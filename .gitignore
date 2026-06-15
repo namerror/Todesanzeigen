@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local config
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Pipeline data
+input/*
+artifacts/*
+output/*
+
+# Keep folder placeholders if they are added later.
+!input/.gitkeep
+!artifacts/.gitkeep
+!output/.gitkeep

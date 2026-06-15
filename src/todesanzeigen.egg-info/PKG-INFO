@@ -1,0 +1,36 @@
+Metadata-Version: 2.4
+Name: todesanzeigen
+Version: 0.1.0
+Summary: OCR and structured extraction pipeline for Todesanzeigen images.
+Requires-Python: >=3.11
+Requires-Dist: google-cloud-documentai>=3.0.0
+Requires-Dist: google-genai>=1.0.0
+Requires-Dist: python-dotenv>=1.0.0
+
+# Images labeled "clean" are images that seem to be of original electronic document form (not by taking a picture of the printed document) without contaminating information. Most of clean images contain standard printed fonts while some contain special fonts (like hand-written like fonts) and some include picture backgrounds, as opposed to standard white background.
+# "Newspaper" images are ones that are camera/phone taken images of newspaper sections that typically are not angled/cropped perfectly and contain some unnecessary sections around the border that shouldn't be included for concern, with the main box of content centered. Some photos even include an "overview" picture that includes an entire newspapaer page with several boxes (these are just reference images), these shouldn't be processed as there are images that are taken of the individual boxes of the same page
+# The content of these images, death announcement, is not necessarily the same in visual format/layout, as it's very flexible, but the main form is similar, so important information such as full name, birth+death date, cities, etc. are there with few outliers.  
+
+Aichacher Nachrichten: 1168 images, 200.7 MB, clean
+Ammersee Kurier: 220 images, 28.5 MB, clean
+Augsburger Algemeine: 27,333 images, 4.7 GB, clean
+Augsburg Land: 2141 images, 337.8 MB
+Augsburg 1951 Neue Augsburger Zeitung: 118 images, 218.8 MB, newspaper
+Augsburg Schaebische Landeszeitung: 6114 images, 6.8 GB, newspaper
+Dillingen: 1148 images, 137.2 MB, clean
+Donauwoerther Zeitung: 2795 images, 436.1 MB, clean
+Donau Zeitung: 2905 images, 411.4 MB, clean
+Friedberger Allgemeine: 4522 images, 602 MB, clean
+Guenzburger Zeitung: 4074 images, 556.3 MB, clean
+Kaufbeuern - Kempten - Oberallgäu - Ostallgäu: 1816 images, 709.9 MB, clean
+Lindau Allgäuer Zeitung: 2537 images, 359 MB, clean
+Mittelschwäbische Nachrichten: 1330 images, 255.1 MB, clean
+Region Donau Ries: 3393 images, 407.9 MB
+Rieser Nachrichten: 5707 images, 786.6 MB
+Schwabmünchner Allgemeine: 2195 images, 353.9 MB
+Unterallgäu - Memmingen: 2274 images, 202.2 MB
+Verbreitungsgebiet der Augsburger Allgemeinen: 5086 images, 3.7 GB, clean
+Verbreitungsgebiet der Augsburger Allgemeinen _Jahresgedenken: 3583 images, 464.3 MB, clean
+Wertinger Zeitung: 644 images, 100.4 MB, clean
+Zeitungsverlag unbekannt: 8034 images, 9.5 GB, newspaper
+

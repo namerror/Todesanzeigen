@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "todesanzeigen"
+version = "0.1.0"
+description = "OCR and structured extraction pipeline for Todesanzeigen images."
+readme = "summary"
+requires-python = ">=3.11"
+dependencies = [
+    "google-cloud-documentai>=3.0.0",
+    "google-genai>=1.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+todesanzeigen = "todesanzeigen.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
