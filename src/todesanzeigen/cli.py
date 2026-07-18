@@ -7,7 +7,14 @@ from pathlib import Path
 
 from .extract import extract_artifacts_to_csv
 from .llm import GeminiProvider, GeminiSettings
-from .ocr import ConfigError, DocumentAiOcrClient, DocumentAiSettings, run_ocr_folder
+from .ocr import (
+    ConfigError,
+    DocumentAiOcrClient,
+    DocumentAiSettings,
+    TesseractOcrClient,
+    TesseractSettings,
+    run_ocr_folder,
+)
 
 
 def _load_dotenv() -> None:
@@ -25,9 +32,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    ocr = subparsers.add_parser("ocr", help="Run Google Document AI OCR for images in input/.")
+    ocr = subparsers.add_parser("ocr", help="Run local Tesseract OCR for images in input/.")
     ocr.add_argument("--input-dir", type=Path, default=Path("input"))
     ocr.add_argument("--artifacts-dir", type=Path, default=Path("artifacts"))
+    ocr.add_argument("--engine", choices=["tesseract", "documentai"], default="tesseract")
+    ocr.add_argument("--tesseract-lang", default="deu+eng")
+    ocr.add_argument("--tesseract-psm", type=int, default=6)
+    ocr.add_argument("--tesseract-bin", default="tesseract")
     ocr.add_argument("--overwrite", action="store_true")
     ocr.add_argument("--limit", type=int)
 
@@ -42,8 +53,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_ocr_command(args: argparse.Namespace) -> int:
-    settings = DocumentAiSettings.from_env()
-    client = DocumentAiOcrClient(settings)
+    if args.engine == "tesseract":
+        client = TesseractOcrClient(
+            TesseractSettings(
+                language=args.tesseract_lang,
+                page_segmentation_mode=args.tesseract_psm,
+                binary=args.tesseract_bin,
+            )
+        )
+    elif args.engine == "documentai":
+        if os.getenv("TODESANZEIGEN_ALLOW_GCP") != "1":
+            raise ConfigError(
+                "Google Document AI OCR is disabled to avoid accidental billing. "
+                "Set TODESANZEIGEN_ALLOW_GCP=1 and pass --engine documentai to use it."
+            )
+        settings = DocumentAiSettings.from_env()
+        client = DocumentAiOcrClient(settings)
+    else:
+        raise ConfigError(f"Unsupported OCR engine: {args.engine}")
+
     results = run_ocr_folder(
         args.input_dir,
         args.artifacts_dir,

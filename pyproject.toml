@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "todesanzeigen"
 version = "0.1.0"
 description = "OCR and structured extraction pipeline for Todesanzeigen images."
-readme = "summary"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "google-cloud-documentai>=3.0.0",

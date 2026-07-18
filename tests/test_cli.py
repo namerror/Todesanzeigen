@@ -1,0 +1,87 @@
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest import TestCase
+from unittest.mock import patch
+
+from src.todesanzeigen import cli
+from src.todesanzeigen.ocr import ConfigError
+
+
+class CliOcrTests(TestCase):
+    def test_ocr_defaults_to_tesseract(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "input"
+            artifacts_dir = root / "artifacts"
+            input_dir.mkdir()
+            args = cli.build_parser().parse_args(
+                [
+                    "ocr",
+                    "--input-dir",
+                    str(input_dir),
+                    "--artifacts-dir",
+                    str(artifacts_dir),
+                ]
+            )
+
+            with (
+                patch("src.todesanzeigen.cli.TesseractOcrClient") as tesseract_client,
+                patch("src.todesanzeigen.cli.DocumentAiSettings.from_env") as document_settings,
+                patch("src.todesanzeigen.cli.run_ocr_folder", return_value=[]) as run_folder,
+            ):
+                tesseract_client.return_value = "local-client"
+
+                cli.run_ocr_command(args)
+
+        tesseract_client.assert_called_once()
+        settings = tesseract_client.call_args.args[0]
+        self.assertEqual(settings.language, "deu+eng")
+        self.assertEqual(settings.page_segmentation_mode, 6)
+        self.assertEqual(settings.binary, "tesseract")
+        document_settings.assert_not_called()
+        run_folder.assert_called_once_with(
+            input_dir,
+            artifacts_dir,
+            "local-client",
+            overwrite=False,
+            limit=None,
+        )
+
+    def test_documentai_requires_explicit_gcp_unlock(self) -> None:
+        args = cli.build_parser().parse_args(["ocr", "--engine", "documentai"])
+
+        with (
+            patch.dict("src.todesanzeigen.cli.os.environ", {}, clear=True),
+            patch("src.todesanzeigen.cli.DocumentAiSettings.from_env") as document_settings,
+            patch("src.todesanzeigen.cli.DocumentAiOcrClient") as document_client,
+        ):
+            with self.assertRaises(ConfigError) as error:
+                cli.run_ocr_command(args)
+
+        self.assertIn("disabled to avoid accidental billing", str(error.exception))
+        document_settings.assert_not_called()
+        document_client.assert_not_called()
+
+    def test_documentai_runs_when_explicitly_unlocked(self) -> None:
+        args = cli.build_parser().parse_args(["ocr", "--engine", "documentai"])
+
+        with (
+            patch.dict("src.todesanzeigen.cli.os.environ", {"TODESANZEIGEN_ALLOW_GCP": "1"}),
+            patch("src.todesanzeigen.cli.DocumentAiSettings.from_env") as document_settings,
+            patch("src.todesanzeigen.cli.DocumentAiOcrClient") as document_client,
+            patch("src.todesanzeigen.cli.run_ocr_folder", return_value=[]) as run_folder,
+        ):
+            document_settings.return_value = "document-settings"
+            document_client.return_value = "document-client"
+
+            cli.run_ocr_command(args)
+
+        document_settings.assert_called_once_with()
+        document_client.assert_called_once_with("document-settings")
+        run_folder.assert_called_once_with(
+            Path("input"),
+            Path("artifacts"),
+            "document-client",
+            overwrite=False,
+            limit=None,
+        )

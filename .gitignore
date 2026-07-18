@@ -25,3 +25,5 @@ output/*
 !input/.gitkeep
 !artifacts/.gitkeep
 !output/.gitkeep
+
+gcp/*

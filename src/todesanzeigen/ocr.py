@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -83,6 +84,49 @@ class DocumentAiOcrClient:
         )
         result = self._client.process_document(request=request)
         return result.document.text or ""
+
+
+@dataclass(frozen=True)
+class TesseractSettings:
+    language: str = "deu+eng"
+    page_segmentation_mode: int = 6
+    binary: str = "tesseract"
+
+
+class TesseractOcrClient:
+    def __init__(self, settings: TesseractSettings | None = None) -> None:
+        self._settings = settings or TesseractSettings()
+
+    def process_image(self, image_path: Path, mime_type: str) -> str:
+        del mime_type
+        command = [
+            self._settings.binary,
+            str(image_path),
+            "stdout",
+            "-l",
+            self._settings.language,
+            "--psm",
+            str(self._settings.page_segmentation_mode),
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError as exc:
+            raise ConfigError(
+                f"Tesseract binary not found: {self._settings.binary}"
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            details = (exc.stderr or exc.stdout or "").strip()
+            message = f"Tesseract OCR failed for {image_path}"
+            if details:
+                message = f"{message}: {details}"
+            raise ConfigError(message) from exc
+
+        return result.stdout or ""
 
 
 @dataclass(frozen=True)

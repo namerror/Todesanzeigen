@@ -1,8 +1,13 @@
+import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
+from unittest.mock import patch
 
 from src.todesanzeigen.ocr import (
+    ConfigError,
+    TesseractOcrClient,
+    TesseractSettings,
     artifact_path_for_image,
     discover_images,
     image_mime_type,
@@ -80,3 +85,54 @@ class OcrTests(TestCase):
             processed = run_ocr_folder(input_dir, artifacts_dir, client, overwrite=True)
             self.assertEqual(processed[0].status, "processed")
             self.assertEqual(artifact_path_for_image(image, artifacts_dir).read_text(encoding="utf-8"), "new")
+
+    def test_tesseract_client_runs_binary_with_configured_language_and_psm(self) -> None:
+        client = TesseractOcrClient(
+            TesseractSettings(
+                language="deu+eng",
+                page_segmentation_mode=6,
+                binary="custom-tesseract",
+            )
+        )
+
+        with patch("src.todesanzeigen.ocr.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="recognized text",
+                stderr="",
+            )
+
+            text = client.process_image(Path("scan.png"), "image/png")
+
+        self.assertEqual(text, "recognized text")
+        run.assert_called_once_with(
+            [
+                "custom-tesseract",
+                "scan.png",
+                "stdout",
+                "-l",
+                "deu+eng",
+                "--psm",
+                "6",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_tesseract_client_reports_command_failures(self) -> None:
+        client = TesseractOcrClient()
+
+        with patch("src.todesanzeigen.ocr.subprocess.run") as run:
+            run.side_effect = subprocess.CalledProcessError(
+                1,
+                ["tesseract"],
+                stderr="Error opening data file deu.traineddata",
+            )
+
+            with self.assertRaises(ConfigError) as error:
+                client.process_image(Path("scan.png"), "image/png")
+
+        self.assertIn("Tesseract OCR failed for scan.png", str(error.exception))
+        self.assertIn("deu.traineddata", str(error.exception))
