@@ -52,11 +52,21 @@ class DocumentAiSettings:
 
 
 class OcrClient(Protocol):
-    def process_image(self, image_path: Path, mime_type: str) -> str:
-        """Return OCR text for one image."""
+    writes_tsv: bool
+
+    def process_image(self, image_path: Path, mime_type: str) -> "OcrOutput":
+        """Return OCR artifacts for one image."""
+
+
+@dataclass(frozen=True)
+class OcrOutput:
+    text: str
+    tsv: str | None = None
 
 
 class DocumentAiOcrClient:
+    writes_tsv = False
+
     def __init__(self, settings: DocumentAiSettings) -> None:
         from google.api_core.client_options import ClientOptions
         from google.cloud import documentai_v1
@@ -72,7 +82,7 @@ class DocumentAiOcrClient:
             settings.processor_id,
         )
 
-    def process_image(self, image_path: Path, mime_type: str) -> str:
+    def process_image(self, image_path: Path, mime_type: str) -> OcrOutput:
         image_content = image_path.read_bytes()
         raw_document = self._documentai.RawDocument(
             content=image_content,
@@ -83,31 +93,54 @@ class DocumentAiOcrClient:
             raw_document=raw_document,
         )
         result = self._client.process_document(request=request)
-        return result.document.text or ""
+        return OcrOutput(text=result.document.text or "")
 
 
 @dataclass(frozen=True)
 class TesseractSettings:
-    language: str = "deu+eng"
-    page_segmentation_mode: int = 6
+    language: str = "deu"
+    page_segmentation_mode: int = 3
+    ocr_engine_mode: int = 1
+    tessdata_dir: Path | None = Path("data")
     binary: str = "tesseract"
 
 
 class TesseractOcrClient:
+    writes_tsv = True
+
     def __init__(self, settings: TesseractSettings | None = None) -> None:
         self._settings = settings or TesseractSettings()
 
-    def process_image(self, image_path: Path, mime_type: str) -> str:
+    def process_image(self, image_path: Path, mime_type: str) -> OcrOutput:
         del mime_type
+        text = self._run_tesseract(image_path, "text")
+        tsv = self._run_tesseract(image_path, "tsv")
+        return OcrOutput(text=text, tsv=tsv)
+
+    def _base_command(self, image_path: Path) -> list[str]:
         command = [
             self._settings.binary,
             str(image_path),
             "stdout",
-            "-l",
-            self._settings.language,
-            "--psm",
-            str(self._settings.page_segmentation_mode),
         ]
+        if self._settings.tessdata_dir is not None:
+            command.extend(["--tessdata-dir", str(self._settings.tessdata_dir)])
+        command.extend(
+            [
+                "-l",
+                self._settings.language,
+                "--oem",
+                str(self._settings.ocr_engine_mode),
+                "--psm",
+                str(self._settings.page_segmentation_mode),
+            ]
+        )
+        return command
+
+    def _run_tesseract(self, image_path: Path, output_format: str) -> str:
+        command = self._base_command(image_path)
+        if output_format == "tsv":
+            command.extend(["-c", "tessedit_create_tsv=1"])
         try:
             result = subprocess.run(
                 command,
@@ -121,7 +154,7 @@ class TesseractOcrClient:
             ) from exc
         except subprocess.CalledProcessError as exc:
             details = (exc.stderr or exc.stdout or "").strip()
-            message = f"Tesseract OCR failed for {image_path}"
+            message = f"Tesseract {output_format} OCR failed for {image_path}"
             if details:
                 message = f"{message}: {details}"
             raise ConfigError(message) from exc
@@ -135,6 +168,8 @@ class OcrRunResult:
     artifact_path: Path
     status: str
     text_length: int = 0
+    tsv_artifact_path: Path | None = None
+    tsv_length: int = 0
 
 
 def image_mime_type(path: Path) -> str | None:
@@ -156,6 +191,10 @@ def artifact_path_for_image(image_path: Path, artifacts_dir: Path) -> Path:
     return artifacts_dir / f"{image_path.stem}.txt"
 
 
+def tsv_artifact_path_for_image(image_path: Path, artifacts_dir: Path) -> Path:
+    return artifacts_dir / f"{image_path.stem}.tsv"
+
+
 def run_ocr_folder(
     input_dir: Path,
     artifacts_dir: Path,
@@ -172,8 +211,20 @@ def run_ocr_folder(
     results: list[OcrRunResult] = []
     for image_path in images:
         artifact_path = artifact_path_for_image(image_path, artifacts_dir)
-        if artifact_path.exists() and not overwrite:
-            results.append(OcrRunResult(image_path, artifact_path, "skipped"))
+        tsv_artifact_path = tsv_artifact_path_for_image(image_path, artifacts_dir)
+        expects_tsv = bool(getattr(client, "writes_tsv", False))
+        artifact_set_exists = artifact_path.exists() and (
+            not expects_tsv or tsv_artifact_path.exists()
+        )
+        if artifact_set_exists and not overwrite:
+            results.append(
+                OcrRunResult(
+                    image_path,
+                    artifact_path,
+                    "skipped",
+                    tsv_artifact_path=tsv_artifact_path if expects_tsv else None,
+                )
+            )
             continue
 
         mime_type = image_mime_type(image_path)
@@ -181,8 +232,19 @@ def run_ocr_folder(
             results.append(OcrRunResult(image_path, artifact_path, "unsupported"))
             continue
 
-        text = client.process_image(image_path, mime_type)
-        artifact_path.write_text(text, encoding="utf-8")
-        results.append(OcrRunResult(image_path, artifact_path, "processed", len(text)))
+        output = client.process_image(image_path, mime_type)
+        artifact_path.write_text(output.text, encoding="utf-8")
+        if output.tsv is not None:
+            tsv_artifact_path.write_text(output.tsv, encoding="utf-8")
+        results.append(
+            OcrRunResult(
+                image_path,
+                artifact_path,
+                "processed",
+                len(output.text),
+                tsv_artifact_path if output.tsv is not None else None,
+                len(output.tsv or ""),
+            )
+        )
 
     return results

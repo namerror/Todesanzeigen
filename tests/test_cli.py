@@ -35,8 +35,10 @@ class CliOcrTests(TestCase):
 
         tesseract_client.assert_called_once()
         settings = tesseract_client.call_args.args[0]
-        self.assertEqual(settings.language, "deu+eng")
-        self.assertEqual(settings.page_segmentation_mode, 6)
+        self.assertEqual(settings.language, "deu")
+        self.assertEqual(settings.page_segmentation_mode, 3)
+        self.assertEqual(settings.ocr_engine_mode, 1)
+        self.assertEqual(settings.tessdata_dir, Path("data"))
         self.assertEqual(settings.binary, "tesseract")
         document_settings.assert_not_called()
         run_folder.assert_called_once_with(

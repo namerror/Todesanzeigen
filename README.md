@@ -17,19 +17,29 @@ Install the Python package in editable mode:
 python -m pip install -e .
 ```
 
-Install Tesseract and German language data. On Ubuntu/Debian:
+Install Tesseract. On Ubuntu/Debian:
 
 ```sh
-sudo apt install tesseract-ocr tesseract-ocr-deu
+sudo apt install tesseract-ocr
 ```
 
-Confirm that German OCR data is available:
+Add the high-quality German traineddata file at:
 
 ```sh
-tesseract --list-langs
+data/deu.traineddata
 ```
 
-The default OCR language is `deu+eng`, so the language list must include `deu` and `eng`.
+The default OCR command uses that local tessdata directory with German-only OCR:
+
+```text
+--tesseract-tessdata-dir data
+--tesseract-lang deu
+--tesseract-oem 1
+--tesseract-psm 3
+```
+
+`--tesseract-oem 1` selects Tesseract's LSTM OCR engine. This is the right mode
+for `tessdata_best` models such as `data/deu.traineddata`.
 
 For structured extraction, create a `.env` file from `.env.example` and set:
 
@@ -47,6 +57,13 @@ todesanzeigen ocr
 ```
 
 By default this writes one `.txt` file per image into `artifacts/`.
+It also writes one `.tsv` layout artifact per image. For `example.jpg`, the OCR
+step creates:
+
+```text
+artifacts/example.txt
+artifacts/example.tsv
+```
 
 Common options:
 
@@ -54,13 +71,15 @@ Common options:
 todesanzeigen ocr --limit 10
 todesanzeigen ocr --overwrite
 todesanzeigen ocr --input-dir input --artifacts-dir artifacts
-todesanzeigen ocr --tesseract-lang deu+eng --tesseract-psm 6
+todesanzeigen ocr --tesseract-lang deu --tesseract-psm 3
+todesanzeigen ocr --tesseract-tessdata-dir data --tesseract-oem 1
 ```
 
 Useful Tesseract page segmentation modes:
 
-- `6`: default; assumes one uniform text block, good for cropped clean notices.
+- `3`: default; fully automatic page segmentation, useful for notices with multiple text areas.
 - `4`: assumes a single column of variable-size text, useful for some newspaper crops.
+- `6`: assumes one uniform text block, useful only for tightly cropped clean notices.
 - `11`: sparse text mode, useful for messy or loosely cropped images.
 
 Supported image extensions are:
@@ -77,7 +96,10 @@ After OCR artifacts exist, extract structured CSV rows:
 todesanzeigen extract
 ```
 
-This reads `artifacts/*.txt` and writes `output/result.csv`.
+This reads `artifacts/*.txt`, requires a matching `artifacts/*.tsv` file for
+each text artifact, and writes `output/result.csv`. The TSV layout feed gives
+Gemini block and line positions, line heights, and confidence values, which helps
+identify large or centered name lines in death notices.
 
 Common options:
 
@@ -87,7 +109,9 @@ todesanzeigen extract --artifacts-dir artifacts --output-file output/result.csv
 todesanzeigen extract --source "Augsburger Allgemeine"
 ```
 
-The extraction step currently uses Gemini and therefore makes remote API calls. Local OCR does not remove Gemini usage.
+The extraction step currently uses Gemini and therefore makes remote API calls.
+Local OCR does not remove Gemini usage. Rerun OCR with `--overwrite` if you have
+old text-only artifacts without matching TSV files.
 
 ## Google Document AI Fallback
 

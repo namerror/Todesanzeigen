@@ -36,8 +36,10 @@ def build_parser() -> argparse.ArgumentParser:
     ocr.add_argument("--input-dir", type=Path, default=Path("input"))
     ocr.add_argument("--artifacts-dir", type=Path, default=Path("artifacts"))
     ocr.add_argument("--engine", choices=["tesseract", "documentai"], default="tesseract")
-    ocr.add_argument("--tesseract-lang", default="deu+eng")
-    ocr.add_argument("--tesseract-psm", type=int, default=6)
+    ocr.add_argument("--tesseract-lang", default="deu")
+    ocr.add_argument("--tesseract-psm", type=int, default=3)
+    ocr.add_argument("--tesseract-oem", type=int, default=1)
+    ocr.add_argument("--tesseract-tessdata-dir", type=Path, default=Path("data"))
     ocr.add_argument("--tesseract-bin", default="tesseract")
     ocr.add_argument("--overwrite", action="store_true")
     ocr.add_argument("--limit", type=int)
@@ -58,6 +60,8 @@ def run_ocr_command(args: argparse.Namespace) -> int:
             TesseractSettings(
                 language=args.tesseract_lang,
                 page_segmentation_mode=args.tesseract_psm,
+                ocr_engine_mode=args.tesseract_oem,
+                tessdata_dir=args.tesseract_tessdata_dir,
                 binary=args.tesseract_bin,
             )
         )
@@ -85,9 +89,18 @@ def run_ocr_command(args: argparse.Namespace) -> int:
     print(f"OCR complete: {processed} processed, {skipped} skipped.")
     for result in results:
         if result.status == "processed":
-            print(f"processed {result.image_path} -> {result.artifact_path} ({result.text_length} chars)")
+            layout = (
+                f", {result.tsv_artifact_path} ({result.tsv_length} tsv chars)"
+                if result.tsv_artifact_path
+                else ""
+            )
+            print(
+                f"processed {result.image_path} -> "
+                f"{result.artifact_path} ({result.text_length} chars){layout}"
+            )
         elif result.status == "skipped":
-            print(f"skipped {result.image_path} -> {result.artifact_path}")
+            layout = f", {result.tsv_artifact_path}" if result.tsv_artifact_path else ""
+            print(f"skipped {result.image_path} -> {result.artifact_path}{layout}")
     return 0
 
 
