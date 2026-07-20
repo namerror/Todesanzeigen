@@ -2,10 +2,11 @@
 
 OCR and structured extraction pipeline for German death notice images.
 
-The current workflow has two separate steps:
+The current workflow has separate steps:
 
 1. Run OCR on images from `input/` and write plain text artifacts to `artifacts/`.
-2. Parse those OCR text artifacts with Gemini and write structured rows to `output/result.csv`.
+2. Optionally run the local TSV filter to print likely deceased names.
+3. Parse those OCR text artifacts with Gemini and write structured rows to `output/result.csv`.
 
 Local Tesseract OCR is the default. Google Document AI OCR is kept as a guarded legacy fallback and is blocked unless explicitly unlocked.
 
@@ -86,6 +87,26 @@ Supported image extensions are:
 
 ```text
 .bmp .gif .jpeg .jpg .png .tif .tiff .webp
+```
+
+## TSV Name Filtering Usage
+
+After OCR artifacts exist, run the preliminary local filter:
+
+```sh
+todesanzeigen filter
+```
+
+This reads `artifacts/*.tsv`, uses the largest visible text lines as the main
+signal, and prints one likely name per TSV artifact with the average OCR
+confidence of the retained name words. It does not call an LLM or write output
+files.
+
+Common options:
+
+```sh
+todesanzeigen filter --limit 10
+todesanzeigen filter --artifacts-dir artifacts
 ```
 
 ## Structured Extraction Usage

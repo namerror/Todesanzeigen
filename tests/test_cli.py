@@ -1,3 +1,5 @@
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -5,6 +7,7 @@ from unittest.mock import patch
 
 from src.todesanzeigen import cli
 from src.todesanzeigen.ocr import ConfigError
+from src.todesanzeigen.ocr_filtering import NameFilterResult
 
 
 class CliOcrTests(TestCase):
@@ -86,4 +89,26 @@ class CliOcrTests(TestCase):
             "document-client",
             overwrite=False,
             limit=None,
+        )
+
+    def test_filter_command_prints_detected_names(self) -> None:
+        args = cli.build_parser().parse_args(
+            ["filter", "--artifacts-dir", "custom-artifacts", "--limit", "2"]
+        )
+
+        with patch("src.todesanzeigen.cli.filter_artifact_names") as filter_names:
+            filter_names.return_value = [
+                NameFilterResult(Path("custom-artifacts/a.tsv"), "Max Mustermann", 93.25),
+                NameFilterResult(Path("custom-artifacts/b.tsv"), "", None),
+            ]
+            output = StringIO()
+
+            with redirect_stdout(output):
+                status = cli.run_filter_command(args)
+
+        self.assertEqual(status, 0)
+        filter_names.assert_called_once_with(Path("custom-artifacts"), limit=2)
+        self.assertEqual(
+            output.getvalue().splitlines(),
+            ["a.tsv: Max Mustermann (conf=93.2)", "b.tsv: <not found>"],
         )

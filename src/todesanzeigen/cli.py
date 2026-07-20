@@ -15,6 +15,7 @@ from .ocr import (
     TesseractSettings,
     run_ocr_folder,
 )
+from .ocr_filtering import filter_artifact_names
 
 
 def _load_dotenv() -> None:
@@ -50,6 +51,13 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--provider", choices=["gemini"], default="gemini")
     extract.add_argument("--source", default=os.getenv("TODESANZEIGEN_SOURCE", ""))
     extract.add_argument("--limit", type=int)
+
+    filter_parser = subparsers.add_parser(
+        "filter",
+        help="Detect likely deceased names from OCR TSV layout artifacts.",
+    )
+    filter_parser.add_argument("--artifacts-dir", type=Path, default=Path("artifacts"))
+    filter_parser.add_argument("--limit", type=int)
 
     return parser
 
@@ -120,6 +128,19 @@ def run_extract_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_filter_command(args: argparse.Namespace) -> int:
+    results = filter_artifact_names(args.artifacts_dir, limit=args.limit)
+    for result in results:
+        if not result.name:
+            print(f"{result.artifact_path.name}: <not found>")
+            continue
+        confidence = (
+            f" (conf={result.confidence:.1f})" if result.confidence is not None else ""
+        )
+        print(f"{result.artifact_path.name}: {result.name}{confidence}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     _load_dotenv()
     parser = build_parser()
@@ -130,6 +151,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_ocr_command(args)
         if args.command == "extract":
             return run_extract_command(args)
+        if args.command == "filter":
+            return run_filter_command(args)
     except (ConfigError, FileNotFoundError, NotADirectoryError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
