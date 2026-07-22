@@ -116,3 +116,45 @@ class CliOcrTests(TestCase):
                 "Name map written to custom-artifacts/name_map.json.",
             ],
         )
+
+    def test_extract_command_passes_threshold_and_log_file(self) -> None:
+        args = cli.build_parser().parse_args(
+            [
+                "extract",
+                "--artifacts-dir",
+                "custom-artifacts",
+                "--output-file",
+                "custom-output/result.csv",
+                "--source",
+                "Testquelle",
+                "--limit",
+                "2",
+                "--name-confidence-threshold",
+                "90",
+                "--log-dir",
+                "custom-logs",
+            ]
+        )
+
+        with (
+            patch("src.todesanzeigen.cli.GeminiSettings.from_env", return_value="settings"),
+            patch("src.todesanzeigen.cli.GeminiProvider", return_value="provider"),
+            patch("src.todesanzeigen.cli.extract_artifacts_to_csv", return_value=[]) as extract,
+        ):
+            output = StringIO()
+            with redirect_stdout(output):
+                status = cli.run_extract_command(args)
+
+        self.assertEqual(status, 0)
+        kwargs = extract.call_args.kwargs
+        self.assertEqual(
+            extract.call_args.args,
+            (Path("custom-artifacts"), Path("custom-output/result.csv"), "provider"),
+        )
+        self.assertEqual(kwargs["source"], "Testquelle")
+        self.assertEqual(kwargs["limit"], 2)
+        self.assertEqual(kwargs["name_confidence_threshold"], 90)
+        self.assertEqual(kwargs["log_file"].parent, Path("custom-logs"))
+        self.assertRegex(kwargs["log_file"].name, r"^extract-\d{8}-\d{6}\.txt$")
+        self.assertIn("0 rows written", output.getvalue())
+        self.assertIn("0 skipped", output.getvalue())

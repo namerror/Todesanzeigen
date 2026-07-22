@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,9 @@ class ExtractionResult:
 class NameHint:
     name: str
     confidence: float | None
+
+
+DEFAULT_NAME_CONFIDENCE_THRESHOLD = 85.0
 
 
 def discover_artifacts(artifacts_dir: Path) -> list[Path]:
@@ -185,6 +189,8 @@ def extract_artifacts_to_csv(
     *,
     source: str = "",
     limit: int | None = None,
+    name_confidence_threshold: float = DEFAULT_NAME_CONFIDENCE_THRESHOLD,
+    log_file: Path | None = None,
 ) -> list[ExtractionResult]:
     artifacts = discover_artifacts(artifacts_dir)
     if limit is not None:
@@ -192,6 +198,12 @@ def extract_artifacts_to_csv(
 
     name_map = load_name_map(artifacts_dir)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
+    if log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_file.write_text(
+            f"Extraction log started {datetime.now().isoformat(timespec='seconds')}\n",
+            encoding="utf-8",
+        )
     results: list[ExtractionResult] = []
     with output_csv.open("w", encoding="utf-8", newline="") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=CSV_COLUMNS)
@@ -204,6 +216,15 @@ def extract_artifacts_to_csv(
                     f"Missing OCR name map entry for {artifact_path.name}. "
                     "Run `todesanzeigen filter` for the same artifacts before extracting."
                 ) from exc
+            if _is_below_confidence_threshold(name_hint, name_confidence_threshold):
+                _write_low_confidence_warning(
+                    log_file,
+                    artifact_path.name,
+                    name_hint.confidence,
+                    name_confidence_threshold,
+                )
+                results.append(ExtractionResult(artifact_path, "skipped_low_confidence"))
+                continue
             row = extract_artifact(
                 artifact_path,
                 provider,
@@ -214,3 +235,28 @@ def extract_artifacts_to_csv(
             results.append(ExtractionResult(artifact_path, "processed", row))
 
     return results
+
+
+def _is_below_confidence_threshold(name_hint: NameHint, threshold: float) -> bool:
+    return name_hint.confidence is None or name_hint.confidence < threshold
+
+
+def _write_low_confidence_warning(
+    log_file: Path | None,
+    filename: str,
+    confidence: float | None,
+    threshold: float,
+) -> None:
+    if confidence is None:
+        message = (
+            f"WARNING: file {filename} has missing confidence, "
+            "not passed to extraction"
+        )
+    else:
+        message = (
+            f"WARNING: file {filename} has low confidence "
+            f"({confidence:.1f} < {threshold:.1f}), not passed to extraction"
+        )
+    if log_file is not None:
+        with log_file.open("a", encoding="utf-8") as handle:
+            handle.write(f"{message}\n")

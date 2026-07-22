@@ -3,9 +3,10 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
-from .extract import extract_artifacts_to_csv
+from .extract import DEFAULT_NAME_CONFIDENCE_THRESHOLD, extract_artifacts_to_csv
 from .llm import GeminiProvider, GeminiSettings
 from .ocr import (
     ConfigError,
@@ -51,6 +52,12 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--provider", choices=["gemini"], default="gemini")
     extract.add_argument("--source", default=os.getenv("TODESANZEIGEN_SOURCE", ""))
     extract.add_argument("--limit", type=int)
+    extract.add_argument(
+        "--name-confidence-threshold",
+        type=float,
+        default=DEFAULT_NAME_CONFIDENCE_THRESHOLD,
+    )
+    extract.add_argument("--log-dir", type=Path, default=Path("logs"))
 
     filter_parser = subparsers.add_parser(
         "filter",
@@ -117,14 +124,22 @@ def run_extract_command(args: argparse.Namespace) -> int:
         raise ConfigError(f"Unsupported LLM provider: {args.provider}")
 
     provider = GeminiProvider(GeminiSettings.from_env())
+    log_file = args.log_dir / f"extract-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"
     results = extract_artifacts_to_csv(
         args.artifacts_dir,
         args.output_file,
         provider,
         source=args.source,
         limit=args.limit,
+        name_confidence_threshold=args.name_confidence_threshold,
+        log_file=log_file,
     )
-    print(f"Extraction complete: {len(results)} rows written to {args.output_file}.")
+    processed = sum(1 for result in results if result.status == "processed")
+    skipped = sum(1 for result in results if result.status == "skipped_low_confidence")
+    print(
+        f"Extraction complete: {processed} rows written to {args.output_file}; "
+        f"{skipped} skipped. Log written to {log_file}."
+    )
     return 0
 
 

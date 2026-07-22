@@ -121,7 +121,9 @@ todesanzeigen extract
 
 This reads `artifacts/*.txt`, requires `artifacts/name_map.json`, and writes
 `output/result.csv`. The LLM receives the OCR text plus the locally detected name
-and confidence as a hint; it does not receive the TSV layout artifact.
+and confidence as a hint; it does not receive the TSV layout artifact. Artifacts
+with missing name confidence or name confidence below 85.0 are not sent to the
+LLM. Each extraction run writes a timestamped text log under `logs/`.
 
 Common options:
 
@@ -129,6 +131,7 @@ Common options:
 todesanzeigen extract --limit 10
 todesanzeigen extract --artifacts-dir artifacts --output-file output/result.csv
 todesanzeigen extract --source "Augsburger Allgemeine"
+todesanzeigen extract --name-confidence-threshold 90 --log-dir logs
 ```
 
 The extraction step currently uses Gemini and therefore makes remote API calls.

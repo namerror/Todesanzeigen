@@ -70,6 +70,77 @@ class ExtractTests(TestCase):
             self.assertIn('"Max Mustermann"', provider.prompts[0])
             self.assertNotIn("OCR-Layout aus TSV", provider.prompts[0])
 
+    def test_extract_skips_low_confidence_artifact_and_logs_warning(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = root / "artifacts"
+            output = root / "output" / "result.csv"
+            log_file = root / "logs" / "extract.txt"
+            artifacts.mkdir()
+            (artifacts / "example.txt").write_text("Max Mustermann", encoding="utf-8")
+            (artifacts / "name_map.json").write_text(
+                json.dumps({"example.txt": {"name": "Max Mustermann", "confidence": 82.4}}),
+                encoding="utf-8",
+            )
+            provider = FakeLlmProvider("{}")
+
+            results = extract_artifacts_to_csv(artifacts, output, provider, log_file=log_file)
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].status, "skipped_low_confidence")
+            self.assertEqual(provider.prompts, [])
+            self.assertEqual(
+                output.read_text(encoding="utf-8").splitlines(),
+                [",".join(CSV_COLUMNS)],
+            )
+            self.assertIn(
+                "WARNING: file example.txt has low confidence (82.4 < 85.0), "
+                "not passed to extraction",
+                log_file.read_text(encoding="utf-8"),
+            )
+
+    def test_extract_skips_missing_confidence_artifact_and_logs_warning(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = root / "artifacts"
+            output = root / "output" / "result.csv"
+            log_file = root / "logs" / "extract.txt"
+            artifacts.mkdir()
+            (artifacts / "example.txt").write_text("Max Mustermann", encoding="utf-8")
+            (artifacts / "name_map.json").write_text(
+                json.dumps({"example.txt": {"name": "Max Mustermann", "confidence": None}}),
+                encoding="utf-8",
+            )
+            provider = FakeLlmProvider("{}")
+
+            results = extract_artifacts_to_csv(artifacts, output, provider, log_file=log_file)
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].status, "skipped_low_confidence")
+            self.assertEqual(provider.prompts, [])
+            self.assertIn(
+                "WARNING: file example.txt has missing confidence, not passed to extraction",
+                log_file.read_text(encoding="utf-8"),
+            )
+
+    def test_extract_processes_confidence_equal_to_threshold(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = root / "artifacts"
+            output = root / "output" / "result.csv"
+            artifacts.mkdir()
+            (artifacts / "example.txt").write_text("Max Mustermann", encoding="utf-8")
+            (artifacts / "name_map.json").write_text(
+                json.dumps({"example.txt": {"name": "Max Mustermann", "confidence": 85.0}}),
+                encoding="utf-8",
+            )
+            provider = FakeLlmProvider(json.dumps({"name": "Mustermann"}))
+
+            results = extract_artifacts_to_csv(artifacts, output, provider)
+
+            self.assertEqual(results[0].status, "processed")
+            self.assertEqual(len(provider.prompts), 1)
+
     def test_extract_requires_name_map_artifact(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
