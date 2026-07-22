@@ -51,6 +51,10 @@ class ExtractTests(TestCase):
                     {
                         "name": "Mustermann",
                         "vorname": "Max",
+                        "foto": "ja",
+                        "bemerkungen": "Vom LLM geliefert",
+                        "quelle": "LLM-Quelle",
+                        "dateiname": "llm-dateiname",
                         "confidence_score": "0.8",
                     }
                 )
@@ -62,13 +66,26 @@ class ExtractTests(TestCase):
             csv_text = output.read_text(encoding="utf-8")
             header = csv_text.splitlines()[0].split(",")
             self.assertEqual(header, CSV_COLUMNS)
-            self.assertIn("Mustermann", csv_text)
-            self.assertIn("example", csv_text)
-            self.assertIn("Testquelle", csv_text)
+            row = results[0].row
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual(row["name"], "Mustermann")
+            self.assertEqual(row["dateiname"], "example")
+            self.assertEqual(row["quelle"], "Testquelle")
+            self.assertEqual(row["foto"], "")
+            self.assertEqual(row["bemerkungen"], "")
             self.assertIn("Lokales OCR-Name-Signal", provider.prompts[0])
             self.assertIn("92.0% Konfidenz", provider.prompts[0])
             self.assertIn('"Max Mustermann"', provider.prompts[0])
             self.assertNotIn("OCR-Layout aus TSV", provider.prompts[0])
+            prompt_fields = provider.prompts[0].split("Regeln:")[0]
+            self.assertNotIn("foto", prompt_fields)
+            self.assertNotIn("bemerkungen", prompt_fields)
+            self.assertNotIn("quelle", prompt_fields)
+            self.assertNotIn("dateiname", prompt_fields)
+            self.assertNotIn("foto ist", provider.prompts[0])
+            self.assertNotIn("quelle muss", provider.prompts[0])
+            self.assertNotIn("dateiname muss", provider.prompts[0])
 
     def test_extract_skips_low_confidence_artifact_and_logs_warning(self) -> None:
         with TemporaryDirectory() as tmp:

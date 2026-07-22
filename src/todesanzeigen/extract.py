@@ -25,6 +25,8 @@ class NameHint:
 
 
 DEFAULT_NAME_CONFIDENCE_THRESHOLD = 85.0
+LLM_EXCLUDED_COLUMNS = {"foto", "bemerkungen", "quelle", "dateiname"}
+LLM_PROMPT_COLUMNS = [column for column in CSV_COLUMNS if column not in LLM_EXCLUDED_COLUMNS]
 
 
 def discover_artifacts(artifacts_dir: Path) -> list[Path]:
@@ -43,7 +45,7 @@ def build_extraction_prompt(
     name_hint: NameHint,
     source: str = "",
 ) -> str:
-    columns = ", ".join(CSV_COLUMNS)
+    columns = ", ".join(LLM_PROMPT_COLUMNS)
     name_signal = _format_name_hint_for_prompt(name_hint)
     return f"""Du extrahierst strukturierte Daten aus OCR-Texten deutscher Todesanzeigen.
 
@@ -51,9 +53,6 @@ Gib ausschliesslich ein einzelnes valides JSON-Objekt zurueck. Verwende exakt di
 {columns}
 
 Regeln:
-- dateiname muss "{filename}" sein.
-- quelle muss "{source}" sein, falls keine Quelle im Text erkennbar ist.
-- foto ist "ja", "nein" oder "".
 - confidence_score ist eine Zahl von 0 bis 1 als String, z.B. "0.82".
 - Fehlende oder unsichere Felder bleiben "".
 - Unsicherheiten, OCR-Probleme und Interpretationshinweise kommen in zusaetzliche_hinweise.
@@ -156,9 +155,10 @@ def normalize_record(data: dict[str, Any], *, filename: str, source: str = "") -
             value = str(value)
         row[column] = value
 
+    row["foto"] = ""
+    row["bemerkungen"] = ""
+    row["quelle"] = source
     row["dateiname"] = filename
-    if not row["quelle"] and source:
-        row["quelle"] = source
     return row
 
 
