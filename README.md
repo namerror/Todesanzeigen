@@ -99,8 +99,9 @@ todesanzeigen filter
 
 This reads `artifacts/*.tsv`, uses the largest visible text lines as the main
 signal, and prints one likely name per TSV artifact with the average OCR
-confidence of the retained name words. It does not call an LLM or write output
-files.
+confidence of the retained name words. It also writes `artifacts/name_map.json`,
+mapping each `.txt` OCR artifact filename to the detected name and confidence.
+It does not call an LLM.
 
 Common options:
 
@@ -111,16 +112,16 @@ todesanzeigen filter --artifacts-dir artifacts
 
 ## Structured Extraction Usage
 
-After OCR artifacts exist, extract structured CSV rows:
+After OCR artifacts exist and `todesanzeigen filter` has written
+`artifacts/name_map.json`, extract structured CSV rows:
 
 ```sh
 todesanzeigen extract
 ```
 
-This reads `artifacts/*.txt`, requires a matching `artifacts/*.tsv` file for
-each text artifact, and writes `output/result.csv`. The TSV layout feed gives
-Gemini block and line positions, line heights, and confidence values, which helps
-identify large or centered name lines in death notices.
+This reads `artifacts/*.txt`, requires `artifacts/name_map.json`, and writes
+`output/result.csv`. The LLM receives the OCR text plus the locally detected name
+and confidence as a hint; it does not receive the TSV layout artifact.
 
 Common options:
 
@@ -132,7 +133,8 @@ todesanzeigen extract --source "Augsburger Allgemeine"
 
 The extraction step currently uses Gemini and therefore makes remote API calls.
 Local OCR does not remove Gemini usage. Rerun OCR with `--overwrite` if you have
-old text-only artifacts without matching TSV files.
+old text-only artifacts without matching TSV files, then run `todesanzeigen filter`
+before extraction.
 
 ## Google Document AI Fallback
 

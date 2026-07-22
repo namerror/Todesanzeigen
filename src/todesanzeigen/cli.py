@@ -15,7 +15,7 @@ from .ocr import (
     TesseractSettings,
     run_ocr_folder,
 )
-from .ocr_filtering import filter_artifact_names
+from .ocr_filtering import filter_artifact_names, name_map_artifact_path
 
 
 def _load_dotenv() -> None:
@@ -138,6 +138,7 @@ def run_filter_command(args: argparse.Namespace) -> int:
             f" (conf={result.confidence:.1f})" if result.confidence is not None else ""
         )
         print(f"{result.artifact_path.name}: {result.name}{confidence}")
+    print(f"Name map written to {name_map_artifact_path(args.artifacts_dir)}.")
     return 0
 
 

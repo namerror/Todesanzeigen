@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -6,6 +7,7 @@ from src.todesanzeigen.ocr_filtering import (
     detect_name_from_tsv,
     discover_tsv_artifacts,
     filter_artifact_names,
+    name_map_artifact_path,
     parse_tesseract_word_lines,
 )
 
@@ -93,8 +95,10 @@ class OcrFilteringTests(TestCase):
 
             self.assertEqual([path.name for path in discover_tsv_artifacts(artifacts)], ["a.tsv", "b.tsv"])
             results = filter_artifact_names(artifacts, limit=1)
+            name_map = json.loads(name_map_artifact_path(artifacts).read_text(encoding="utf-8"))
 
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].artifact_path.name, "a.tsv")
         self.assertEqual(results[0].name, "Max")
         self.assertEqual(results[0].confidence, 95)
+        self.assertEqual(name_map, {"a.txt": {"name": "Max", "confidence": 95}})

@@ -110,5 +110,9 @@ class CliOcrTests(TestCase):
         filter_names.assert_called_once_with(Path("custom-artifacts"), limit=2)
         self.assertEqual(
             output.getvalue().splitlines(),
-            ["a.tsv: Max Mustermann (conf=93.2)", "b.tsv: <not found>"],
+            [
+                "a.tsv: Max Mustermann (conf=93.2)",
+                "b.tsv: <not found>",
+                "Name map written to custom-artifacts/name_map.json.",
+            ],
         )

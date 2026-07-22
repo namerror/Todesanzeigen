@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import csv
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,7 @@ class NameFilterResult:
     confidence: float | None
 
 
+NAME_MAP_FILENAME = "name_map.json"
 _WORD_EDGE_CHARS = "\"'`´‘’‚“”„()[]{}<>|/\\:;,_~=+*#%!?«»"
 _DATE_OR_NOTICE_PATTERN = re.compile(
     r"(\d|veröffentlicht|nachrichten|januar|februar|märz|maerz|april|mai|juni|"
@@ -94,10 +97,38 @@ def discover_tsv_artifacts(artifacts_dir: Path) -> list[Path]:
     )
 
 
+def name_map_artifact_path(artifacts_dir: Path) -> Path:
+    return artifacts_dir / NAME_MAP_FILENAME
+
+
+def build_name_map(results: list[NameFilterResult]) -> dict[str, dict[str, Any]]:
+    return {
+        result.artifact_path.with_suffix(".txt").name: {
+            "name": result.name,
+            "confidence": result.confidence,
+        }
+        for result in results
+    }
+
+
+def write_name_map(
+    results: list[NameFilterResult],
+    output_path: Path,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(build_name_map(results), ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def filter_artifact_names(
     artifacts_dir: Path,
     *,
     limit: int | None = None,
+    write_map: bool = True,
+    map_path: Path | None = None,
 ) -> list[NameFilterResult]:
     artifact_paths = discover_tsv_artifacts(artifacts_dir)
     if limit is not None:
@@ -113,6 +144,8 @@ def filter_artifact_names(
                 confidence=detected_name.confidence,
             )
         )
+    if write_map:
+        write_name_map(results, map_path or name_map_artifact_path(artifacts_dir))
     return results
 
 
