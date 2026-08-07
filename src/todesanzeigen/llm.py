@@ -35,6 +35,9 @@ class LlmProvider(Protocol):
     def complete(self, prompt: str) -> str:
         """Return the model response body for one prompt."""
 
+    async def async_complete(self, prompt: str) -> str:
+        """Return the model response body for one prompt from async extraction."""
+
 
 LLM_PROVIDERS = ("gemini", "qwen")
 
@@ -91,11 +94,14 @@ class GeminiProvider:
             return text
         raise RuntimeError("Gemini response did not contain text.")
 
+    async def async_complete(self, prompt: str) -> str:
+        return self.complete(prompt)
+
 
 @dataclass(frozen=True)
 class QwenSettings:
     api_key: str
-    model: str = "qwen3.7-plus"
+    model: str = "qwen3.6-flash"
     base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
     @classmethod
@@ -104,7 +110,7 @@ class QwenSettings:
         if not api_key:
             raise ConfigError("Missing required Qwen environment variable: DASHSCOPE_API_KEY")
 
-        model = os.getenv("QWEN_MODEL", "qwen3.7-plus").strip()
+        model = os.getenv("QWEN_MODEL", "qwen3.6-flash").strip()
         base_url = os.getenv(
             "QWEN_BASE_URL",
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -114,13 +120,26 @@ class QwenSettings:
 
 class QwenProvider:
     def __init__(self, settings: QwenSettings) -> None:
-        from openai import OpenAI
+        from openai import AsyncOpenAI, OpenAI
 
         self._client = OpenAI(api_key=settings.api_key, base_url=settings.base_url)
+        self._async_client = AsyncOpenAI(api_key=settings.api_key, base_url=settings.base_url)
         self._model = settings.model
 
     def complete(self, prompt: str) -> str:
         completion = self._client.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+        content = completion.choices[0].message.content
+        if content:
+            return content
+        raise RuntimeError("Qwen response did not contain message content.")
+
+    async def async_complete(self, prompt: str) -> str:
+        completion = await self._async_client.chat.completions.create(
             model=self._model,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},

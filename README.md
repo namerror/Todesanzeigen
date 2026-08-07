@@ -56,7 +56,7 @@ To use Qwen through Alibaba Cloud Model Studio's OpenAI-compatible API:
 ```sh
 TODESANZEIGEN_LLM_PROVIDER=qwen
 DASHSCOPE_API_KEY=your-dashscope-api-key
-QWEN_MODEL=qwen3.7-plus
+QWEN_MODEL=qwen3.6-flash
 QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 ```
 
@@ -147,6 +147,7 @@ todesanzeigen extract --limit 10
 todesanzeigen extract --artifacts-dir artifacts --output-file output/result.csv
 todesanzeigen extract --source "Augsburger Allgemeine"
 todesanzeigen extract --provider qwen
+todesanzeigen extract --provider qwen --concurrency 10
 todesanzeigen extract --name-confidence-threshold 90 --log-dir logs
 ```
 
@@ -154,6 +155,30 @@ The extraction step makes remote API calls to the configured LLM provider. Local
 OCR does not remove LLM usage. Rerun OCR with `--overwrite` if you have old
 text-only artifacts without matching TSV files, then run `todesanzeigen filter`
 before extraction.
+
+Extraction is checkpointed by default. Every `extract` run writes completed,
+skipped, and failed file records to `logs/results.jsonl` unless `--resume-from`
+points at another JSONL checkpoint. Existing `processed` and
+`skipped_low_confidence` records are reused on the next run, while failed or
+missing files are tried again.
+
+Extraction is sequential by default. Passing `--concurrency` greater than `1`
+enables concurrent extraction with retry and rate limiting. Qwen runs default to
+conservative limits of 600 requests/minute and 500000 estimated tokens/minute
+unless overridden:
+
+```sh
+TODESANZEIGEN_LLM_CONCURRENCY=10
+TODESANZEIGEN_LLM_RPM_LIMIT=600
+TODESANZEIGEN_LLM_TPM_LIMIT=500000
+TODESANZEIGEN_LLM_MAX_RETRIES=5
+```
+
+Resume or continue a run with a specific checkpoint file:
+
+```sh
+todesanzeigen extract --provider qwen --concurrency 10 --resume-from logs/results.jsonl
+```
 
 ## Google Document AI Fallback
 

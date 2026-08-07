@@ -1,5 +1,5 @@
 import types
-from unittest import TestCase
+from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import Mock, patch
 
 from src.todesanzeigen.llm import (
@@ -71,7 +71,7 @@ class QwenSettingsTests(TestCase):
             settings = QwenSettings.from_env()
 
         self.assertEqual(settings.api_key, "key")
-        self.assertEqual(settings.model, "qwen3.7-plus")
+        self.assertEqual(settings.model, "qwen3.6-flash")
         self.assertEqual(
             settings.base_url,
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -112,8 +112,10 @@ class QwenProviderTests(TestCase):
             chat=types.SimpleNamespace(completions=completions)
         )
         openai_constructor = Mock(return_value=client)
+        async_openai_constructor = Mock()
         openai_module = types.ModuleType("openai")
         openai_module.OpenAI = openai_constructor
+        openai_module.AsyncOpenAI = async_openai_constructor
 
         with patch.dict("sys.modules", {"openai": openai_module}):
             provider = QwenProvider(
@@ -127,6 +129,10 @@ class QwenProviderTests(TestCase):
 
         self.assertEqual(result, '{"name":"Mustermann"}')
         openai_constructor.assert_called_once_with(
+            api_key="key",
+            base_url="https://example.test/compatible-mode/v1",
+        )
+        async_openai_constructor.assert_called_once_with(
             api_key="key",
             base_url="https://example.test/compatible-mode/v1",
         )
@@ -148,6 +154,7 @@ class QwenProviderTests(TestCase):
         )
         openai_module = types.ModuleType("openai")
         openai_module.OpenAI = Mock(return_value=client)
+        openai_module.AsyncOpenAI = Mock()
 
         with patch.dict("sys.modules", {"openai": openai_module}):
             provider = QwenProvider(QwenSettings(api_key="key"))
@@ -155,3 +162,46 @@ class QwenProviderTests(TestCase):
                 provider.complete("prompt")
 
         self.assertIn("Qwen response did not contain message content", str(error.exception))
+
+
+class QwenAsyncProviderTests(IsolatedAsyncioTestCase):
+    async def test_qwen_provider_requests_async_json_chat_completion(self) -> None:
+        completion = types.SimpleNamespace(
+            choices=[
+                types.SimpleNamespace(
+                    message=types.SimpleNamespace(content='{"name":"Mustermann"}')
+                )
+            ]
+        )
+        completions = Mock()
+        completions.create = Mock()
+
+        async def create_completion(**kwargs: object) -> object:
+            completions.create(**kwargs)
+            return completion
+
+        async_completions = types.SimpleNamespace(create=create_completion)
+        async_client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=async_completions)
+        )
+        openai_module = types.ModuleType("openai")
+        openai_module.OpenAI = Mock()
+        openai_module.AsyncOpenAI = Mock(return_value=async_client)
+
+        with patch.dict("sys.modules", {"openai": openai_module}):
+            provider = QwenProvider(
+                QwenSettings(
+                    api_key="key",
+                    model="qwen-plus",
+                    base_url="https://example.test/compatible-mode/v1",
+                )
+            )
+            result = await provider.async_complete("Bitte JSON extrahieren.")
+
+        self.assertEqual(result, '{"name":"Mustermann"}')
+        completions.create.assert_called_once_with(
+            model="qwen-plus",
+            messages=[{"role": "user", "content": "Bitte JSON extrahieren."}],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )

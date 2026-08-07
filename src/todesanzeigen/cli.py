@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
-from .extract import DEFAULT_NAME_CONFIDENCE_THRESHOLD, extract_artifacts_to_csv
+from .extract import (
+    DEFAULT_NAME_CONFIDENCE_THRESHOLD,
+    AsyncExtractionSettings,
+    extract_artifacts_to_csv_async,
+)
 from .llm import LLM_PROVIDERS, build_llm_provider
 from .ocr import (
     ConfigError,
@@ -25,6 +30,13 @@ def _load_dotenv() -> None:
     except ImportError:
         return
     load_dotenv()
+
+
+def _env_int(name: str, default: int | None = None) -> int | None:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    return int(value)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -62,6 +74,27 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_NAME_CONFIDENCE_THRESHOLD,
     )
     extract.add_argument("--log-dir", type=Path, default=Path("logs"))
+    extract.add_argument(
+        "--concurrency",
+        type=int,
+        default=_env_int("TODESANZEIGEN_LLM_CONCURRENCY", 1),
+    )
+    extract.add_argument(
+        "--rpm-limit",
+        type=int,
+        default=_env_int("TODESANZEIGEN_LLM_RPM_LIMIT"),
+    )
+    extract.add_argument(
+        "--tpm-limit",
+        type=int,
+        default=_env_int("TODESANZEIGEN_LLM_TPM_LIMIT"),
+    )
+    extract.add_argument(
+        "--max-retries",
+        type=int,
+        default=_env_int("TODESANZEIGEN_LLM_MAX_RETRIES", 5),
+    )
+    extract.add_argument("--resume-from", type=Path)
 
     filter_parser = subparsers.add_parser(
         "filter",
@@ -124,22 +157,49 @@ def run_ocr_command(args: argparse.Namespace) -> int:
 
 
 def run_extract_command(args: argparse.Namespace) -> int:
+    if args.concurrency < 1:
+        raise ValueError("LLM extraction concurrency must be at least 1.")
+    if args.max_retries < 0:
+        raise ValueError("LLM max retries must be at least 0.")
+    if args.rpm_limit is not None and args.rpm_limit < 0:
+        raise ValueError("LLM RPM limit must be at least 0.")
+    if args.tpm_limit is not None and args.tpm_limit < 0:
+        raise ValueError("LLM TPM limit must be at least 0.")
+
     provider = build_llm_provider(args.provider)
     log_file = args.log_dir / f"extract-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"
-    results = extract_artifacts_to_csv(
-        args.artifacts_dir,
-        args.output_file,
-        provider,
-        source=args.source,
-        limit=args.limit,
-        name_confidence_threshold=args.name_confidence_threshold,
-        log_file=log_file,
+    checkpoint_file = args.resume_from or args.log_dir / "results.jsonl"
+    rpm_limit = args.rpm_limit
+    tpm_limit = args.tpm_limit
+    if args.provider == "qwen":
+        rpm_limit = 600 if rpm_limit is None else rpm_limit
+        tpm_limit = 500000 if tpm_limit is None else tpm_limit
+    results = asyncio.run(
+        extract_artifacts_to_csv_async(
+            args.artifacts_dir,
+            args.output_file,
+            provider,
+            source=args.source,
+            limit=args.limit,
+            name_confidence_threshold=args.name_confidence_threshold,
+            log_file=log_file,
+            checkpoint_file=checkpoint_file,
+            resume_from=checkpoint_file,
+            settings=AsyncExtractionSettings(
+                concurrency=args.concurrency,
+                rpm_limit=rpm_limit,
+                tpm_limit=tpm_limit,
+                max_retries=args.max_retries,
+            ),
+        )
     )
     processed = sum(1 for result in results if result.status == "processed")
     skipped = sum(1 for result in results if result.status == "skipped_low_confidence")
+    failed = sum(1 for result in results if result.status == "failed")
     print(
         f"Extraction complete: {processed} rows written to {args.output_file}; "
-        f"{skipped} skipped. Log written to {log_file}."
+        f"{skipped} skipped; {failed} failed. "
+        f"Log written to {log_file}. Checkpoint written to {checkpoint_file}."
     )
     return 0
 
@@ -160,10 +220,9 @@ def run_filter_command(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     _load_dotenv()
-    parser = build_parser()
-    args = parser.parse_args(argv)
-
     try:
+        parser = build_parser()
+        args = parser.parse_args(argv)
         if args.command == "ocr":
             return run_ocr_command(args)
         if args.command == "extract":

@@ -3,7 +3,7 @@ from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from src.todesanzeigen import cli
 from src.todesanzeigen.ocr import ConfigError
@@ -139,7 +139,10 @@ class CliOcrTests(TestCase):
 
         with (
             patch("src.todesanzeigen.cli.build_llm_provider", return_value="provider") as build_provider,
-            patch("src.todesanzeigen.cli.extract_artifacts_to_csv", return_value=[]) as extract,
+            patch(
+                "src.todesanzeigen.cli.extract_artifacts_to_csv_async",
+                new=AsyncMock(return_value=[]),
+            ) as extract,
         ):
             output = StringIO()
             with redirect_stdout(output):
@@ -157,8 +160,12 @@ class CliOcrTests(TestCase):
         self.assertEqual(kwargs["name_confidence_threshold"], 90)
         self.assertEqual(kwargs["log_file"].parent, Path("custom-logs"))
         self.assertRegex(kwargs["log_file"].name, r"^extract-\d{8}-\d{6}\.txt$")
+        self.assertEqual(kwargs["checkpoint_file"], Path("custom-logs/results.jsonl"))
+        self.assertEqual(kwargs["resume_from"], Path("custom-logs/results.jsonl"))
+        self.assertEqual(kwargs["settings"].concurrency, 1)
         self.assertIn("0 rows written", output.getvalue())
         self.assertIn("0 skipped", output.getvalue())
+        self.assertIn("Checkpoint written to custom-logs/results.jsonl", output.getvalue())
 
     def test_extract_command_uses_provider_from_env_default(self) -> None:
         with patch.dict(
@@ -170,9 +177,76 @@ class CliOcrTests(TestCase):
 
         with (
             patch("src.todesanzeigen.cli.build_llm_provider", return_value="provider") as build_provider,
-            patch("src.todesanzeigen.cli.extract_artifacts_to_csv", return_value=[]),
+            patch(
+                "src.todesanzeigen.cli.extract_artifacts_to_csv_async",
+                new=AsyncMock(return_value=[]),
+            ),
         ):
             status = cli.run_extract_command(args)
 
         self.assertEqual(status, 0)
         build_provider.assert_called_once_with("qwen")
+
+    def test_extract_command_uses_async_path_for_concurrency(self) -> None:
+        args = cli.build_parser().parse_args(
+            [
+                "extract",
+                "--provider",
+                "qwen",
+                "--concurrency",
+                "10",
+                "--rpm-limit",
+                "100",
+                "--tpm-limit",
+                "200000",
+                "--max-retries",
+                "3",
+            ]
+        )
+
+        with (
+            patch("src.todesanzeigen.cli.build_llm_provider", return_value="provider") as build_provider,
+            patch(
+                "src.todesanzeigen.cli.extract_artifacts_to_csv_async",
+                new=AsyncMock(return_value=[]),
+            ) as async_extract,
+        ):
+            output = StringIO()
+            with redirect_stdout(output):
+                status = cli.run_extract_command(args)
+
+        self.assertEqual(status, 0)
+        build_provider.assert_called_once_with("qwen")
+        kwargs = async_extract.call_args.kwargs
+        self.assertEqual(async_extract.call_args.args, (Path("artifacts"), Path("output/result.csv"), "provider"))
+        self.assertEqual(kwargs["settings"].concurrency, 10)
+        self.assertEqual(kwargs["settings"].rpm_limit, 100)
+        self.assertEqual(kwargs["settings"].tpm_limit, 200000)
+        self.assertEqual(kwargs["settings"].max_retries, 3)
+        self.assertIn("0 failed", output.getvalue())
+
+    def test_extract_command_uses_qwen_async_default_limits(self) -> None:
+        args = cli.build_parser().parse_args(
+            ["extract", "--provider", "qwen", "--concurrency", "2"]
+        )
+
+        with (
+            patch("src.todesanzeigen.cli.build_llm_provider", return_value="provider"),
+            patch(
+                "src.todesanzeigen.cli.extract_artifacts_to_csv_async",
+                new=AsyncMock(return_value=[]),
+            ) as async_extract,
+        ):
+            cli.run_extract_command(args)
+
+        settings = async_extract.call_args.kwargs["settings"]
+        self.assertEqual(settings.rpm_limit, 600)
+        self.assertEqual(settings.tpm_limit, 500000)
+
+    def test_extract_command_rejects_invalid_concurrency(self) -> None:
+        args = cli.build_parser().parse_args(["extract", "--concurrency", "0"])
+
+        with self.assertRaises(ValueError) as error:
+            cli.run_extract_command(args)
+
+        self.assertIn("concurrency must be at least 1", str(error.exception))
