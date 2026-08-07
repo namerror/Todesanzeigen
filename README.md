@@ -6,7 +6,7 @@ The current workflow has separate steps:
 
 1. Run OCR on images from `input/` and write plain text artifacts to `artifacts/`.
 2. Optionally run the local TSV filter to print likely deceased names.
-3. Parse those OCR text artifacts with Gemini and write structured rows to `output/result.csv`.
+3. Parse those OCR text artifacts with an LLM and write structured rows to `output/result.csv`.
 
 Local Tesseract OCR is the default. Google Document AI OCR is kept as a guarded legacy fallback and is blocked unless explicitly unlocked.
 
@@ -42,12 +42,27 @@ The default OCR command uses that local tessdata directory with German-only OCR:
 `--tesseract-oem 1` selects Tesseract's LSTM OCR engine. This is the right mode
 for `tessdata_best` models such as `data/deu.traineddata`.
 
-For structured extraction, create a `.env` file from `.env.example` and set:
+For structured extraction, create a `.env` file from `.env.example` and configure an LLM provider.
+Gemini remains the default:
 
 ```sh
+TODESANZEIGEN_LLM_PROVIDER=gemini
 GEMINI_API_KEY=your-gemini-api-key
 GEMINI_MODEL=gemini-2.0-flash-lite
 ```
+
+To use Qwen through Alibaba Cloud Model Studio's OpenAI-compatible API:
+
+```sh
+TODESANZEIGEN_LLM_PROVIDER=qwen
+DASHSCOPE_API_KEY=your-dashscope-api-key
+QWEN_MODEL=qwen3.7-plus
+QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+```
+
+Qwen base URLs are region-specific. Override `QWEN_BASE_URL` if your API key is
+for another region, such as `https://dashscope-us.aliyuncs.com/compatible-mode/v1`
+for US Virginia.
 
 ## OCR Usage
 
@@ -131,12 +146,13 @@ Common options:
 todesanzeigen extract --limit 10
 todesanzeigen extract --artifacts-dir artifacts --output-file output/result.csv
 todesanzeigen extract --source "Augsburger Allgemeine"
+todesanzeigen extract --provider qwen
 todesanzeigen extract --name-confidence-threshold 90 --log-dir logs
 ```
 
-The extraction step currently uses Gemini and therefore makes remote API calls.
-Local OCR does not remove Gemini usage. Rerun OCR with `--overwrite` if you have
-old text-only artifacts without matching TSV files, then run `todesanzeigen filter`
+The extraction step makes remote API calls to the configured LLM provider. Local
+OCR does not remove LLM usage. Rerun OCR with `--overwrite` if you have old
+text-only artifacts without matching TSV files, then run `todesanzeigen filter`
 before extraction.
 
 ## Google Document AI Fallback

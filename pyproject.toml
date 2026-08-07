@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
     "google-cloud-documentai>=3.0.0",
     "google-genai>=1.0.0",
+    "openai>=1.0.0",
     "python-dotenv>=1.0.0",
 ]
 

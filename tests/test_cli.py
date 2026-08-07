@@ -118,27 +118,27 @@ class CliOcrTests(TestCase):
         )
 
     def test_extract_command_passes_threshold_and_log_file(self) -> None:
-        args = cli.build_parser().parse_args(
-            [
-                "extract",
-                "--artifacts-dir",
-                "custom-artifacts",
-                "--output-file",
-                "custom-output/result.csv",
-                "--source",
-                "Testquelle",
-                "--limit",
-                "2",
-                "--name-confidence-threshold",
-                "90",
-                "--log-dir",
-                "custom-logs",
-            ]
-        )
+        with patch.dict("src.todesanzeigen.cli.os.environ", {}, clear=True):
+            args = cli.build_parser().parse_args(
+                [
+                    "extract",
+                    "--artifacts-dir",
+                    "custom-artifacts",
+                    "--output-file",
+                    "custom-output/result.csv",
+                    "--source",
+                    "Testquelle",
+                    "--limit",
+                    "2",
+                    "--name-confidence-threshold",
+                    "90",
+                    "--log-dir",
+                    "custom-logs",
+                ]
+            )
 
         with (
-            patch("src.todesanzeigen.cli.GeminiSettings.from_env", return_value="settings"),
-            patch("src.todesanzeigen.cli.GeminiProvider", return_value="provider"),
+            patch("src.todesanzeigen.cli.build_llm_provider", return_value="provider") as build_provider,
             patch("src.todesanzeigen.cli.extract_artifacts_to_csv", return_value=[]) as extract,
         ):
             output = StringIO()
@@ -146,6 +146,7 @@ class CliOcrTests(TestCase):
                 status = cli.run_extract_command(args)
 
         self.assertEqual(status, 0)
+        build_provider.assert_called_once_with("gemini")
         kwargs = extract.call_args.kwargs
         self.assertEqual(
             extract.call_args.args,
@@ -158,3 +159,20 @@ class CliOcrTests(TestCase):
         self.assertRegex(kwargs["log_file"].name, r"^extract-\d{8}-\d{6}\.txt$")
         self.assertIn("0 rows written", output.getvalue())
         self.assertIn("0 skipped", output.getvalue())
+
+    def test_extract_command_uses_provider_from_env_default(self) -> None:
+        with patch.dict(
+            "src.todesanzeigen.cli.os.environ",
+            {"TODESANZEIGEN_LLM_PROVIDER": "qwen"},
+            clear=True,
+        ):
+            args = cli.build_parser().parse_args(["extract"])
+
+        with (
+            patch("src.todesanzeigen.cli.build_llm_provider", return_value="provider") as build_provider,
+            patch("src.todesanzeigen.cli.extract_artifacts_to_csv", return_value=[]),
+        ):
+            status = cli.run_extract_command(args)
+
+        self.assertEqual(status, 0)
+        build_provider.assert_called_once_with("qwen")

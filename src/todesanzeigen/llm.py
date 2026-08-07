@@ -36,6 +36,23 @@ class LlmProvider(Protocol):
         """Return the model response body for one prompt."""
 
 
+LLM_PROVIDERS = ("gemini", "qwen")
+
+
+def build_llm_provider(provider_name: str | None = None) -> LlmProvider:
+    raw_provider = (
+        provider_name
+        if provider_name is not None
+        else os.getenv("TODESANZEIGEN_LLM_PROVIDER", "gemini")
+    )
+    provider = raw_provider.strip().lower() or "gemini"
+    if provider == "gemini":
+        return GeminiProvider(GeminiSettings.from_env())
+    if provider == "qwen":
+        return QwenProvider(QwenSettings.from_env())
+    raise ConfigError(f"Unsupported LLM provider: {provider}")
+
+
 @dataclass(frozen=True)
 class GeminiSettings:
     api_key: str
@@ -73,3 +90,43 @@ class GeminiProvider:
         if text:
             return text
         raise RuntimeError("Gemini response did not contain text.")
+
+
+@dataclass(frozen=True)
+class QwenSettings:
+    api_key: str
+    model: str = "qwen3.7-plus"
+    base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+    @classmethod
+    def from_env(cls) -> "QwenSettings":
+        api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
+        if not api_key:
+            raise ConfigError("Missing required Qwen environment variable: DASHSCOPE_API_KEY")
+
+        model = os.getenv("QWEN_MODEL", "qwen3.7-plus").strip()
+        base_url = os.getenv(
+            "QWEN_BASE_URL",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        ).strip()
+        return cls(api_key=api_key, model=model, base_url=base_url)
+
+
+class QwenProvider:
+    def __init__(self, settings: QwenSettings) -> None:
+        from openai import OpenAI
+
+        self._client = OpenAI(api_key=settings.api_key, base_url=settings.base_url)
+        self._model = settings.model
+
+    def complete(self, prompt: str) -> str:
+        completion = self._client.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+        content = completion.choices[0].message.content
+        if content:
+            return content
+        raise RuntimeError("Qwen response did not contain message content.")
