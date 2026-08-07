@@ -102,6 +102,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     filter_parser.add_argument("--artifacts-dir", type=Path, default=Path("artifacts"))
     filter_parser.add_argument("--limit", type=int)
+    filter_parser.add_argument(
+        "--name-confidence-threshold",
+        type=float,
+        default=DEFAULT_NAME_CONFIDENCE_THRESHOLD,
+    )
+    filter_parser.add_argument("--low-confidence-log-file", type=Path)
 
     return parser
 
@@ -205,7 +211,14 @@ def run_extract_command(args: argparse.Namespace) -> int:
 
 
 def run_filter_command(args: argparse.Namespace) -> int:
-    results = filter_artifact_names(args.artifacts_dir, limit=args.limit)
+    results = filter_artifact_names(
+        args.artifacts_dir,
+        limit=args.limit,
+        low_confidence_log_path=args.low_confidence_log_file,
+        confidence_threshold=(
+            args.name_confidence_threshold if args.low_confidence_log_file is not None else None
+        ),
+    )
     for result in results:
         if not result.name:
             print(f"{result.artifact_path.name}: <not found>")
@@ -215,6 +228,16 @@ def run_filter_command(args: argparse.Namespace) -> int:
         )
         print(f"{result.artifact_path.name}: {result.name}{confidence}")
     print(f"Name map written to {name_map_artifact_path(args.artifacts_dir)}.")
+    if args.low_confidence_log_file is not None:
+        skipped = sum(
+            1
+            for result in results
+            if result.confidence is None or result.confidence < args.name_confidence_threshold
+        )
+        print(
+            f"Low-confidence skip log written to {args.low_confidence_log_file} "
+            f"({skipped} entries below {args.name_confidence_threshold:.1f})."
+        )
     return 0
 
 

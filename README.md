@@ -116,14 +116,21 @@ This reads `artifacts/*.tsv`, uses the largest visible text lines as the main
 signal, and prints one likely name per TSV artifact with the average OCR
 confidence of the retained name words. It also writes `artifacts/name_map.json`,
 mapping each `.txt` OCR artifact filename to the detected name and confidence.
-It does not call an LLM.
+It does not call an LLM and does not discard low-confidence entries by default.
 
 Common options:
 
 ```sh
 todesanzeigen filter --limit 10
 todesanzeigen filter --artifacts-dir artifacts
+todesanzeigen filter --low-confidence-log-file logs/filter-low-confidence.jsonl
+todesanzeigen filter --name-confidence-threshold 90 --low-confidence-log-file logs/filter-low-confidence.jsonl
 ```
+
+The optional low-confidence log is a JSONL report of entries that would be
+skipped by extraction under the configured threshold. Missing confidence and
+confidence below the threshold are logged; confidence equal to the threshold is
+kept. The generated `name_map.json` still contains every TSV result.
 
 ## Structured Extraction Usage
 

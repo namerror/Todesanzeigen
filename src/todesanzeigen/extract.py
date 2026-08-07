@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .llm import CSV_COLUMNS, LlmProvider
-from .ocr_filtering import name_map_artifact_path
+from .ocr_filtering import is_below_confidence_threshold, name_map_artifact_path
 
 
 @dataclass(frozen=True)
@@ -377,7 +377,7 @@ async def extract_artifacts_to_csv_async(
 
 
 def _is_below_confidence_threshold(name_hint: NameHint, threshold: float) -> bool:
-    return name_hint.confidence is None or name_hint.confidence < threshold
+    return is_below_confidence_threshold(name_hint.confidence, threshold)
 
 
 def _write_low_confidence_warning(

@@ -48,6 +48,7 @@ class NameFilterResult:
 
 
 NAME_MAP_FILENAME = "name_map.json"
+LOW_CONFIDENCE_STATUS = "skipped_low_confidence"
 _WORD_EDGE_CHARS = "\"'`´‘’‚“”„()[]{}<>|/\\:;,_~=+*#%!?«»"
 _DATE_OR_NOTICE_PATTERN = re.compile(
     r"(\d|veröffentlicht|nachrichten|januar|februar|märz|maerz|april|mai|juni|"
@@ -123,12 +124,57 @@ def write_name_map(
     )
 
 
+def is_below_confidence_threshold(confidence: float | None, threshold: float) -> bool:
+    return confidence is None or confidence < threshold
+
+
+def low_confidence_reason(confidence: float | None) -> str:
+    return "missing_confidence" if confidence is None else "low_confidence"
+
+
+def build_low_confidence_skip_records(
+    results: list[NameFilterResult],
+    threshold: float,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for result in results:
+        if not is_below_confidence_threshold(result.confidence, threshold):
+            continue
+        records.append(
+            {
+                "filename": result.artifact_path.with_suffix(".txt").name,
+                "artifact": str(result.artifact_path),
+                "status": LOW_CONFIDENCE_STATUS,
+                "reason": low_confidence_reason(result.confidence),
+                "name": result.name,
+                "confidence": result.confidence,
+                "threshold": threshold,
+            }
+        )
+    return records
+
+
+def write_low_confidence_skip_log(
+    results: list[NameFilterResult],
+    output_path: Path,
+    threshold: float,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        json.dumps(record, ensure_ascii=False, sort_keys=True)
+        for record in build_low_confidence_skip_records(results, threshold)
+    ]
+    output_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
 def filter_artifact_names(
     artifacts_dir: Path,
     *,
     limit: int | None = None,
     write_map: bool = True,
     map_path: Path | None = None,
+    low_confidence_log_path: Path | None = None,
+    confidence_threshold: float | None = None,
 ) -> list[NameFilterResult]:
     artifact_paths = discover_tsv_artifacts(artifacts_dir)
     if limit is not None:
@@ -146,6 +192,10 @@ def filter_artifact_names(
         )
     if write_map:
         write_name_map(results, map_path or name_map_artifact_path(artifacts_dir))
+    if low_confidence_log_path is not None:
+        if confidence_threshold is None:
+            raise ValueError("confidence_threshold is required when writing a low-confidence log.")
+        write_low_confidence_skip_log(results, low_confidence_log_path, confidence_threshold)
     return results
 
 

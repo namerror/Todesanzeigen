@@ -107,7 +107,12 @@ class CliOcrTests(TestCase):
                 status = cli.run_filter_command(args)
 
         self.assertEqual(status, 0)
-        filter_names.assert_called_once_with(Path("custom-artifacts"), limit=2)
+        filter_names.assert_called_once_with(
+            Path("custom-artifacts"),
+            limit=2,
+            low_confidence_log_path=None,
+            confidence_threshold=None,
+        )
         self.assertEqual(
             output.getvalue().splitlines(),
             [
@@ -115,6 +120,43 @@ class CliOcrTests(TestCase):
                 "b.tsv: <not found>",
                 "Name map written to custom-artifacts/name_map.json.",
             ],
+        )
+
+    def test_filter_command_writes_low_confidence_log(self) -> None:
+        args = cli.build_parser().parse_args(
+            [
+                "filter",
+                "--artifacts-dir",
+                "custom-artifacts",
+                "--name-confidence-threshold",
+                "90",
+                "--low-confidence-log-file",
+                "logs/filter-low-confidence.jsonl",
+            ]
+        )
+
+        with patch("src.todesanzeigen.cli.filter_artifact_names") as filter_names:
+            filter_names.return_value = [
+                NameFilterResult(Path("custom-artifacts/a.tsv"), "Max Mustermann", 89.9),
+                NameFilterResult(Path("custom-artifacts/b.tsv"), "Erika Musterfrau", 90),
+                NameFilterResult(Path("custom-artifacts/c.tsv"), "", None),
+            ]
+            output = StringIO()
+
+            with redirect_stdout(output):
+                status = cli.run_filter_command(args)
+
+        self.assertEqual(status, 0)
+        filter_names.assert_called_once_with(
+            Path("custom-artifacts"),
+            limit=None,
+            low_confidence_log_path=Path("logs/filter-low-confidence.jsonl"),
+            confidence_threshold=90,
+        )
+        self.assertIn(
+            "Low-confidence skip log written to logs/filter-low-confidence.jsonl "
+            "(2 entries below 90.0).",
+            output.getvalue(),
         )
 
     def test_extract_command_passes_threshold_and_log_file(self) -> None:

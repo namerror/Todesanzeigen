@@ -4,11 +4,15 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 
 from src.todesanzeigen.ocr_filtering import (
+    build_low_confidence_skip_records,
     detect_name_from_tsv,
     discover_tsv_artifacts,
     filter_artifact_names,
+    is_below_confidence_threshold,
     name_map_artifact_path,
     parse_tesseract_word_lines,
+    write_low_confidence_skip_log,
+    NameFilterResult,
 )
 
 
@@ -102,3 +106,82 @@ class OcrFilteringTests(TestCase):
         self.assertEqual(results[0].name, "Max")
         self.assertEqual(results[0].confidence, 95)
         self.assertEqual(name_map, {"a.txt": {"name": "Max", "confidence": 95}})
+
+    def test_confidence_threshold_treats_missing_and_lower_as_skipped(self) -> None:
+        self.assertTrue(is_below_confidence_threshold(None, 85))
+        self.assertTrue(is_below_confidence_threshold(84.9, 85))
+        self.assertFalse(is_below_confidence_threshold(85, 85))
+
+    def test_builds_low_confidence_skip_records(self) -> None:
+        results = [
+            NameFilterResult(Path("artifacts/a.tsv"), "Alpha", 84.9),
+            NameFilterResult(Path("artifacts/b.tsv"), "Beta", 85),
+            NameFilterResult(Path("artifacts/c.tsv"), "", None),
+        ]
+
+        records = build_low_confidence_skip_records(results, 85)
+
+        self.assertEqual(
+            records,
+            [
+                {
+                    "filename": "a.txt",
+                    "artifact": "artifacts/a.tsv",
+                    "status": "skipped_low_confidence",
+                    "reason": "low_confidence",
+                    "name": "Alpha",
+                    "confidence": 84.9,
+                    "threshold": 85,
+                },
+                {
+                    "filename": "c.txt",
+                    "artifact": "artifacts/c.tsv",
+                    "status": "skipped_low_confidence",
+                    "reason": "missing_confidence",
+                    "name": "",
+                    "confidence": None,
+                    "threshold": 85,
+                },
+            ],
+        )
+
+    def test_filter_artifact_names_writes_low_confidence_log(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = root / "artifacts"
+            artifacts.mkdir()
+            log_file = root / "logs" / "low-confidence.jsonl"
+            (artifacts / "low.tsv").write_text(
+                tsv("5\t1\t1\t1\t1\t1\t100\t100\t80\t30\t80\tMax"),
+                encoding="utf-8",
+            )
+            (artifacts / "kept.tsv").write_text(
+                tsv("5\t1\t1\t1\t1\t1\t100\t100\t80\t30\t90\tAnna"),
+                encoding="utf-8",
+            )
+
+            filter_artifact_names(
+                artifacts,
+                low_confidence_log_path=log_file,
+                confidence_threshold=85,
+            )
+            records = [
+                json.loads(line)
+                for line in log_file.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["filename"], "low.txt")
+        self.assertEqual(records[0]["confidence"], 80)
+
+    def test_write_low_confidence_skip_log_creates_empty_file_when_no_skips(self) -> None:
+        with TemporaryDirectory() as tmp:
+            log_file = Path(tmp) / "logs" / "low-confidence.jsonl"
+
+            write_low_confidence_skip_log(
+                [NameFilterResult(Path("artifacts/a.tsv"), "Alpha", 90)],
+                log_file,
+                85,
+            )
+
+            self.assertEqual(log_file.read_text(encoding="utf-8"), "")
