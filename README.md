@@ -64,6 +64,27 @@ Qwen base URLs are region-specific. Override `QWEN_BASE_URL` if your API key is
 for another region, such as `https://dashscope-us.aliyuncs.com/compatible-mode/v1`
 for US Virginia.
 
+Low-confidence OCR/name cases can be sent directly to a vision model. Qwen OCR
+is the default reroute provider:
+
+```sh
+TODESANZEIGEN_REROUTE_PROVIDER=qwen
+TODESANZEIGEN_REROUTE_MODEL=qwen-vl-ocr
+QWEN_VISION_MODEL=qwen-vl-ocr
+QWEN_VISION_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+```
+
+Gemini and OpenAI vision reroute providers are also supported:
+
+```sh
+TODESANZEIGEN_REROUTE_PROVIDER=gemini
+GEMINI_VISION_MODEL=gemini-2.5-pro
+
+TODESANZEIGEN_REROUTE_PROVIDER=openai
+OPENAI_API_KEY=your-openai-api-key
+OPENAI_VISION_MODEL=gpt-5.6-luna
+```
+
 ## OCR Usage
 
 Run local Tesseract OCR for all supported images in `input/`:
@@ -144,8 +165,9 @@ todesanzeigen extract
 This reads `artifacts/*.txt`, requires `artifacts/name_map.json`, and writes
 `output/result.csv`. The LLM receives the OCR text plus the locally detected name
 and confidence as a hint; it does not receive the TSV layout artifact. Artifacts
-with missing name confidence or name confidence below 85.0 are not sent to the
-LLM. Each extraction run writes a timestamped text log under `logs/`.
+with missing name confidence or name confidence below 85.0 are skipped unless
+vision reroute is enabled. Each extraction run writes a timestamped text log
+under `logs/`.
 
 Common options:
 
@@ -156,6 +178,7 @@ todesanzeigen extract --source "Augsburger Allgemeine"
 todesanzeigen extract --provider qwen
 todesanzeigen extract --provider qwen --concurrency 10
 todesanzeigen extract --name-confidence-threshold 90 --log-dir logs
+todesanzeigen extract --reroute --input-dir input --reroute-provider qwen
 ```
 
 The extraction step makes remote API calls to the configured LLM provider. Local
@@ -164,10 +187,29 @@ text-only artifacts without matching TSV files, then run `todesanzeigen filter`
 before extraction.
 
 Extraction is checkpointed by default. Every `extract` run writes completed,
-skipped, and failed file records to `logs/results.jsonl` unless `--resume-from`
-points at another JSONL checkpoint. Existing `processed` and
-`skipped_low_confidence` records are reused on the next run, while failed or
-missing files are tried again.
+skipped, rerouted, and failed file records to `logs/results.jsonl` unless
+`--resume-from` points at another JSONL checkpoint. Existing `processed` and
+`rerouted_processed` records are reused on the next run. Existing
+`skipped_low_confidence` records are reused when reroute is off, but retried
+through the vision provider when `--reroute` is enabled.
+
+With `--reroute`, low-confidence cases are sent to the configured vision model
+using the original source image. Successful reroutes are merged into the normal
+CSV with status `rerouted_processed` in JSONL logs. Reroute audit records are
+also written to `logs/reroute-results.jsonl` unless overridden:
+
+```sh
+todesanzeigen extract \
+  --reroute \
+  --input-dir "input/Aichacher Nachrichten" \
+  --artifacts-dir "artifacts/Aichacher Nachrichten" \
+  --reroute-results-file logs/aichacher_nachrichten/reroute-results.jsonl
+```
+
+The JSONL records include `method`, `provider`, `model`, `source_image`,
+`ocr_artifact`, `tsv_artifact`, `original_name_hint`,
+`original_name_confidence`, and `threshold` so rerouted rows can be audited
+without changing the CSV schema.
 
 Extraction is sequential by default. Passing `--concurrency` greater than `1`
 enables concurrent extraction with retry and rate limiting. Qwen runs default to
@@ -186,6 +228,42 @@ Resume or continue a run with a specific checkpoint file:
 ```sh
 todesanzeigen extract --provider qwen --concurrency 10 --resume-from logs/results.jsonl
 ```
+
+## Vision Reroute Usage
+
+If high-confidence rows were already extracted without `--reroute`, process only
+the rejected cases later with the standalone reroute command:
+
+```sh
+todesanzeigen reroute \
+  --input-dir "input/Aichacher Nachrichten" \
+  --artifacts-dir "artifacts/Aichacher Nachrichten" \
+  --low-confidence-file logs/aichacher_nachrichten/filter-low-confidence.jsonl \
+  --output-file output/aichacher-rerouted.csv
+```
+
+You can also source candidates from an existing extraction checkpoint:
+
+```sh
+todesanzeigen reroute \
+  --input-dir "input/Aichacher Nachrichten" \
+  --artifacts-dir "artifacts/Aichacher Nachrichten" \
+  --from-results logs/aichacher_nachrichten/results.jsonl
+```
+
+Useful selection and merge options:
+
+```sh
+todesanzeigen reroute --only "Aichacher Nachrichten 2023_063.txt"
+todesanzeigen reroute --sample-ratio 0.1 --sample-seed 42
+todesanzeigen reroute --limit 20
+todesanzeigen reroute --merge-output-file output/result.csv
+```
+
+Standalone reroute writes `output/rerouted.csv` by default and records audit
+details in `logs/reroute-results.jsonl`. When `--merge-output-file` is passed,
+rerouted rows are merged into that CSV by `dateiname`, replacing any existing
+row for the same notice.
 
 ## Google Document AI Fallback
 
@@ -212,4 +290,11 @@ Run tests from the repository root:
 
 ```sh
 PYTHONPATH=. pytest -q
+```
+
+If `pytest` is not installed in the active environment, the current test suite
+also runs with:
+
+```sh
+python -m unittest discover -s tests
 ```

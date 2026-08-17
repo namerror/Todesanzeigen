@@ -1,11 +1,16 @@
 import types
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import Mock, patch
 
 from src.todesanzeigen.llm import (
     QwenProvider,
     QwenSettings,
+    QwenVisionProvider,
+    QwenVisionSettings,
     build_llm_provider,
+    build_vision_llm_provider,
 )
 from src.todesanzeigen.ocr import ConfigError
 
@@ -53,6 +58,38 @@ class LlmProviderTests(TestCase):
 
         self.assertIn("Unsupported LLM provider: unknown", str(error.exception))
 
+    def test_build_vision_llm_provider_defaults_to_qwen(self) -> None:
+        with (
+            patch.dict("src.todesanzeigen.llm.os.environ", {}, clear=True),
+            patch("src.todesanzeigen.llm.QwenVisionSettings.from_env", return_value="settings"),
+            patch("src.todesanzeigen.llm.QwenVisionProvider", return_value="provider") as provider,
+        ):
+            result = build_vision_llm_provider()
+
+        self.assertEqual(result, "provider")
+        provider.assert_called_once_with("settings")
+
+    def test_build_vision_llm_provider_uses_explicit_model(self) -> None:
+        settings = QwenVisionSettings(
+            api_key="key",
+            model="qwen-vl-ocr",
+            base_url="https://example.test/compatible-mode/v1",
+        )
+        with (
+            patch("src.todesanzeigen.llm.QwenVisionSettings.from_env", return_value=settings),
+            patch("src.todesanzeigen.llm.QwenVisionProvider", return_value="provider") as provider,
+        ):
+            result = build_vision_llm_provider("qwen", "qwen-vl-ocr-latest")
+
+        self.assertEqual(result, "provider")
+        provider.assert_called_once_with(
+            QwenVisionSettings(
+                api_key="key",
+                model="qwen-vl-ocr-latest",
+                base_url="https://example.test/compatible-mode/v1",
+            )
+        )
+
 
 class QwenSettingsTests(TestCase):
     def test_qwen_settings_require_api_key(self) -> None:
@@ -95,6 +132,39 @@ class QwenSettingsTests(TestCase):
             settings.base_url,
             "https://dashscope-us.aliyuncs.com/compatible-mode/v1",
         )
+
+
+class QwenVisionSettingsTests(TestCase):
+    def test_qwen_vision_settings_use_defaults(self) -> None:
+        with patch.dict(
+            "src.todesanzeigen.llm.os.environ",
+            {"DASHSCOPE_API_KEY": " key "},
+            clear=True,
+        ):
+            settings = QwenVisionSettings.from_env()
+
+        self.assertEqual(settings.api_key, "key")
+        self.assertEqual(settings.model, "qwen-vl-ocr")
+        self.assertEqual(
+            settings.base_url,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+
+    def test_qwen_vision_settings_use_env_overrides(self) -> None:
+        with patch.dict(
+            "src.todesanzeigen.llm.os.environ",
+            {
+                "DASHSCOPE_API_KEY": " key ",
+                "QWEN_VISION_MODEL": " qwen-vl-ocr-latest ",
+                "QWEN_VISION_BASE_URL": " https://example.test/compatible-mode/v1 ",
+            },
+            clear=True,
+        ):
+            settings = QwenVisionSettings.from_env()
+
+        self.assertEqual(settings.api_key, "key")
+        self.assertEqual(settings.model, "qwen-vl-ocr-latest")
+        self.assertEqual(settings.base_url, "https://example.test/compatible-mode/v1")
 
 
 class QwenProviderTests(TestCase):
@@ -162,6 +232,49 @@ class QwenProviderTests(TestCase):
                 provider.complete("prompt")
 
         self.assertIn("Qwen response did not contain message content", str(error.exception))
+
+
+class QwenVisionProviderTests(TestCase):
+    def test_qwen_vision_provider_requests_json_chat_completion_with_image(self) -> None:
+        completion = types.SimpleNamespace(
+            choices=[
+                types.SimpleNamespace(
+                    message=types.SimpleNamespace(content='{"name":"Vision"}')
+                )
+            ]
+        )
+        completions = Mock()
+        completions.create.return_value = completion
+        client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=completions)
+        )
+        openai_constructor = Mock(return_value=client)
+        async_openai_constructor = Mock()
+        openai_module = types.ModuleType("openai")
+        openai_module.OpenAI = openai_constructor
+        openai_module.AsyncOpenAI = async_openai_constructor
+
+        with TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "example.jpg"
+            image_path.write_bytes(b"image-bytes")
+            with patch.dict("sys.modules", {"openai": openai_module}):
+                provider = QwenVisionProvider(
+                    QwenVisionSettings(
+                        api_key="key",
+                        model="qwen-vl-ocr",
+                        base_url="https://example.test/compatible-mode/v1",
+                    )
+                )
+                result = provider.vision_complete("Bitte JSON extrahieren.", image_path, "image/jpeg")
+
+        self.assertEqual(result, '{"name":"Vision"}')
+        completions.create.assert_called_once()
+        kwargs = completions.create.call_args.kwargs
+        self.assertEqual(kwargs["model"], "qwen-vl-ocr")
+        self.assertEqual(kwargs["response_format"], {"type": "json_object"})
+        content = kwargs["messages"][0]["content"]
+        self.assertEqual(content[0], {"type": "text", "text": "Bitte JSON extrahieren."})
+        self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
 
 
 class QwenAsyncProviderTests(IsolatedAsyncioTestCase):

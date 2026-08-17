@@ -7,12 +7,16 @@ from unittest.mock import patch
 
 from src.todesanzeigen.extract import (
     AsyncExtractionSettings,
+    VisionRerouteSettings,
     discover_artifacts,
     estimate_llm_tokens,
     extract_artifacts_to_csv,
     extract_artifacts_to_csv_async,
+    load_reroute_candidates,
     load_name_map,
     parse_json_object,
+    reroute_candidates_to_csv_async,
+    select_reroute_candidates,
 )
 from src.todesanzeigen.llm import CSV_COLUMNS
 
@@ -38,6 +42,23 @@ class AsyncFakeLlmProvider:
             if marker in prompt:
                 return response
         return "{}"
+
+
+class AsyncFakeVisionProvider:
+    provider_name = "fake-vision"
+    model_name = "fake-vision-model"
+
+    def __init__(self, response: str) -> None:
+        self.response = response
+        self.calls: list[tuple[str, Path, str]] = []
+
+    def vision_complete(self, prompt: str, image_path: Path, mime_type: str) -> str:
+        self.calls.append((prompt, image_path, mime_type))
+        return self.response
+
+    async def async_vision_complete(self, prompt: str, image_path: Path, mime_type: str) -> str:
+        self.calls.append((prompt, image_path, mime_type))
+        return self.response
 
 
 class ExtractTests(TestCase):
@@ -225,6 +246,40 @@ class ExtractTests(TestCase):
     def test_estimate_llm_tokens_includes_output_budget(self) -> None:
         self.assertEqual(estimate_llm_tokens("abc"), 301)
 
+    def test_load_reroute_candidates_from_results_checkpoint(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = root / "artifacts"
+            checkpoint = root / "logs" / "results.jsonl"
+            artifacts.mkdir()
+            checkpoint.parent.mkdir()
+            (artifacts / "name_map.json").write_text(
+                json.dumps(
+                    {
+                        "low.txt": {"name": "Low Person", "confidence": 80},
+                        "done.txt": {"name": "Done Person", "confidence": 95},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            checkpoint.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"filename": "low.txt", "status": "skipped_low_confidence"}),
+                        json.dumps({"filename": "done.txt", "status": "processed", "row": {}}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            candidates = load_reroute_candidates(artifacts, results_file=checkpoint)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].artifact_path.name, "low.txt")
+        self.assertEqual(candidates[0].name_hint.name, "Low Person")
+        self.assertEqual(candidates[0].name_hint.confidence, 80)
+
 
 class AsyncExtractTests(IsolatedAsyncioTestCase):
     async def test_async_extract_writes_rows_in_artifact_order(self) -> None:
@@ -284,6 +339,112 @@ class AsyncExtractTests(IsolatedAsyncioTestCase):
 
         self.assertEqual(results[0].status, "skipped_low_confidence")
         self.assertEqual(provider.prompts, [])
+
+    async def test_async_extract_reroutes_low_confidence_to_vision_provider(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = root / "artifacts"
+            input_dir = root / "input"
+            output = root / "output" / "result.csv"
+            reroute_results = root / "logs" / "reroute-results.jsonl"
+            artifacts.mkdir()
+            input_dir.mkdir()
+            (artifacts / "example.txt").write_text("weak local OCR", encoding="utf-8")
+            (artifacts / "name_map.json").write_text(
+                json.dumps({"example.txt": {"name": "Wrong Person", "confidence": 40}}),
+                encoding="utf-8",
+            )
+            (input_dir / "example.jpg").write_bytes(b"image")
+            text_provider = AsyncFakeLlmProvider({"weak local OCR": "{}"})
+            vision_provider = AsyncFakeVisionProvider(json.dumps({"name": "Vision Name"}))
+
+            results = await extract_artifacts_to_csv_async(
+                artifacts,
+                output,
+                text_provider,
+                reroute_settings=VisionRerouteSettings(
+                    input_dir=input_dir,
+                    provider=vision_provider,
+                    results_file=reroute_results,
+                ),
+            )
+            with output.open(encoding="utf-8", newline="") as csv_file:
+                rows = list(csv.DictReader(csv_file))
+            reroute_records = [
+                json.loads(line)
+                for line in reroute_results.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(results[0].status, "rerouted_processed")
+        self.assertEqual(text_provider.prompts, [])
+        self.assertEqual(rows[0]["name"], "Vision Name")
+        self.assertEqual(vision_provider.calls[0][1].name, "example.jpg")
+        self.assertEqual(vision_provider.calls[0][2], "image/jpeg")
+        self.assertIn("weak local OCR", vision_provider.calls[0][0])
+        self.assertEqual(reroute_records[0]["method"], "vision_model_reroute")
+        self.assertEqual(reroute_records[0]["original_name_confidence"], 40)
+
+    async def test_standalone_reroute_processes_selected_low_confidence_candidates(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = root / "artifacts"
+            input_dir = root / "input"
+            output = root / "output" / "rerouted.csv"
+            results_file = root / "logs" / "reroute-results.jsonl"
+            artifacts.mkdir()
+            input_dir.mkdir()
+            (artifacts / "a.txt").write_text("a ocr", encoding="utf-8")
+            (artifacts / "b.txt").write_text("b ocr", encoding="utf-8")
+            (input_dir / "a.jpg").write_bytes(b"a")
+            (input_dir / "b.jpg").write_bytes(b"b")
+            low_confidence_file = root / "logs" / "filter-low-confidence.jsonl"
+            low_confidence_file.parent.mkdir()
+            low_confidence_file.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "filename": "a.txt",
+                                "status": "skipped_low_confidence",
+                                "name": "A Person",
+                                "confidence": 80,
+                                "threshold": 85,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "filename": "b.txt",
+                                "status": "skipped_low_confidence",
+                                "name": "B Person",
+                                "confidence": 70,
+                                "threshold": 85,
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            candidates = select_reroute_candidates(
+                load_reroute_candidates(artifacts, low_confidence_file=low_confidence_file),
+                only=["b.txt"],
+            )
+            vision_provider = AsyncFakeVisionProvider(json.dumps({"name": "Selected Vision"}))
+
+            results = await reroute_candidates_to_csv_async(
+                candidates,
+                output,
+                vision_provider,
+                input_dir=input_dir,
+                results_file=results_file,
+            )
+            with output.open(encoding="utf-8", newline="") as csv_file:
+                rows = list(csv.DictReader(csv_file))
+
+        self.assertEqual([candidate.artifact_path.name for candidate in candidates], ["b.txt"])
+        self.assertEqual(results[0].status, "rerouted_processed")
+        self.assertEqual(rows[0]["name"], "Selected Vision")
+        self.assertEqual(vision_provider.calls[0][1].name, "b.jpg")
 
     async def test_async_extract_retries_transient_errors(self) -> None:
         class RateLimitError(Exception):

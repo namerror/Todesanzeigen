@@ -285,6 +285,48 @@ class CliOcrTests(TestCase):
         self.assertEqual(settings.rpm_limit, 600)
         self.assertEqual(settings.tpm_limit, 500000)
 
+    def test_extract_command_passes_reroute_settings(self) -> None:
+        args = cli.build_parser().parse_args(
+            [
+                "extract",
+                "--reroute",
+                "--input-dir",
+                "custom-input",
+                "--reroute-provider",
+                "gemini",
+                "--reroute-model",
+                "gemini-2.5-pro",
+                "--reroute-results-file",
+                "custom-logs/reroute-results.jsonl",
+                "--reroute-concurrency",
+                "2",
+            ]
+        )
+
+        with (
+            patch("src.todesanzeigen.cli.build_llm_provider", return_value="text-provider"),
+            patch(
+                "src.todesanzeigen.cli.build_vision_llm_provider",
+                return_value="vision-provider",
+            ) as build_vision_provider,
+            patch(
+                "src.todesanzeigen.cli.extract_artifacts_to_csv_async",
+                new=AsyncMock(return_value=[]),
+            ) as async_extract,
+        ):
+            output = StringIO()
+            with redirect_stdout(output):
+                status = cli.run_extract_command(args)
+
+        self.assertEqual(status, 0)
+        build_vision_provider.assert_called_once_with("gemini", "gemini-2.5-pro")
+        reroute_settings = async_extract.call_args.kwargs["reroute_settings"]
+        self.assertEqual(reroute_settings.input_dir, Path("custom-input"))
+        self.assertEqual(reroute_settings.provider, "vision-provider")
+        self.assertEqual(reroute_settings.results_file, Path("custom-logs/reroute-results.jsonl"))
+        self.assertEqual(reroute_settings.concurrency, 2)
+        self.assertIn("0 rerouted", output.getvalue())
+
     def test_extract_command_rejects_invalid_concurrency(self) -> None:
         args = cli.build_parser().parse_args(["extract", "--concurrency", "0"])
 
@@ -292,3 +334,65 @@ class CliOcrTests(TestCase):
             cli.run_extract_command(args)
 
         self.assertIn("concurrency must be at least 1", str(error.exception))
+
+    def test_reroute_command_processes_selected_candidates(self) -> None:
+        args = cli.build_parser().parse_args(
+            [
+                "reroute",
+                "--artifacts-dir",
+                "custom-artifacts",
+                "--input-dir",
+                "custom-input",
+                "--output-file",
+                "custom-output/rerouted.csv",
+                "--merge-output-file",
+                "custom-output/result.csv",
+                "--low-confidence-file",
+                "logs/filter-low-confidence.jsonl",
+                "--only",
+                "a.txt",
+                "--limit",
+                "1",
+                "--provider",
+                "qwen",
+                "--model",
+                "qwen-vl-ocr-latest",
+            ]
+        )
+
+        with (
+            patch(
+                "src.todesanzeigen.cli.build_vision_llm_provider",
+                return_value="vision-provider",
+            ) as build_vision_provider,
+            patch("src.todesanzeigen.cli.load_reroute_candidates", return_value=["a", "b"]) as load_candidates,
+            patch("src.todesanzeigen.cli.select_reroute_candidates", return_value=["a"]) as select_candidates,
+            patch(
+                "src.todesanzeigen.cli.reroute_candidates_to_csv_async",
+                new=AsyncMock(return_value=[]),
+            ) as reroute_async,
+        ):
+            output = StringIO()
+            with redirect_stdout(output):
+                status = cli.run_reroute_command(args)
+
+        self.assertEqual(status, 0)
+        build_vision_provider.assert_called_once_with("qwen", "qwen-vl-ocr-latest")
+        load_candidates.assert_called_once_with(
+            Path("custom-artifacts"),
+            low_confidence_file=Path("logs/filter-low-confidence.jsonl"),
+            results_file=None,
+            threshold=85.0,
+        )
+        select_candidates.assert_called_once_with(
+            ["a", "b"],
+            only=["a.txt"],
+            sample_ratio=None,
+            sample_seed=0,
+            limit=1,
+        )
+        self.assertEqual(reroute_async.call_args.args, (["a"], Path("custom-output/rerouted.csv"), "vision-provider"))
+        kwargs = reroute_async.call_args.kwargs
+        self.assertEqual(kwargs["input_dir"], Path("custom-input"))
+        self.assertEqual(kwargs["merge_output_file"], Path("custom-output/result.csv"))
+        self.assertIn("Vision reroute complete", output.getvalue())

@@ -10,9 +10,13 @@ from pathlib import Path
 from .extract import (
     DEFAULT_NAME_CONFIDENCE_THRESHOLD,
     AsyncExtractionSettings,
+    VisionRerouteSettings,
     extract_artifacts_to_csv_async,
+    load_reroute_candidates,
+    reroute_candidates_to_csv_async,
+    select_reroute_candidates,
 )
-from .llm import LLM_PROVIDERS, build_llm_provider
+from .llm import LLM_PROVIDERS, VISION_LLM_PROVIDERS, build_llm_provider, build_vision_llm_provider
 from .ocr import (
     ConfigError,
     DocumentAiOcrClient,
@@ -59,6 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     ocr.add_argument("--limit", type=int)
 
     extract = subparsers.add_parser("extract", help="Parse OCR artifacts and write output/result.csv.")
+    extract.add_argument("--input-dir", type=Path, default=Path("input"))
     extract.add_argument("--artifacts-dir", type=Path, default=Path("artifacts"))
     extract.add_argument("--output-file", type=Path, default=Path("output/result.csv"))
     extract.add_argument(
@@ -95,6 +100,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=_env_int("TODESANZEIGEN_LLM_MAX_RETRIES", 5),
     )
     extract.add_argument("--resume-from", type=Path)
+    extract.add_argument("--reroute", action="store_true")
+    extract.add_argument(
+        "--reroute-provider",
+        choices=VISION_LLM_PROVIDERS,
+        default=os.getenv("TODESANZEIGEN_REROUTE_PROVIDER", "qwen"),
+    )
+    extract.add_argument("--reroute-model", default=os.getenv("TODESANZEIGEN_REROUTE_MODEL"))
+    extract.add_argument("--reroute-results-file", type=Path)
+    extract.add_argument(
+        "--reroute-concurrency",
+        type=int,
+        default=_env_int("TODESANZEIGEN_REROUTE_CONCURRENCY", 1),
+    )
 
     filter_parser = subparsers.add_parser(
         "filter",
@@ -108,6 +126,47 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_NAME_CONFIDENCE_THRESHOLD,
     )
     filter_parser.add_argument("--low-confidence-log-file", type=Path)
+
+    reroute = subparsers.add_parser(
+        "reroute",
+        help="Run direct vision extraction for low-confidence or selected artifacts.",
+    )
+    reroute.add_argument("--input-dir", type=Path, default=Path("input"))
+    reroute.add_argument("--artifacts-dir", type=Path, default=Path("artifacts"))
+    reroute.add_argument("--output-file", type=Path, default=Path("output/rerouted.csv"))
+    reroute.add_argument("--merge-output-file", type=Path)
+    reroute.add_argument("--source", default=os.getenv("TODESANZEIGEN_SOURCE", ""))
+    reroute.add_argument(
+        "--provider",
+        choices=VISION_LLM_PROVIDERS,
+        default=os.getenv("TODESANZEIGEN_REROUTE_PROVIDER", "qwen"),
+    )
+    reroute.add_argument("--model", default=os.getenv("TODESANZEIGEN_REROUTE_MODEL"))
+    reroute.add_argument("--low-confidence-file", type=Path)
+    reroute.add_argument("--from-results", type=Path)
+    reroute.add_argument(
+        "--name-confidence-threshold",
+        type=float,
+        default=DEFAULT_NAME_CONFIDENCE_THRESHOLD,
+    )
+    reroute.add_argument("--limit", type=int)
+    reroute.add_argument("--sample-ratio", type=float)
+    reroute.add_argument("--sample-seed", type=int, default=0)
+    reroute.add_argument("--only", action="append")
+    reroute.add_argument("--log-dir", type=Path, default=Path("logs"))
+    reroute.add_argument("--results-file", type=Path, default=Path("logs/reroute-results.jsonl"))
+    reroute.add_argument(
+        "--concurrency",
+        type=int,
+        default=_env_int("TODESANZEIGEN_REROUTE_CONCURRENCY", 1),
+    )
+    reroute.add_argument("--rpm-limit", type=int, default=_env_int("TODESANZEIGEN_LLM_RPM_LIMIT"))
+    reroute.add_argument("--tpm-limit", type=int, default=_env_int("TODESANZEIGEN_LLM_TPM_LIMIT"))
+    reroute.add_argument(
+        "--max-retries",
+        type=int,
+        default=_env_int("TODESANZEIGEN_LLM_MAX_RETRIES", 5),
+    )
 
     return parser
 
@@ -171,8 +230,21 @@ def run_extract_command(args: argparse.Namespace) -> int:
         raise ValueError("LLM RPM limit must be at least 0.")
     if args.tpm_limit is not None and args.tpm_limit < 0:
         raise ValueError("LLM TPM limit must be at least 0.")
+    if args.reroute_concurrency < 1:
+        raise ValueError("Vision reroute concurrency must be at least 1.")
 
     provider = build_llm_provider(args.provider)
+    reroute_settings = None
+    reroute_results_file = args.reroute_results_file or args.log_dir / "reroute-results.jsonl"
+    if args.reroute:
+        reroute_provider = build_vision_llm_provider(args.reroute_provider, args.reroute_model)
+        reroute_settings = VisionRerouteSettings(
+            input_dir=args.input_dir,
+            provider=reroute_provider,
+            results_file=reroute_results_file,
+            concurrency=args.reroute_concurrency,
+        )
+
     log_file = args.log_dir / f"extract-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"
     checkpoint_file = args.resume_from or args.log_dir / "results.jsonl"
     rpm_limit = args.rpm_limit
@@ -197,15 +269,83 @@ def run_extract_command(args: argparse.Namespace) -> int:
                 tpm_limit=tpm_limit,
                 max_retries=args.max_retries,
             ),
+            reroute_settings=reroute_settings,
         )
     )
     processed = sum(1 for result in results if result.status == "processed")
+    rerouted = sum(1 for result in results if result.status == "rerouted_processed")
     skipped = sum(1 for result in results if result.status == "skipped_low_confidence")
-    failed = sum(1 for result in results if result.status == "failed")
+    failed = sum(1 for result in results if result.status in {"failed", "rerouted_failed"})
+    rows_written = processed + rerouted
+    reroute_note = f" Reroute checkpoint written to {reroute_results_file}." if args.reroute else ""
     print(
-        f"Extraction complete: {processed} rows written to {args.output_file}; "
-        f"{skipped} skipped; {failed} failed. "
+        f"Extraction complete: {rows_written} rows written to {args.output_file}; "
+        f"{skipped} skipped; {rerouted} rerouted; {failed} failed. "
         f"Log written to {log_file}. Checkpoint written to {checkpoint_file}."
+        f"{reroute_note}"
+    )
+    return 0
+
+
+def run_reroute_command(args: argparse.Namespace) -> int:
+    if args.concurrency < 1:
+        raise ValueError("Vision reroute concurrency must be at least 1.")
+    if args.max_retries < 0:
+        raise ValueError("LLM max retries must be at least 0.")
+    if args.rpm_limit is not None and args.rpm_limit < 0:
+        raise ValueError("LLM RPM limit must be at least 0.")
+    if args.tpm_limit is not None and args.tpm_limit < 0:
+        raise ValueError("LLM TPM limit must be at least 0.")
+    if args.low_confidence_file is not None and args.from_results is not None:
+        raise ValueError("Use either --low-confidence-file or --from-results, not both.")
+
+    provider = build_vision_llm_provider(args.provider, args.model)
+    low_confidence_file = args.low_confidence_file
+    if low_confidence_file is None and args.from_results is None:
+        default_low_confidence_file = args.log_dir / "filter-low-confidence.jsonl"
+        low_confidence_file = (
+            default_low_confidence_file if default_low_confidence_file.exists() else None
+        )
+    candidates = load_reroute_candidates(
+        args.artifacts_dir,
+        low_confidence_file=low_confidence_file,
+        results_file=args.from_results,
+        threshold=args.name_confidence_threshold,
+    )
+    selected_candidates = select_reroute_candidates(
+        candidates,
+        only=args.only,
+        sample_ratio=args.sample_ratio,
+        sample_seed=args.sample_seed,
+        limit=args.limit,
+    )
+    log_file = args.log_dir / f"reroute-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"
+    results = asyncio.run(
+        reroute_candidates_to_csv_async(
+            selected_candidates,
+            args.output_file,
+            provider,
+            input_dir=args.input_dir,
+            source=args.source,
+            log_file=log_file,
+            results_file=args.results_file,
+            merge_output_file=args.merge_output_file,
+            settings=AsyncExtractionSettings(
+                concurrency=args.concurrency,
+                rpm_limit=args.rpm_limit,
+                tpm_limit=args.tpm_limit,
+                max_retries=args.max_retries,
+            ),
+            concurrency=args.concurrency,
+        )
+    )
+    rerouted = sum(1 for result in results if result.status == "rerouted_processed")
+    failed = sum(1 for result in results if result.status == "rerouted_failed")
+    merge_note = f" Merged into {args.merge_output_file}." if args.merge_output_file else ""
+    print(
+        f"Vision reroute complete: {rerouted} rows written to {args.output_file}; "
+        f"{failed} failed. Log written to {log_file}. "
+        f"Results written to {args.results_file}.{merge_note}"
     )
     return 0
 
@@ -252,6 +392,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_extract_command(args)
         if args.command == "filter":
             return run_filter_command(args)
+        if args.command == "reroute":
+            return run_reroute_command(args)
     except (ConfigError, FileNotFoundError, NotADirectoryError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
