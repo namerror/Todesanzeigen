@@ -12,10 +12,13 @@ from src.todesanzeigen.extract import (
     estimate_llm_tokens,
     extract_artifacts_to_csv,
     extract_artifacts_to_csv_async,
+    extract_image_with_vision,
+    extract_images_to_csv_async,
     load_reroute_candidates,
     load_name_map,
     parse_json_object,
     reroute_candidates_to_csv_async,
+    select_image_paths,
     select_reroute_candidates,
 )
 from src.todesanzeigen.llm import CSV_COLUMNS
@@ -280,6 +283,27 @@ class ExtractTests(TestCase):
         self.assertEqual(candidates[0].name_hint.name, "Low Person")
         self.assertEqual(candidates[0].name_hint.confidence, 80)
 
+    def test_select_image_paths_applies_only_sample_and_limit(self) -> None:
+        images = [Path("b.jpg"), Path("a.png"), Path("c.webp")]
+
+        selected = select_image_paths(images, only=["c.webp", "a"], limit=1)
+        sampled = select_image_paths(images, sample_ratio=0.5, sample_seed=42)
+
+        self.assertEqual([path.name for path in selected], ["a.png"])
+        self.assertEqual(len(sampled), 2)
+        self.assertEqual(sampled, select_image_paths(images, sample_ratio=0.5, sample_seed=42))
+
+    def test_extract_image_with_vision_rejects_unsupported_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "example.txt"
+            image_path.write_text("not an image", encoding="utf-8")
+            provider = AsyncFakeVisionProvider("{}")
+
+            with self.assertRaises(ValueError) as error:
+                extract_image_with_vision(image_path, provider)
+
+        self.assertIn("Unsupported image type for vision extraction", str(error.exception))
+
 
 class AsyncExtractTests(IsolatedAsyncioTestCase):
     async def test_async_extract_writes_rows_in_artifact_order(self) -> None:
@@ -445,6 +469,118 @@ class AsyncExtractTests(IsolatedAsyncioTestCase):
         self.assertEqual(results[0].status, "rerouted_processed")
         self.assertEqual(rows[0]["name"], "Selected Vision")
         self.assertEqual(vision_provider.calls[0][1].name, "b.jpg")
+
+    async def test_image_only_vision_extract_processes_images_without_ocr_artifacts(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "input"
+            output = root / "output" / "vision.csv"
+            results_file = root / "logs" / "vision-results.jsonl"
+            input_dir.mkdir()
+            (input_dir / "a.jpg").write_bytes(b"a")
+            (input_dir / "b.png").write_bytes(b"b")
+            (input_dir / "ignored.txt").write_text("ignore", encoding="utf-8")
+            vision_provider = AsyncFakeVisionProvider(json.dumps({"name": "Vision Name"}))
+
+            results = await extract_images_to_csv_async(
+                input_dir,
+                output,
+                vision_provider,
+                source="Ground Truth",
+                results_file=results_file,
+            )
+            with output.open(encoding="utf-8", newline="") as csv_file:
+                rows = list(csv.DictReader(csv_file))
+            records = [
+                json.loads(line)
+                for line in results_file.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual([result.status for result in results], ["vision_processed", "vision_processed"])
+        self.assertEqual([row["dateiname"] for row in rows], ["a", "b"])
+        self.assertEqual([row["quelle"] for row in rows], ["Ground Truth", "Ground Truth"])
+        self.assertEqual([call[1].name for call in vision_provider.calls], ["a.jpg", "b.png"])
+        self.assertEqual([call[2] for call in vision_provider.calls], ["image/jpeg", "image/png"])
+        self.assertNotIn("Lokales OCR-Name-Signal", vision_provider.calls[0][0])
+        self.assertNotIn("OCR-Text", vision_provider.calls[0][0])
+        self.assertEqual(records[0]["method"], "vision_model_image_only")
+        self.assertEqual(records[0]["source_image"], str(input_dir / "a.jpg"))
+        self.assertEqual(records[0]["mime_type"], "image/jpeg")
+
+    async def test_image_only_vision_extract_resumes_completed_results(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "input"
+            output = root / "output" / "vision.csv"
+            results_file = root / "logs" / "vision-results.jsonl"
+            input_dir.mkdir()
+            results_file.parent.mkdir()
+            (input_dir / "a.jpg").write_bytes(b"a")
+            (input_dir / "b.jpg").write_bytes(b"b")
+            results_file.write_text(
+                json.dumps(
+                    {
+                        "filename": "a.jpg",
+                        "status": "vision_processed",
+                        "method": "vision_model_image_only",
+                        "attempts": 1,
+                        "row": {"name": "Already", "dateiname": "a"},
+                        "error": None,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            vision_provider = AsyncFakeVisionProvider(json.dumps({"name": "New"}))
+
+            await extract_images_to_csv_async(
+                input_dir,
+                output,
+                vision_provider,
+                results_file=results_file,
+            )
+            with output.open(encoding="utf-8", newline="") as csv_file:
+                rows = list(csv.DictReader(csv_file))
+
+        self.assertEqual([row["name"] for row in rows], ["Already", "New"])
+        self.assertEqual([call[1].name for call in vision_provider.calls], ["b.jpg"])
+
+    async def test_image_only_vision_extract_records_failure(self) -> None:
+        class FailingVisionProvider:
+            provider_name = "fake-vision"
+            model_name = "fake-vision-model"
+
+            async def async_vision_complete(
+                self,
+                prompt: str,
+                image_path: Path,
+                mime_type: str,
+            ) -> str:
+                raise ValueError("bad image")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "input"
+            output = root / "output" / "vision.csv"
+            log_file = root / "logs" / "vision.txt"
+            input_dir.mkdir()
+            (input_dir / "example.jpg").write_bytes(b"image")
+
+            results = await extract_images_to_csv_async(
+                input_dir,
+                output,
+                FailingVisionProvider(),
+                log_file=log_file,
+                settings=AsyncExtractionSettings(max_retries=0),
+            )
+            log_text = log_file.read_text(encoding="utf-8")
+
+        self.assertEqual(results[0].status, "vision_failed")
+        self.assertIn("bad image", results[0].error or "")
+        self.assertIn(
+            "ERROR: file example.jpg failed vision_model_image_only: bad image",
+            log_text,
+        )
 
     async def test_async_extract_retries_transient_errors(self) -> None:
         class RateLimitError(Exception):

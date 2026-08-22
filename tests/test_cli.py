@@ -396,3 +396,75 @@ class CliOcrTests(TestCase):
         self.assertEqual(kwargs["input_dir"], Path("custom-input"))
         self.assertEqual(kwargs["merge_output_file"], Path("custom-output/result.csv"))
         self.assertIn("Vision reroute complete", output.getvalue())
+
+    def test_vision_extract_command_processes_selected_images(self) -> None:
+        args = cli.build_parser().parse_args(
+            [
+                "vision-extract",
+                "--input-dir",
+                "custom-input",
+                "--output-file",
+                "custom-output/vision.csv",
+                "--source",
+                "Ground Truth",
+                "--provider",
+                "gemini",
+                "--model",
+                "gemini-2.5-pro",
+                "--limit",
+                "5",
+                "--sample-ratio",
+                "0.2",
+                "--sample-seed",
+                "42",
+                "--only",
+                "a.jpg",
+                "--log-dir",
+                "custom-logs",
+                "--results-file",
+                "custom-logs/vision-results.jsonl",
+                "--concurrency",
+                "3",
+                "--rpm-limit",
+                "100",
+                "--tpm-limit",
+                "200000",
+                "--max-retries",
+                "2",
+            ]
+        )
+
+        with (
+            patch(
+                "src.todesanzeigen.cli.build_vision_llm_provider",
+                return_value="vision-provider",
+            ) as build_vision_provider,
+            patch(
+                "src.todesanzeigen.cli.extract_images_to_csv_async",
+                new=AsyncMock(return_value=[]),
+            ) as vision_extract_async,
+        ):
+            output = StringIO()
+            with redirect_stdout(output):
+                status = cli.run_vision_extract_command(args)
+
+        self.assertEqual(status, 0)
+        build_vision_provider.assert_called_once_with("gemini", "gemini-2.5-pro")
+        self.assertEqual(
+            vision_extract_async.call_args.args,
+            (Path("custom-input"), Path("custom-output/vision.csv"), "vision-provider"),
+        )
+        kwargs = vision_extract_async.call_args.kwargs
+        self.assertEqual(kwargs["source"], "Ground Truth")
+        self.assertEqual(kwargs["limit"], 5)
+        self.assertEqual(kwargs["only"], ["a.jpg"])
+        self.assertEqual(kwargs["sample_ratio"], 0.2)
+        self.assertEqual(kwargs["sample_seed"], 42)
+        self.assertEqual(kwargs["log_file"].parent, Path("custom-logs"))
+        self.assertRegex(kwargs["log_file"].name, r"^vision-extract-\d{8}-\d{6}\.txt$")
+        self.assertEqual(kwargs["results_file"], Path("custom-logs/vision-results.jsonl"))
+        self.assertEqual(kwargs["settings"].concurrency, 3)
+        self.assertEqual(kwargs["settings"].rpm_limit, 100)
+        self.assertEqual(kwargs["settings"].tpm_limit, 200000)
+        self.assertEqual(kwargs["settings"].max_retries, 2)
+        self.assertIn("Vision extraction complete", output.getvalue())

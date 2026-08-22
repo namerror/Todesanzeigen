@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .llm import CSV_COLUMNS, LlmProvider, VisionLlmProvider
-from .ocr import image_mime_type
+from .ocr import discover_images, image_mime_type
 from .ocr_filtering import is_below_confidence_threshold, name_map_artifact_path
 
 
@@ -58,7 +58,10 @@ class RerouteCandidate:
 DEFAULT_NAME_CONFIDENCE_THRESHOLD = 85.0
 TEXT_EXTRACTION_METHOD = "text_extraction"
 VISION_REROUTE_METHOD = "vision_model_reroute"
-PROCESSED_STATUSES = {"processed", "rerouted_processed"}
+VISION_IMAGE_ONLY_METHOD = "vision_model_image_only"
+VISION_PROCESSED_STATUS = "vision_processed"
+VISION_FAILED_STATUS = "vision_failed"
+PROCESSED_STATUSES = {"processed", "rerouted_processed", VISION_PROCESSED_STATUS}
 CHECKPOINT_REUSE_STATUSES = {"processed", "rerouted_processed", "skipped_low_confidence"}
 LLM_EXCLUDED_COLUMNS = {"foto", "bemerkungen", "quelle", "dateiname"}
 LLM_PROMPT_COLUMNS = [column for column in CSV_COLUMNS if column not in LLM_EXCLUDED_COLUMNS]
@@ -133,6 +136,27 @@ Lokales OCR-Name-Signal:
 
 OCR-Text aus dem schwachen lokalen Lauf:
 {ocr_hint}
+"""
+
+
+def build_image_only_vision_extraction_prompt(
+    *,
+    filename: str,
+    source: str = "",
+) -> str:
+    del filename, source
+    columns = ", ".join(LLM_PROMPT_COLUMNS)
+    return f"""Du extrahierst strukturierte Daten direkt aus dem Bild einer deutschen Todesanzeige.
+
+Gib ausschliesslich ein einzelnes valides JSON-Objekt zurueck. Verwende exakt diese Keys:
+{columns}
+
+Regeln:
+- Das Bild ist die einzige Quelle.
+- confidence_score ist eine Zahl von 0 bis 1 als String, z.B. "0.82".
+- Fehlende oder unsichere Felder bleiben "".
+- Unsicherheiten, schwer lesbare Stellen und Interpretationshinweise kommen in zusaetzliche_hinweise.
+- Erfinde keine Daten.
 """
 
 
@@ -298,6 +322,25 @@ def extract_artifact_with_vision(
         filename=filename,
         source=source,
         name_hint=name_hint,
+    )
+    response_text = provider.vision_complete(prompt, image_path, mime_type)
+    data = parse_json_object(response_text)
+    return normalize_record(data, filename=filename, source=source)
+
+
+def extract_image_with_vision(
+    image_path: Path,
+    provider: VisionLlmProvider,
+    *,
+    source: str = "",
+) -> dict[str, str]:
+    mime_type = image_mime_type(image_path)
+    if mime_type is None:
+        raise ValueError(f"Unsupported image type for vision extraction: {image_path}")
+    filename = image_path.stem
+    prompt = build_image_only_vision_extraction_prompt(
+        filename=filename,
+        source=source,
     )
     response_text = provider.vision_complete(prompt, image_path, mime_type)
     data = parse_json_object(response_text)
@@ -686,6 +729,36 @@ def select_reroute_candidates(
     return selected
 
 
+def select_image_paths(
+    images: list[Path],
+    *,
+    only: list[str] | None = None,
+    sample_ratio: float | None = None,
+    sample_seed: int = 0,
+    limit: int | None = None,
+) -> list[Path]:
+    selected = sorted(images, key=lambda path: path.name)
+    if only:
+        wanted = set(only)
+        selected = [
+            path
+            for path in selected
+            if path.name in wanted or path.stem in wanted or str(path) in wanted
+        ]
+    if sample_ratio is not None:
+        if sample_ratio <= 0 or sample_ratio > 1:
+            raise ValueError("sample_ratio must be greater than 0 and at most 1.")
+        if sample_ratio < 1 and selected:
+            sample_size = max(1, math.ceil(len(selected) * sample_ratio))
+            sampled_names = {
+                path.name for path in random.Random(sample_seed).sample(selected, sample_size)
+            }
+            selected = [path for path in selected if path.name in sampled_names]
+    if limit is not None:
+        selected = selected[:limit]
+    return selected
+
+
 async def reroute_candidates_to_csv_async(
     candidates: list[RerouteCandidate],
     output_csv: Path,
@@ -793,6 +866,114 @@ async def reroute_candidates_to_csv_async(
             [result.row for result in results if result.status in PROCESSED_STATUSES and result.row],
         )
     return list(results)
+
+
+async def extract_images_to_csv_async(
+    input_dir: Path,
+    output_csv: Path,
+    provider: VisionLlmProvider,
+    *,
+    source: str = "",
+    limit: int | None = None,
+    only: list[str] | None = None,
+    sample_ratio: float | None = None,
+    sample_seed: int = 0,
+    log_file: Path | None = None,
+    results_file: Path | None = None,
+    resume_from: Path | None = None,
+    settings: AsyncExtractionSettings | None = None,
+) -> list[ExtractionResult]:
+    settings = settings or AsyncExtractionSettings()
+    if settings.concurrency < 1:
+        raise ValueError("Vision extraction concurrency must be at least 1.")
+    if settings.max_retries < 0:
+        raise ValueError("LLM max retries must be at least 0.")
+
+    images = select_image_paths(
+        discover_images(input_dir),
+        only=only,
+        sample_ratio=sample_ratio,
+        sample_seed=sample_seed,
+        limit=limit,
+    )
+
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    if log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_file.write_text(
+            f"Image-only vision extraction log started {datetime.now().isoformat(timespec='seconds')}\n",
+            encoding="utf-8",
+        )
+
+    checkpoint_path = results_file or resume_from
+    resume_path = resume_from or results_file
+    resumed_results = _load_completed_image_checkpoint_results(input_dir, resume_path)
+    if checkpoint_path is None and log_file is not None:
+        checkpoint_path = log_file.with_suffix(".results.jsonl")
+    if checkpoint_path is not None:
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_path.touch()
+
+    results_by_name: dict[str, ExtractionResult] = {}
+    limiter = AsyncLlmRateLimiter(settings.rpm_limit, settings.tpm_limit)
+    checkpoint_lock = asyncio.Lock()
+    semaphore = asyncio.Semaphore(settings.concurrency)
+
+    async def process_image(image_path: Path) -> ExtractionResult:
+        async with semaphore:
+            try:
+                row, attempts = await _extract_image_with_vision_async_with_retry(
+                    image_path,
+                    provider,
+                    source=source,
+                    limiter=limiter,
+                    max_retries=settings.max_retries,
+                )
+                result = ExtractionResult(image_path, VISION_PROCESSED_STATUS, row)
+                await _append_checkpoint_record_async(
+                    checkpoint_path,
+                    checkpoint_lock,
+                    image_path.name,
+                    result,
+                    attempts,
+                    metadata=_image_checkpoint_metadata(
+                        method=VISION_IMAGE_ONLY_METHOD,
+                        provider=provider,
+                        image_path=image_path,
+                    ),
+                )
+                return result
+            except Exception as exc:
+                result = ExtractionResult(image_path, VISION_FAILED_STATUS, error=str(exc))
+                _write_extraction_error(log_file, image_path.name, exc, method=VISION_IMAGE_ONLY_METHOD)
+                await _append_checkpoint_record_async(
+                    checkpoint_path,
+                    checkpoint_lock,
+                    image_path.name,
+                    result,
+                    settings.max_retries + 1,
+                    metadata=_image_checkpoint_metadata(
+                        method=VISION_IMAGE_ONLY_METHOD,
+                        provider=provider,
+                        image_path=image_path,
+                    ),
+                )
+                return result
+
+    tasks: list[asyncio.Task[ExtractionResult]] = []
+    for image_path in images:
+        resumed_result = resumed_results.get(image_path.name)
+        if resumed_result is not None:
+            results_by_name[image_path.name] = resumed_result
+            continue
+        tasks.append(asyncio.create_task(process_image(image_path)))
+
+    for result in await asyncio.gather(*tasks):
+        results_by_name[result.artifact_path.name] = result
+
+    ordered_results = [results_by_name[path.name] for path in images]
+    _write_results_csv(output_csv, ordered_results)
+    return ordered_results
 
 
 def merge_rows_into_csv(output_csv: Path, rows: list[dict[str, str] | None]) -> None:
@@ -1043,6 +1224,38 @@ async def _extract_artifact_with_vision_async_with_retry(
             await asyncio.sleep(_retry_delay_seconds(attempts))
 
 
+async def _extract_image_with_vision_async_with_retry(
+    image_path: Path,
+    provider: VisionLlmProvider,
+    *,
+    source: str,
+    limiter: AsyncLlmRateLimiter,
+    max_retries: int,
+) -> tuple[dict[str, str], int]:
+    mime_type = image_mime_type(image_path)
+    if mime_type is None:
+        raise ValueError(f"Unsupported image type for vision extraction: {image_path}")
+    filename = image_path.stem
+    prompt = build_image_only_vision_extraction_prompt(
+        filename=filename,
+        source=source,
+    )
+    estimated_tokens = estimate_vision_llm_tokens(prompt, image_path)
+    attempts = 0
+
+    while True:
+        attempts += 1
+        await limiter.acquire(estimated_tokens)
+        try:
+            response_text = await provider.async_vision_complete(prompt, image_path, mime_type)
+            data = parse_json_object(response_text)
+            return normalize_record(data, filename=filename, source=source), attempts
+        except Exception:
+            if attempts > max_retries:
+                raise
+            await asyncio.sleep(_retry_delay_seconds(attempts))
+
+
 def estimate_llm_tokens(prompt: str) -> int:
     return math.ceil(len(prompt) / 3) + 300
 
@@ -1115,6 +1328,44 @@ def _load_completed_checkpoint_results(
     return results
 
 
+def _load_completed_image_checkpoint_results(
+    input_dir: Path,
+    checkpoint_path: Path | None,
+) -> dict[str, ExtractionResult]:
+    if checkpoint_path is None or not checkpoint_path.exists():
+        return {}
+
+    results: dict[str, ExtractionResult] = {}
+    for line_number, line in enumerate(checkpoint_path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Checkpoint contains invalid JSON on line {line_number}: {checkpoint_path}"
+            ) from exc
+
+        filename = record.get("filename")
+        status = record.get("status")
+        method = record.get("method")
+        if (
+            not isinstance(filename, str)
+            or status != VISION_PROCESSED_STATUS
+            or method != VISION_IMAGE_ONLY_METHOD
+        ):
+            continue
+        row = record.get("row")
+        if not isinstance(row, dict):
+            continue
+        results[filename] = ExtractionResult(
+            input_dir / filename,
+            status,
+            row={key: str(value) for key, value in row.items()},
+        )
+    return results
+
+
 async def _append_checkpoint_record_async(
     checkpoint_path: Path | None,
     checkpoint_lock: asyncio.Lock,
@@ -1173,6 +1424,21 @@ def _checkpoint_metadata(
     elif _is_below_confidence_threshold(name_hint, threshold):
         metadata["reason"] = _low_confidence_reason(name_hint.confidence)
     return metadata
+
+
+def _image_checkpoint_metadata(
+    *,
+    method: str,
+    provider: object,
+    image_path: Path,
+) -> dict[str, Any]:
+    return {
+        "method": method,
+        "provider": getattr(provider, "provider_name", None),
+        "model": getattr(provider, "model_name", None),
+        "source_image": str(image_path),
+        "mime_type": image_mime_type(image_path),
+    }
 
 
 def _write_extraction_error(

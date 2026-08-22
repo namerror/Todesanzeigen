@@ -85,6 +85,15 @@ OPENAI_API_KEY=your-openai-api-key
 OPENAI_VISION_MODEL=gpt-5.6-luna
 ```
 
+Image-only vision extraction uses the same vision provider implementations. It
+defaults to the reroute provider settings, but can be configured separately:
+
+```sh
+TODESANZEIGEN_VISION_PROVIDER=qwen
+TODESANZEIGEN_VISION_MODEL=qwen-vl-ocr
+TODESANZEIGEN_VISION_CONCURRENCY=1
+```
+
 ## OCR Usage
 
 Run local Tesseract OCR for all supported images in `input/`:
@@ -264,6 +273,35 @@ Standalone reroute writes `output/rerouted.csv` by default and records audit
 details in `logs/reroute-results.jsonl`. When `--merge-output-file` is passed,
 rerouted rows are merged into that CSV by `dateiname`, replacing any existing
 row for the same notice.
+
+## Image-Only Vision Extraction
+
+Use `vision-extract` to process source images directly through a VLM without
+running OCR, TSV filtering, or low-confidence reroute selection:
+
+```sh
+todesanzeigen vision-extract \
+  --input-dir "input/Aichacher Nachrichten" \
+  --output-file output/ground-truth/aichacher-vlm.csv \
+  --provider qwen \
+  --model qwen-vl-ocr \
+  --limit 25 \
+  --sample-seed 42
+```
+
+This writes the same CSV schema as normal extraction, with `dateiname` set from
+the image stem. Results are checkpointed by default in
+`logs/vision-results.jsonl`, and audit records use
+`method=vision_model_image_only`.
+
+Useful dataset selection options:
+
+```sh
+todesanzeigen vision-extract --only "Aichacher Nachrichten 2023_063.jpg"
+todesanzeigen vision-extract --sample-ratio 0.05 --sample-seed 42
+todesanzeigen vision-extract --limit 20
+todesanzeigen vision-extract --concurrency 3 --rpm-limit 100 --tpm-limit 200000
+```
 
 ## Google Document AI Fallback
 

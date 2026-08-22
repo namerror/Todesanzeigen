@@ -10,8 +10,11 @@ from pathlib import Path
 from .extract import (
     DEFAULT_NAME_CONFIDENCE_THRESHOLD,
     AsyncExtractionSettings,
+    VISION_FAILED_STATUS,
+    VISION_PROCESSED_STATUS,
     VisionRerouteSettings,
     extract_artifacts_to_csv_async,
+    extract_images_to_csv_async,
     load_reroute_candidates,
     reroute_candidates_to_csv_async,
     select_reroute_candidates,
@@ -163,6 +166,50 @@ def build_parser() -> argparse.ArgumentParser:
     reroute.add_argument("--rpm-limit", type=int, default=_env_int("TODESANZEIGEN_LLM_RPM_LIMIT"))
     reroute.add_argument("--tpm-limit", type=int, default=_env_int("TODESANZEIGEN_LLM_TPM_LIMIT"))
     reroute.add_argument(
+        "--max-retries",
+        type=int,
+        default=_env_int("TODESANZEIGEN_LLM_MAX_RETRIES", 5),
+    )
+
+    vision_extract = subparsers.add_parser(
+        "vision-extract",
+        help="Run image-only vision extraction for source images.",
+    )
+    vision_extract.add_argument("--input-dir", type=Path, default=Path("input"))
+    vision_extract.add_argument("--output-file", type=Path, default=Path("output/vision-result.csv"))
+    vision_extract.add_argument("--source", default=os.getenv("TODESANZEIGEN_SOURCE", ""))
+    vision_extract.add_argument(
+        "--provider",
+        choices=VISION_LLM_PROVIDERS,
+        default=os.getenv(
+            "TODESANZEIGEN_VISION_PROVIDER",
+            os.getenv("TODESANZEIGEN_REROUTE_PROVIDER", "qwen"),
+        ),
+    )
+    vision_extract.add_argument(
+        "--model",
+        default=os.getenv(
+            "TODESANZEIGEN_VISION_MODEL",
+            os.getenv("TODESANZEIGEN_REROUTE_MODEL"),
+        ),
+    )
+    vision_extract.add_argument("--limit", type=int)
+    vision_extract.add_argument("--sample-ratio", type=float)
+    vision_extract.add_argument("--sample-seed", type=int, default=0)
+    vision_extract.add_argument("--only", action="append")
+    vision_extract.add_argument("--log-dir", type=Path, default=Path("logs"))
+    vision_extract.add_argument("--results-file", type=Path)
+    vision_extract.add_argument(
+        "--concurrency",
+        type=int,
+        default=_env_int(
+            "TODESANZEIGEN_VISION_CONCURRENCY",
+            _env_int("TODESANZEIGEN_REROUTE_CONCURRENCY", 1),
+        ),
+    )
+    vision_extract.add_argument("--rpm-limit", type=int, default=_env_int("TODESANZEIGEN_LLM_RPM_LIMIT"))
+    vision_extract.add_argument("--tpm-limit", type=int, default=_env_int("TODESANZEIGEN_LLM_TPM_LIMIT"))
+    vision_extract.add_argument(
         "--max-retries",
         type=int,
         default=_env_int("TODESANZEIGEN_LLM_MAX_RETRIES", 5),
@@ -350,6 +397,54 @@ def run_reroute_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_vision_extract_command(args: argparse.Namespace) -> int:
+    if args.concurrency < 1:
+        raise ValueError("Vision extraction concurrency must be at least 1.")
+    if args.max_retries < 0:
+        raise ValueError("LLM max retries must be at least 0.")
+    if args.rpm_limit is not None and args.rpm_limit < 0:
+        raise ValueError("LLM RPM limit must be at least 0.")
+    if args.tpm_limit is not None and args.tpm_limit < 0:
+        raise ValueError("LLM TPM limit must be at least 0.")
+
+    provider = build_vision_llm_provider(args.provider, args.model)
+    log_file = args.log_dir / f"vision-extract-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"
+    results_file = args.results_file or args.log_dir / "vision-results.jsonl"
+    rpm_limit = args.rpm_limit
+    tpm_limit = args.tpm_limit
+    if args.provider == "qwen":
+        rpm_limit = 600 if rpm_limit is None else rpm_limit
+        tpm_limit = 500000 if tpm_limit is None else tpm_limit
+
+    results = asyncio.run(
+        extract_images_to_csv_async(
+            args.input_dir,
+            args.output_file,
+            provider,
+            source=args.source,
+            limit=args.limit,
+            only=args.only,
+            sample_ratio=args.sample_ratio,
+            sample_seed=args.sample_seed,
+            log_file=log_file,
+            results_file=results_file,
+            settings=AsyncExtractionSettings(
+                concurrency=args.concurrency,
+                rpm_limit=rpm_limit,
+                tpm_limit=tpm_limit,
+                max_retries=args.max_retries,
+            ),
+        )
+    )
+    processed = sum(1 for result in results if result.status == VISION_PROCESSED_STATUS)
+    failed = sum(1 for result in results if result.status == VISION_FAILED_STATUS)
+    print(
+        f"Vision extraction complete: {processed} rows written to {args.output_file}; "
+        f"{failed} failed. Log written to {log_file}. Results written to {results_file}."
+    )
+    return 0
+
+
 def run_filter_command(args: argparse.Namespace) -> int:
     results = filter_artifact_names(
         args.artifacts_dir,
@@ -394,6 +489,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_filter_command(args)
         if args.command == "reroute":
             return run_reroute_command(args)
+        if args.command == "vision-extract":
+            return run_vision_extract_command(args)
     except (ConfigError, FileNotFoundError, NotADirectoryError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
