@@ -29,3 +29,7 @@ output/*
 gcp/*
 
 logs
+
+temp/
+
+state/*.sqlite*

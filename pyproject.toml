@@ -9,10 +9,13 @@ description = "OCR and structured extraction pipeline for Todesanzeigen images."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "fastapi>=0.116.0",
     "google-cloud-documentai>=3.0.0",
     "google-genai>=1.0.0",
+    "jinja2>=3.1.0",
     "openai>=1.0.0",
     "python-dotenv>=1.0.0",
+    "uvicorn>=0.35.0",
 ]
 
 [project.scripts]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 from datetime import datetime
@@ -29,6 +30,7 @@ from .ocr import (
     run_ocr_folder,
 )
 from .ocr_filtering import filter_artifact_names, name_map_artifact_path
+from .storage import DEFAULT_DB_PATH, DEFAULT_LABEL_SET
 
 
 def _load_dotenv() -> None:
@@ -214,6 +216,69 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=_env_int("TODESANZEIGEN_LLM_MAX_RETRIES", 5),
     )
+
+    db = subparsers.add_parser("db", help="Manage the local SQLite project database.")
+    db_subparsers = db.add_subparsers(dest="db_command", required=True)
+    db_init = db_subparsers.add_parser("init", help="Create or migrate the SQLite database.")
+    db_init.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+
+    ingest = subparsers.add_parser("ingest", help="Import local data and generated outputs into SQLite.")
+    ingest_subparsers = ingest.add_subparsers(dest="ingest_command", required=True)
+    ingest_source = ingest_subparsers.add_parser("source", help="Import source images and OCR artifacts.")
+    ingest_source.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    ingest_source.add_argument("--source", required=True)
+    ingest_source.add_argument("--input-dir", type=Path, default=Path("input"))
+    ingest_source.add_argument("--artifacts-dir", type=Path, default=Path("artifacts"))
+    ingest_source.add_argument("--layout-family", default="")
+    ingest_source.add_argument("--limit", type=int)
+    ingest_results = ingest_subparsers.add_parser("results", help="Import CSV/JSONL extraction outputs.")
+    ingest_results.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    ingest_results.add_argument("--source", default="")
+    ingest_results.add_argument("--output-csv", type=Path)
+    ingest_results.add_argument("--results-file", type=Path)
+    ingest_results.add_argument("--method", default="csv_import")
+    ingest_results.add_argument("--provider", default="")
+    ingest_results.add_argument("--model", default="")
+    ingest_results.add_argument(
+        "--candidate-kind",
+        choices=["teacher", "pipeline", "manual_seed"],
+        default="teacher",
+    )
+
+    dataset = subparsers.add_parser("dataset", help="Create and export benchmark dataset splits.")
+    dataset_subparsers = dataset.add_subparsers(dest="dataset_command", required=True)
+    dataset_split = dataset_subparsers.add_parser("split", help="Create a deterministic source-year split.")
+    dataset_split.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    dataset_split.add_argument("--name", required=True)
+    dataset_split.add_argument("--strategy", choices=["source-year"], default="source-year")
+    dataset_split.add_argument("--train-ratio", type=float, default=0.7)
+    dataset_split.add_argument("--validation-ratio", type=float, default=0.15)
+    dataset_split.add_argument("--test-ratio", type=float, default=0.15)
+    dataset_split.add_argument("--seed", type=int, default=0)
+    dataset_export = dataset_subparsers.add_parser("export", help="Export a split as JSONL.")
+    dataset_export.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    dataset_export.add_argument("--split", required=True)
+    dataset_export.add_argument("--label-set", default=DEFAULT_LABEL_SET)
+    dataset_export.add_argument("--output-file", type=Path, required=True)
+    dataset_export.add_argument("--format", choices=["jsonl"], default="jsonl")
+
+    eval_parser = subparsers.add_parser("eval", help="Evaluate extraction outputs against ground truth labels.")
+    eval_subparsers = eval_parser.add_subparsers(dest="eval_command", required=True)
+    eval_run = eval_subparsers.add_parser("run", help="Run field-level extraction evaluation.")
+    eval_run.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    eval_run.add_argument("--label-set", default=DEFAULT_LABEL_SET)
+    eval_run.add_argument("--method", required=True)
+    eval_run.add_argument("--split", default="")
+    eval_run.add_argument("--name")
+
+    review = subparsers.add_parser("review", help="Review and approve label candidates.")
+    review_subparsers = review.add_subparsers(dest="review_command", required=True)
+    review_serve = review_subparsers.add_parser("serve", help="Start the local review web UI.")
+    review_serve.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    review_serve.add_argument("--label-set", default=DEFAULT_LABEL_SET)
+    review_serve.add_argument("--reviewer", default="")
+    review_serve.add_argument("--host", default="127.0.0.1")
+    review_serve.add_argument("--port", type=int, default=8000)
 
     return parser
 
@@ -476,6 +541,166 @@ def run_filter_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_db_command(args: argparse.Namespace) -> int:
+    if args.db_command == "init":
+        from .storage import apply_migrations
+
+        applied = apply_migrations(args.db)
+        applied_note = ", ".join(applied) if applied else "no new migrations"
+        print(f"Database ready at {args.db} ({applied_note}).")
+        return 0
+    raise ValueError(f"Unsupported db command: {args.db_command}")
+
+
+def run_ingest_command(args: argparse.Namespace) -> int:
+    if args.ingest_command == "source":
+        from .ingest import ingest_source
+
+        summary = ingest_source(
+            db_path=args.db,
+            source=args.source,
+            input_dir=args.input_dir,
+            artifacts_dir=args.artifacts_dir,
+            layout_family=args.layout_family,
+            limit=args.limit,
+        )
+        print(
+            f"Ingested {summary.documents} documents into {args.db}; "
+            f"{summary.text_artifacts} OCR text artifacts, {summary.tsv_artifacts} TSV artifacts, "
+            f"{summary.ocr_outputs} OCR outputs. Run {summary.run_id}."
+        )
+        return 0
+    if args.ingest_command == "results":
+        from .ingest import ingest_results
+
+        summary = ingest_results(
+            db_path=args.db,
+            source=args.source,
+            output_csv=args.output_csv,
+            results_file=args.results_file,
+            method=args.method,
+            provider=args.provider,
+            model=args.model,
+            candidate_kind=args.candidate_kind,
+        )
+        print(
+            f"Ingested {summary.extraction_outputs} extraction outputs and "
+            f"{summary.label_candidates} label candidates into {args.db}. Run {summary.run_id}."
+        )
+        return 0
+    raise ValueError(f"Unsupported ingest command: {args.ingest_command}")
+
+
+def run_dataset_command(args: argparse.Namespace) -> int:
+    if args.dataset_command == "split":
+        from .evaluation import create_source_year_split
+
+        summary = create_source_year_split(
+            db_path=args.db,
+            name=args.name,
+            train_ratio=args.train_ratio,
+            validation_ratio=args.validation_ratio,
+            test_ratio=args.test_ratio,
+            seed=args.seed,
+        )
+        print(
+            f"Dataset split {summary.name} written: "
+            f"{summary.train} train, {summary.validation} validation, {summary.test} test."
+        )
+        return 0
+    if args.dataset_command == "export":
+        rows = _export_dataset_jsonl(args.db, args.split, args.label_set)
+        args.output_file.parent.mkdir(parents=True, exist_ok=True)
+        args.output_file.write_text(
+            "\n".join(json.dumps(row, ensure_ascii=False, sort_keys=True) for row in rows)
+            + ("\n" if rows else ""),
+            encoding="utf-8",
+        )
+        print(f"Exported {len(rows)} dataset rows to {args.output_file}.")
+        return 0
+    raise ValueError(f"Unsupported dataset command: {args.dataset_command}")
+
+
+def run_eval_command(args: argparse.Namespace) -> int:
+    if args.eval_command == "run":
+        from .evaluation import evaluate_method
+
+        summary = evaluate_method(
+            db_path=args.db,
+            label_set=args.label_set,
+            method=args.method,
+            split_name=args.split,
+            name=args.name,
+        )
+        print(
+            f"Evaluation {summary.evaluation_run_id}: {summary.documents} documents; "
+            f"exact={summary.exact_record_accuracy:.3f}; "
+            f"field_f1={summary.field_f1:.3f}; "
+            f"precision={summary.field_precision:.3f}; recall={summary.field_recall:.3f}; "
+            f"missing_predictions={summary.missing_predictions}."
+        )
+        return 0
+    raise ValueError(f"Unsupported eval command: {args.eval_command}")
+
+
+def run_review_command(args: argparse.Namespace) -> int:
+    if args.review_command == "serve":
+        from .review import serve_review_app
+
+        serve_review_app(
+            db_path=args.db,
+            label_set=args.label_set,
+            reviewer=args.reviewer,
+            host=args.host,
+            port=args.port,
+        )
+        return 0
+    raise ValueError(f"Unsupported review command: {args.review_command}")
+
+
+def _export_dataset_jsonl(db_path: Path, split_name: str, label_set: str) -> list[dict[str, object]]:
+    from .storage import apply_migrations, connect
+
+    apply_migrations(db_path)
+    with connect(db_path) as connection:
+        records = []
+        for row in connection.execute(
+            """
+            SELECT
+                dataset_memberships.subset,
+                documents.id AS document_id,
+                sources.name AS source,
+                documents.filename_stem,
+                documents.image_path,
+                documents.year,
+                ground_truth_labels.fields_json
+            FROM dataset_memberships
+            JOIN dataset_splits ON dataset_splits.id = dataset_memberships.split_id
+            JOIN documents ON documents.id = dataset_memberships.document_id
+            JOIN sources ON sources.id = documents.source_id
+            LEFT JOIN ground_truth_labels
+                ON ground_truth_labels.document_id = documents.id
+                AND ground_truth_labels.label_set = ?
+            WHERE dataset_splits.name = ?
+            ORDER BY dataset_memberships.subset, sources.name, documents.filename_stem
+            """,
+            (label_set, split_name),
+        ):
+            fields = json.loads(row["fields_json"] or "{}") if row["fields_json"] else None
+            records.append(
+                {
+                    "subset": row["subset"],
+                    "document_id": row["document_id"],
+                    "source": row["source"],
+                    "filename_stem": row["filename_stem"],
+                    "image_path": row["image_path"],
+                    "year": row["year"],
+                    "ground_truth": fields,
+                }
+            )
+    return records
+
+
 def main(argv: list[str] | None = None) -> int:
     _load_dotenv()
     try:
@@ -491,7 +716,17 @@ def main(argv: list[str] | None = None) -> int:
             return run_reroute_command(args)
         if args.command == "vision-extract":
             return run_vision_extract_command(args)
-    except (ConfigError, FileNotFoundError, NotADirectoryError, ValueError) as exc:
+        if args.command == "db":
+            return run_db_command(args)
+        if args.command == "ingest":
+            return run_ingest_command(args)
+        if args.command == "dataset":
+            return run_dataset_command(args)
+        if args.command == "eval":
+            return run_eval_command(args)
+        if args.command == "review":
+            return run_review_command(args)
+    except (ConfigError, FileNotFoundError, NotADirectoryError, RuntimeError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 

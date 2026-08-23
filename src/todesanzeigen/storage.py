@@ -1,0 +1,745 @@
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import re
+import sqlite3
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable
+
+from .llm import CSV_COLUMNS
+from .ocr import image_mime_type
+
+
+DEFAULT_DB_PATH = Path("state/todesanzeigen.sqlite3")
+DEFAULT_LABEL_SET = "gt-v1"
+SCHEMA_VERSION = "001_initial"
+
+
+@dataclass(frozen=True)
+class DocumentRecord:
+    id: int
+    source: str
+    filename_stem: str
+    image_path: str
+    mime_type: str
+    year: int | None
+
+
+def connect(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def apply_migrations(db_path: Path = DEFAULT_DB_PATH, migrations_dir: Path | None = None) -> list[str]:
+    migrations_root = migrations_dir or Path(__file__).resolve().parents[2] / "migrations"
+    with connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        applied = {
+            row["version"]
+            for row in connection.execute("SELECT version FROM schema_migrations").fetchall()
+        }
+        applied_now: list[str] = []
+        for path in sorted(migrations_root.glob("*.sql")):
+            version = path.stem
+            if version in applied:
+                continue
+            connection.executescript(path.read_text(encoding="utf-8"))
+            connection.execute("INSERT INTO schema_migrations(version) VALUES (?)", (version,))
+            applied_now.append(version)
+        return applied_now
+
+
+def create_run(
+    connection: sqlite3.Connection,
+    *,
+    command: str,
+    method: str = "",
+    provider: str = "",
+    model: str = "",
+    config: dict[str, Any] | None = None,
+    code_version: str = "",
+) -> str:
+    run_id = str(uuid.uuid4())
+    connection.execute(
+        """
+        INSERT INTO runs(id, command, method, provider, model, config_json, code_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            command,
+            method,
+            provider,
+            model,
+            _json(config or {}),
+            code_version,
+        ),
+    )
+    return run_id
+
+
+def finish_run(connection: sqlite3.Connection, run_id: str, *, status: str = "completed") -> None:
+    connection.execute(
+        "UPDATE runs SET status = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (status, run_id),
+    )
+
+
+def get_or_create_source(
+    connection: sqlite3.Connection,
+    name: str,
+    *,
+    source_type: str = "",
+    notes: str = "",
+) -> int:
+    clean_name = name.strip()
+    if not clean_name:
+        raise ValueError("source name is required")
+    connection.execute(
+        """
+        INSERT INTO sources(name, source_type, notes)
+        VALUES (?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET
+            source_type = COALESCE(NULLIF(excluded.source_type, ''), sources.source_type),
+            notes = COALESCE(NULLIF(excluded.notes, ''), sources.notes)
+        """,
+        (clean_name, source_type, notes),
+    )
+    return int(
+        connection.execute("SELECT id FROM sources WHERE name = ?", (clean_name,)).fetchone()["id"]
+    )
+
+
+def upsert_document(
+    connection: sqlite3.Connection,
+    *,
+    source_name: str,
+    filename_stem: str,
+    image_path: Path | str = "",
+    image_sha256: str = "",
+    mime_type: str = "",
+    year: int | None = None,
+    layout_family: str = "",
+) -> int:
+    source_id = get_or_create_source(connection, source_name)
+    image_path_text = _path_text(image_path)
+    document_key = f"{source_name}:{image_path_text or filename_stem}"
+    inferred_year = year if year is not None else infer_year(filename_stem)
+    connection.execute(
+        """
+        INSERT INTO documents(
+            document_key, source_id, filename_stem, image_path, image_sha256,
+            mime_type, year, layout_family
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(document_key) DO UPDATE SET
+            filename_stem = excluded.filename_stem,
+            image_path = COALESCE(NULLIF(excluded.image_path, ''), documents.image_path),
+            image_sha256 = COALESCE(NULLIF(excluded.image_sha256, ''), documents.image_sha256),
+            mime_type = COALESCE(NULLIF(excluded.mime_type, ''), documents.mime_type),
+            year = COALESCE(excluded.year, documents.year),
+            layout_family = COALESCE(NULLIF(excluded.layout_family, ''), documents.layout_family),
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            document_key,
+            source_id,
+            filename_stem,
+            image_path_text,
+            image_sha256,
+            mime_type,
+            inferred_year,
+            layout_family,
+        ),
+    )
+    return int(
+        connection.execute(
+            "SELECT id FROM documents WHERE document_key = ?",
+            (document_key,),
+        ).fetchone()["id"]
+    )
+
+
+def find_document_id(
+    connection: sqlite3.Connection,
+    *,
+    source_name: str,
+    filename_stem: str,
+) -> int | None:
+    row = connection.execute(
+        """
+        SELECT documents.id
+        FROM documents
+        JOIN sources ON sources.id = documents.source_id
+        WHERE sources.name = ? AND documents.filename_stem = ?
+        ORDER BY documents.id DESC
+        LIMIT 1
+        """,
+        (source_name, filename_stem),
+    ).fetchone()
+    return int(row["id"]) if row else None
+
+
+def record_artifact(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int | None,
+    artifact_type: str,
+    path: Path,
+    run_id: str | None = None,
+    producer: str = "",
+) -> int:
+    path_text = _path_text(path)
+    digest = sha256_file(path) if path.exists() and path.is_file() else ""
+    if document_id is None:
+        existing = connection.execute(
+            """
+            SELECT id FROM artifacts
+            WHERE document_id IS NULL AND artifact_type = ? AND path = ?
+            """,
+            (artifact_type, path_text),
+        ).fetchone()
+        if existing is not None:
+            connection.execute(
+                """
+                UPDATE artifacts
+                SET run_id = COALESCE(?, run_id),
+                    sha256 = ?,
+                    producer = COALESCE(NULLIF(?, ''), producer)
+                WHERE id = ?
+                """,
+                (run_id, digest, producer, int(existing["id"])),
+            )
+            return int(existing["id"])
+    connection.execute(
+        """
+        INSERT INTO artifacts(document_id, run_id, artifact_type, path, sha256, producer)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(document_id, artifact_type, path) DO UPDATE SET
+            run_id = COALESCE(excluded.run_id, artifacts.run_id),
+            sha256 = excluded.sha256,
+            producer = COALESCE(NULLIF(excluded.producer, ''), artifacts.producer)
+        """,
+        (document_id, run_id, artifact_type, path_text, digest, producer),
+    )
+    return int(
+        connection.execute(
+            """
+            SELECT id FROM artifacts
+            WHERE (document_id IS ? OR document_id = ?)
+              AND artifact_type = ?
+              AND path = ?
+            """,
+            (document_id, document_id, artifact_type, path_text),
+        ).fetchone()["id"]
+    )
+
+
+def upsert_ocr_output(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+    run_id: str,
+    text: str,
+    text_artifact_id: int | None = None,
+    tsv_artifact_id: int | None = None,
+    settings: dict[str, Any] | None = None,
+    features: dict[str, Any] | None = None,
+    name_hint: str = "",
+    name_confidence: float | None = None,
+) -> int:
+    connection.execute(
+        """
+        INSERT INTO ocr_outputs(
+            document_id, run_id, text, text_artifact_id, tsv_artifact_id,
+            settings_json, features_json, name_hint, name_confidence
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(document_id, run_id) DO UPDATE SET
+            text = excluded.text,
+            text_artifact_id = excluded.text_artifact_id,
+            tsv_artifact_id = excluded.tsv_artifact_id,
+            settings_json = excluded.settings_json,
+            features_json = excluded.features_json,
+            name_hint = excluded.name_hint,
+            name_confidence = excluded.name_confidence
+        """,
+        (
+            document_id,
+            run_id,
+            text,
+            text_artifact_id,
+            tsv_artifact_id,
+            _json(settings or {}),
+            _json(features or {}),
+            name_hint,
+            name_confidence,
+        ),
+    )
+    return int(
+        connection.execute(
+            "SELECT id FROM ocr_outputs WHERE document_id = ? AND run_id = ?",
+            (document_id, run_id),
+        ).fetchone()["id"]
+    )
+
+
+def insert_extraction_output(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+    run_id: str | None,
+    method: str,
+    fields: dict[str, Any] | None,
+    status: str,
+    provider: str = "",
+    model: str = "",
+    prompt_version: str = "death_notice_v1",
+    raw_response: str = "",
+    error: str = "",
+    attempts: int = 0,
+    estimated_tokens: int | None = None,
+    source_artifact_id: int | None = None,
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO extraction_outputs(
+            document_id, run_id, method, provider, model, prompt_version,
+            fields_json, raw_response, status, error, attempts, estimated_tokens,
+            source_artifact_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            document_id,
+            run_id,
+            method,
+            provider,
+            model,
+            prompt_version,
+            _json(_normalize_fields(fields or {})),
+            raw_response,
+            status,
+            error,
+            attempts,
+            estimated_tokens,
+            source_artifact_id,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def insert_label_candidate(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+    fields: dict[str, Any],
+    source_kind: str,
+    source_name: str = "",
+    extraction_output_id: int | None = None,
+    status: str = "pending",
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO label_candidates(
+            document_id, extraction_output_id, source_kind, source_name,
+            fields_json, confidence_score, status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            document_id,
+            extraction_output_id,
+            source_kind,
+            source_name,
+            _json(_normalize_fields(fields)),
+            _optional_float(fields.get("confidence_score")),
+            status,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def save_ground_truth_label(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+    label_set: str,
+    fields: dict[str, Any],
+    source_candidate_id: int | None = None,
+    reviewer: str = "",
+    review_notes: str = "",
+) -> int:
+    connection.execute(
+        """
+        INSERT INTO ground_truth_labels(
+            document_id, label_set, fields_json, source_candidate_id, reviewer, review_notes
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(document_id, label_set) DO UPDATE SET
+            fields_json = excluded.fields_json,
+            source_candidate_id = excluded.source_candidate_id,
+            reviewer = excluded.reviewer,
+            review_notes = excluded.review_notes,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            document_id,
+            label_set,
+            _json(_normalize_fields(fields)),
+            source_candidate_id,
+            reviewer,
+            review_notes,
+        ),
+    )
+    if source_candidate_id is not None:
+        connection.execute(
+            "UPDATE label_candidates SET status = 'approved' WHERE id = ?",
+            (source_candidate_id,),
+        )
+    return int(
+        connection.execute(
+            """
+            SELECT id FROM ground_truth_labels
+            WHERE document_id = ? AND label_set = ?
+            """,
+            (document_id, label_set),
+        ).fetchone()["id"]
+    )
+
+
+def mark_candidate_status(
+    connection: sqlite3.Connection,
+    *,
+    candidate_id: int,
+    status: str,
+) -> None:
+    connection.execute(
+        "UPDATE label_candidates SET status = ? WHERE id = ?",
+        (status, candidate_id),
+    )
+
+
+def load_candidate(connection: sqlite3.Connection, candidate_id: int) -> sqlite3.Row:
+    row = connection.execute(
+        "SELECT * FROM label_candidates WHERE id = ?",
+        (candidate_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"Label candidate does not exist: {candidate_id}")
+    return row
+
+
+def pending_review_items(
+    connection: sqlite3.Connection,
+    *,
+    label_set: str = DEFAULT_LABEL_SET,
+    limit: int = 50,
+) -> list[sqlite3.Row]:
+    return list(
+        connection.execute(
+            """
+            SELECT
+                label_candidates.id AS candidate_id,
+                documents.id AS document_id,
+                sources.name AS source,
+                documents.filename_stem,
+                documents.image_path,
+                label_candidates.source_kind,
+                label_candidates.source_name,
+                label_candidates.created_at
+            FROM label_candidates
+            JOIN documents ON documents.id = label_candidates.document_id
+            JOIN sources ON sources.id = documents.source_id
+            LEFT JOIN ground_truth_labels
+                ON ground_truth_labels.document_id = documents.id
+                AND ground_truth_labels.label_set = ?
+            WHERE label_candidates.status = 'pending'
+              AND ground_truth_labels.id IS NULL
+            ORDER BY label_candidates.created_at, label_candidates.id
+            LIMIT ?
+            """,
+            (label_set, limit),
+        )
+    )
+
+
+def document_review_detail(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+    label_set: str = DEFAULT_LABEL_SET,
+) -> dict[str, Any]:
+    document = connection.execute(
+        """
+        SELECT documents.*, sources.name AS source
+        FROM documents
+        JOIN sources ON sources.id = documents.source_id
+        WHERE documents.id = ?
+        """,
+        (document_id,),
+    ).fetchone()
+    if document is None:
+        raise ValueError(f"Document does not exist: {document_id}")
+    candidates = [
+        {
+            **dict(row),
+            "fields": _loads(row["fields_json"]),
+        }
+        for row in connection.execute(
+            """
+            SELECT * FROM label_candidates
+            WHERE document_id = ?
+            ORDER BY created_at DESC, id DESC
+            """,
+            (document_id,),
+        )
+    ]
+    ground_truth = connection.execute(
+        """
+        SELECT * FROM ground_truth_labels
+        WHERE document_id = ? AND label_set = ?
+        """,
+        (document_id, label_set),
+    ).fetchone()
+    ocr = connection.execute(
+        """
+        SELECT * FROM ocr_outputs
+        WHERE document_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (document_id,),
+    ).fetchone()
+    return {
+        "document": dict(document),
+        "candidates": candidates,
+        "ground_truth": (
+            {**dict(ground_truth), "fields": _loads(ground_truth["fields_json"])}
+            if ground_truth
+            else None
+        ),
+        "ocr": dict(ocr) if ocr else None,
+    }
+
+
+def latest_extraction_by_method(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+    method: str,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT * FROM extraction_outputs
+        WHERE document_id = ? AND method = ? AND status IN (
+            'processed', 'rerouted_processed', 'vision_processed'
+        )
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (document_id, method),
+    ).fetchone()
+
+
+def ground_truth_rows(
+    connection: sqlite3.Connection,
+    *,
+    label_set: str,
+    split_name: str = "",
+) -> list[sqlite3.Row]:
+    if not split_name:
+        return list(
+            connection.execute(
+                """
+                SELECT ground_truth_labels.*, documents.filename_stem
+                FROM ground_truth_labels
+                JOIN documents ON documents.id = ground_truth_labels.document_id
+                WHERE label_set = ?
+                ORDER BY documents.id
+                """,
+                (label_set,),
+            )
+        )
+    return list(
+        connection.execute(
+            """
+            SELECT ground_truth_labels.*, documents.filename_stem
+            FROM ground_truth_labels
+            JOIN documents ON documents.id = ground_truth_labels.document_id
+            JOIN dataset_memberships ON dataset_memberships.document_id = documents.id
+            JOIN dataset_splits ON dataset_splits.id = dataset_memberships.split_id
+            WHERE ground_truth_labels.label_set = ?
+              AND dataset_splits.name = ?
+              AND dataset_memberships.subset != 'train'
+            ORDER BY documents.id
+            """,
+            (label_set, split_name),
+        )
+    )
+
+
+def create_dataset_split(
+    connection: sqlite3.Connection,
+    *,
+    name: str,
+    strategy: str,
+    assignments: dict[int, str],
+    config: dict[str, Any] | None = None,
+) -> int:
+    connection.execute(
+        """
+        INSERT INTO dataset_splits(name, strategy, config_json)
+        VALUES (?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET
+            strategy = excluded.strategy,
+            config_json = excluded.config_json
+        """,
+        (name, strategy, _json(config or {})),
+    )
+    split_id = int(
+        connection.execute("SELECT id FROM dataset_splits WHERE name = ?", (name,)).fetchone()["id"]
+    )
+    connection.execute("DELETE FROM dataset_memberships WHERE split_id = ?", (split_id,))
+    connection.executemany(
+        """
+        INSERT INTO dataset_memberships(split_id, document_id, subset)
+        VALUES (?, ?, ?)
+        """,
+        [(split_id, document_id, subset) for document_id, subset in assignments.items()],
+    )
+    return split_id
+
+
+def all_documents(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+    return list(
+        connection.execute(
+            """
+            SELECT documents.*, sources.name AS source
+            FROM documents
+            JOIN sources ON sources.id = documents.source_id
+            ORDER BY sources.name, documents.filename_stem, documents.id
+            """
+        )
+    )
+
+
+def insert_evaluation_run(
+    connection: sqlite3.Connection,
+    *,
+    name: str,
+    label_set: str,
+    method: str,
+    split_name: str,
+    config: dict[str, Any],
+    metrics: dict[str, Any],
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO evaluation_runs(
+            name, label_set, method, split_name, config_json, metrics_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (name, label_set, method, split_name, _json(config), _json(metrics)),
+    )
+    return int(cursor.lastrowid)
+
+
+def insert_evaluation_result(
+    connection: sqlite3.Connection,
+    *,
+    evaluation_run_id: int,
+    document_id: int,
+    extraction_output_id: int | None,
+    exact_match: bool,
+    field_results: dict[str, Any],
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO evaluation_results(
+            evaluation_run_id, document_id, extraction_output_id, exact_match, field_results_json
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            evaluation_run_id,
+            document_id,
+            extraction_output_id,
+            1 if exact_match else 0,
+            _json(field_results),
+        ),
+    )
+
+
+def read_csv_rows(path: Path) -> list[dict[str, str]]:
+    with path.open(encoding="utf-8", newline="") as handle:
+        return [{column: row.get(column, "") for column in CSV_COLUMNS} for row in csv.DictReader(handle)]
+
+
+def infer_year(value: str) -> int | None:
+    match = re.search(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)", value)
+    return int(match.group(1)) if match else None
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def fields_from_form(items: Iterable[tuple[str, Any]]) -> dict[str, str]:
+    values = {key: str(value) for key, value in items}
+    return {column: values.get(column, "") for column in CSV_COLUMNS}
+
+
+def _normalize_fields(fields: dict[str, Any]) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for column in CSV_COLUMNS:
+        value = fields.get(column, "")
+        normalized[column] = "" if value is None else str(value)
+    return normalized
+
+
+def _optional_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _path_text(path: Path | str) -> str:
+    if not path:
+        return ""
+    path_obj = path if isinstance(path, Path) else Path(path)
+    try:
+        return str(path_obj.relative_to(Path.cwd()))
+    except ValueError:
+        return str(path_obj)
+
+
+def _json(value: dict[str, Any]) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _loads(value: str) -> dict[str, Any]:
+    data = json.loads(value or "{}")
+    return data if isinstance(data, dict) else {}

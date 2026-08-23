@@ -7,6 +7,7 @@ The current workflow has separate steps:
 1. Run OCR on images from `input/` and write plain text artifacts to `artifacts/`.
 2. Optionally run the local TSV filter to print likely deceased names.
 3. Parse those OCR text artifacts with an LLM and write structured rows to `output/result.csv`.
+4. Import images, artifacts, extraction outputs, and review labels into a local SQLite database for evaluation and ML work.
 
 Local Tesseract OCR is the default. Google Document AI OCR is kept as a guarded legacy fallback and is blocked unless explicitly unlocked.
 
@@ -301,6 +302,152 @@ todesanzeigen vision-extract --only "Aichacher Nachrichten 2023_063.jpg"
 todesanzeigen vision-extract --sample-ratio 0.05 --sample-seed 42
 todesanzeigen vision-extract --limit 20
 todesanzeigen vision-extract --concurrency 3 --rpm-limit 100 --tpm-limit 200000
+```
+
+## ML Infrastructure Usage
+
+The file-based OCR and extraction commands remain the operational pipeline. The
+SQLite workflow adds a durable project state for ML work: document inventory,
+artifact lineage, model outputs, teacher candidates, reviewed ground truth,
+dataset splits, and evaluation results.
+
+The default database path is:
+
+```text
+state/todesanzeigen.sqlite3
+```
+
+Local SQLite files are ignored by Git. Images and generated artifacts also stay
+as files; the database stores their relative paths and content hashes.
+
+Initialize or migrate the database:
+
+```sh
+todesanzeigen db init
+```
+
+Import a source folder and its OCR artifacts:
+
+```sh
+todesanzeigen ingest source \
+  --source "Aichacher Nachrichten" \
+  --input-dir "input/Aichacher Nachrichten" \
+  --artifacts-dir "artifacts/Aichacher Nachrichten" \
+  --layout-family clean
+```
+
+This records source images, OCR text artifacts, TSV artifacts, name-map hints,
+basic OCR features, and a run record. It does not move or rewrite the original
+files.
+
+Import existing extraction outputs:
+
+```sh
+todesanzeigen ingest results \
+  --output-csv output/result.csv \
+  --method text_extraction \
+  --candidate-kind teacher
+```
+
+You can also import JSONL checkpoints:
+
+```sh
+todesanzeigen ingest results \
+  --results-file logs/aichacher_nachrichten/results.jsonl \
+  --method text_extraction \
+  --candidate-kind teacher
+```
+
+Imported rows are stored as extraction outputs and as pending label candidates.
+They are not treated as ground truth automatically. This is intentional:
+VLM-generated or LLM-generated "ground truth" should be reviewed before it is
+used as a benchmark label.
+
+### Label Review
+
+Start the local review UI:
+
+```sh
+todesanzeigen review serve --reviewer "your-name"
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8000
+```
+
+The review UI shows pending candidates, the source image, the latest OCR text,
+and an editable structured-label form. You can approve a candidate directly or
+edit fields before saving. Saved labels are written to the default label set
+`gt-v1`.
+
+Use a custom label set when needed:
+
+```sh
+todesanzeigen review serve --label-set gt-v2 --port 8001
+```
+
+The review app is local-only and has no authentication. Do not bind it to a
+public interface unless you add access control.
+
+### Dataset Splits
+
+Create a deterministic source/year split:
+
+```sh
+todesanzeigen dataset split --name benchmark-v1 --strategy source-year
+```
+
+The split keeps documents from the same source/year group together, which helps
+avoid overly optimistic results from near-duplicate newspaper templates.
+
+Export a split as JSONL:
+
+```sh
+todesanzeigen dataset export \
+  --split benchmark-v1 \
+  --label-set gt-v1 \
+  --output-file output/datasets/benchmark-v1.jsonl
+```
+
+### Evaluation
+
+Evaluate the latest outputs for a method against reviewed labels:
+
+```sh
+todesanzeigen eval run \
+  --label-set gt-v1 \
+  --method text_extraction
+```
+
+Evaluate on a named split:
+
+```sh
+todesanzeigen eval run \
+  --label-set gt-v1 \
+  --method vision_model_image_only \
+  --split benchmark-v1
+```
+
+Evaluation records exact-record accuracy, field-level precision, recall, F1, and
+missing predictions. Aggregate metrics are stored in `evaluation_runs`; per
+document field comparisons are stored in `evaluation_results`.
+
+### Recommended ML Workflow
+
+For a first benchmark pass:
+
+```sh
+todesanzeigen ocr --input-dir "input/Aichacher Nachrichten" --artifacts-dir "artifacts/Aichacher Nachrichten"
+todesanzeigen filter --artifacts-dir "artifacts/Aichacher Nachrichten"
+todesanzeigen extract --input-dir "input/Aichacher Nachrichten" --artifacts-dir "artifacts/Aichacher Nachrichten" --source "Aichacher Nachrichten"
+todesanzeigen db init
+todesanzeigen ingest source --source "Aichacher Nachrichten" --input-dir "input/Aichacher Nachrichten" --artifacts-dir "artifacts/Aichacher Nachrichten" --layout-family clean
+todesanzeigen ingest results --output-csv output/result.csv --method text_extraction --candidate-kind teacher
+todesanzeigen review serve --reviewer "your-name"
+todesanzeigen dataset split --name benchmark-v1 --strategy source-year
+todesanzeigen eval run --label-set gt-v1 --method text_extraction --split benchmark-v1
 ```
 
 ## Google Document AI Fallback
