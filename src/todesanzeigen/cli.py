@@ -327,6 +327,35 @@ def build_parser() -> argparse.ArgumentParser:
     eval_run.add_argument("--split", default="")
     eval_run.add_argument("--name")
 
+    router = subparsers.add_parser("router", help="Train and apply learned model-routing policies.")
+    router_subparsers = router.add_subparsers(dest="router_command", required=True)
+    router_train = router_subparsers.add_parser(
+        "train",
+        help="Train the OCR+LLM failure predictor from SQLite feature snapshots and labels.",
+    )
+    router_train.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    router_train.add_argument("--label-set", default=DEFAULT_LABEL_SET)
+    router_train.add_argument("--feature-set", default="router-v1")
+    router_train.add_argument("--split", default="")
+    router_train.add_argument("--model-dir", type=Path, required=True)
+    router_train.add_argument("--target-f1-threshold", type=float, default=0.95)
+    router_train.add_argument("--validation-ratio", type=float, default=0.2)
+    router_train.add_argument("--seed", type=int, default=0)
+    router_train.add_argument("--cheap-cost", type=float, default=1.0)
+    router_train.add_argument("--vlm-cost", type=float, default=10.0)
+    router_train.add_argument("--lambda-cost", type=float, default=0.01)
+    router_train.add_argument("--min-train-rows", type=int, default=4)
+    router_manifest = router_subparsers.add_parser(
+        "manifest",
+        help="Write a document-to-route manifest from a trained router model.",
+    )
+    router_manifest.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    router_manifest.add_argument("--label-set", default=DEFAULT_LABEL_SET)
+    router_manifest.add_argument("--feature-set", default="router-v1")
+    router_manifest.add_argument("--model-dir", type=Path, required=True)
+    router_manifest.add_argument("--output-file", type=Path, required=True)
+    router_manifest.add_argument("--threshold", type=float)
+
     review = subparsers.add_parser("review", help="Review and approve label candidates.")
     review_subparsers = review.add_subparsers(dest="review_command", required=True)
     review_serve = review_subparsers.add_parser("serve", help="Start the local review web UI.")
@@ -764,6 +793,52 @@ def run_eval_command(args: argparse.Namespace) -> int:
     raise ValueError(f"Unsupported eval command: {args.eval_command}")
 
 
+def run_router_command(args: argparse.Namespace) -> int:
+    if args.router_command == "train":
+        from .router.model import train_router_from_db
+
+        summary = train_router_from_db(
+            db_path=args.db,
+            label_set=args.label_set,
+            feature_set=args.feature_set,
+            model_dir=args.model_dir,
+            split_name=args.split,
+            target_f1_threshold=args.target_f1_threshold,
+            validation_ratio=args.validation_ratio,
+            seed=args.seed,
+            cheap_cost=args.cheap_cost,
+            vlm_cost=args.vlm_cost,
+            lambda_cost=args.lambda_cost,
+            min_train_rows=args.min_train_rows,
+        )
+        print(
+            f"Router trained in {summary.model_dir}: "
+            f"{summary.training_rows} train, {summary.validation_rows} validation; "
+            f"threshold={summary.threshold:.3f}; "
+            f"validation_escalation_rate={summary.validation_escalation_rate:.3f}; "
+            f"validation_failure_rate={summary.validation_failure_rate:.3f}."
+        )
+        return 0
+    if args.router_command == "manifest":
+        from .router.manifest import write_router_manifest
+
+        summary = write_router_manifest(
+            db_path=args.db,
+            model_dir=args.model_dir,
+            output_file=args.output_file,
+            label_set=args.label_set,
+            feature_set=args.feature_set,
+            threshold=args.threshold,
+        )
+        print(
+            f"Router manifest written to {summary.output_file}: "
+            f"{summary.rows} rows; {summary.escalations} VLM routes; "
+            f"missing_features={summary.missing_features}."
+        )
+        return 0
+    raise ValueError(f"Unsupported router command: {args.router_command}")
+
+
 def run_review_command(args: argparse.Namespace) -> int:
     if args.review_command == "serve":
         from .review import serve_review_app
@@ -849,6 +924,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_export_command(args)
         if args.command == "eval":
             return run_eval_command(args)
+        if args.command == "router":
+            return run_router_command(args)
         if args.command == "review":
             return run_review_command(args)
     except (ConfigError, FileNotFoundError, NotADirectoryError, RuntimeError, ValueError) as exc:

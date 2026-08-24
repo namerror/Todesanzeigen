@@ -477,6 +477,99 @@ an exact-record match. Features include source/year/layout metadata, image
 quality proxies, OCR text statistics, TSV confidence/layout statistics, and the
 local name-hint confidence.
 
+### Learned Router Training
+
+The learned router predicts whether the cheap OCR+LLM path should be trusted or
+whether a document should be escalated to the VLM path. The first-pass decision
+problem is binary:
+
+```text
+ocr_llm  = OCR text -> text LLM extraction
+vlm      = raw image -> vision-language extraction
+```
+
+The router trains from SQLite, not from the exported CSV. Each labeled training
+record is expected to point to one document/image and have:
+
+- a feature snapshot, usually `router-v1`
+- a reviewed GT label in `ground_truth_labels`
+- an active OCR+LLM output in the `ocr_llm` result slot
+- optionally an active VLM output in the `vlm` result slot for routed quality/cost metrics
+
+Build feature snapshots before training:
+
+```sh
+todesanzeigen features build \
+  --db state/todesanzeigen.sqlite3 \
+  --feature-set router-v1
+```
+
+Train the router:
+
+```sh
+todesanzeigen router train \
+  --db state/todesanzeigen.sqlite3 \
+  --label-set gt-v1 \
+  --feature-set router-v1 \
+  --split benchmark-v1 \
+  --model-dir models/router/router-v1
+```
+
+Training writes:
+
+```text
+models/router/router-v1/model.joblib
+models/router/router-v1/training-report.json
+models/router/router-v1/feature-schema.json
+models/router/router-v1/thresholds.json
+```
+
+The default target is `cheap_pipeline_failed = target_field_f1 < 0.95`.
+Only these structured target fields are evaluated:
+
+```text
+geschlecht, name, vorname, geburtsdatum, sterbedatum, geburtsname, titel,
+genannt, geburtsort, sterbeort, wohnort, ort, weitere_orte, beruf
+```
+
+Blank GT fields are treated as unavailable labels, not required empty outputs.
+Non-target fields such as `bemerkungen`, `quelle`, `dateiname`,
+`zusaetzliche_hinweise`, and `confidence_score` are excluded from router target
+scoring.
+
+Write a routing manifest:
+
+```sh
+todesanzeigen router manifest \
+  --db state/todesanzeigen.sqlite3 \
+  --label-set gt-v1 \
+  --feature-set router-v1 \
+  --model-dir models/router/router-v1 \
+  --output-file output/router-manifest.jsonl
+```
+
+Each manifest row includes the document id, source, filename stem, image path,
+predicted failure probability, selected route, threshold, expected cost, and the
+available OCR+LLM/VLM output ids. This manifest is the artifact later routing
+code can use to decide whether a request should run through `ocr_llm` or `vlm`.
+
+Useful training knobs:
+
+```sh
+todesanzeigen router train \
+  --feature-set router-v1 \
+  --model-dir models/router/router-v1 \
+  --target-f1-threshold 0.95 \
+  --cheap-cost 1.0 \
+  --vlm-cost 10.0 \
+  --lambda-cost 0.01 \
+  --min-train-rows 20
+```
+
+If there are too few labeled rows, no feature snapshots, or only one target
+class, training fails with a clear message instead of writing a misleading
+model.
+
 ### Evaluation
 
 Evaluate the latest outputs for a method against reviewed labels:
@@ -515,6 +608,8 @@ todesanzeigen dataset split --name benchmark-v1 --strategy source-year
 todesanzeigen features build --feature-set router-v1
 todesanzeigen eval run --label-set gt-v1 --method text_extraction --split benchmark-v1
 todesanzeigen dataset export-router --label-set gt-v1 --method text_extraction --feature-set router-v1 --output-file output/datasets/router-v1.jsonl
+todesanzeigen router train --label-set gt-v1 --feature-set router-v1 --split benchmark-v1 --model-dir models/router/router-v1
+todesanzeigen router manifest --label-set gt-v1 --feature-set router-v1 --model-dir models/router/router-v1 --output-file output/router-manifest.jsonl
 todesanzeigen export csv --label-set gt-v1 --output-file output/result.csv
 ```
 
@@ -542,12 +637,8 @@ Without `TODESANZEIGEN_ALLOW_GCP=1`, the program fails before creating a Documen
 Run tests from the repository root:
 
 ```sh
-PYTHONPATH=. pytest -q
+PYTHONPATH=. uv run pytest -q
 ```
 
-If `pytest` is not installed in the active environment, the current test suite
-also runs with:
-
-```sh
-python -m unittest discover -s tests
-```
+The project declares `pytest` in the `dev` dependency group, so `uv run` uses
+the same dependency-managed environment as the package.

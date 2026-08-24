@@ -17,7 +17,13 @@ dependencies = [
     "Pillow>=10.0.0",
     "python-dotenv>=1.0.0",
     "python-multipart>=0.0.32",
+    "scikit-learn>=1.5.0",
     "uvicorn>=0.35.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.4.0",
 ]
 
 [project.scripts]

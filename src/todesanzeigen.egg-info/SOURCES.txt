@@ -19,9 +19,16 @@ src/todesanzeigen.egg-info/dependency_links.txt
 src/todesanzeigen.egg-info/entry_points.txt
 src/todesanzeigen.egg-info/requires.txt
 src/todesanzeigen.egg-info/top_level.txt
+src/todesanzeigen/router/__init__.py
+src/todesanzeigen/router/dataset.py
+src/todesanzeigen/router/labels.py
+src/todesanzeigen/router/manifest.py
+src/todesanzeigen/router/metrics.py
+src/todesanzeigen/router/model.py
 tests/test_cli.py
 tests/test_extract.py
 tests/test_llm.py
 tests/test_ml_infrastructure.py
 tests/test_ocr.py
 tests/test_ocr_filtering.py
+tests/test_router.py
