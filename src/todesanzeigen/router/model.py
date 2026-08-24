@@ -336,8 +336,6 @@ def _fallback_vlm_failure_rate(
 
 def _model_features(record: RouterRecord) -> dict[str, Any]:
     features = dict(record.features)
-    features.setdefault("source", record.source)
-    features.setdefault("year", record.year)
     sanitized: dict[str, Any] = {}
     for key, value in sorted(features.items()):
         clean_key = str(key)

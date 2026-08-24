@@ -658,6 +658,8 @@ class MlInfrastructureTests(TestCase):
                     connection,
                     source_name="Aichacher Nachrichten",
                     filename_stem="Example 2024",
+                    mime_type="image/jpeg",
+                    year=2024,
                     layout_family="clean",
                 )
                 run_id = create_run(connection, command="test", method="source_inventory")
@@ -668,7 +670,11 @@ class MlInfrastructureTests(TestCase):
                     text="Max Mustermann",
                     name_hint="Max Mustermann",
                     name_confidence=91,
-                    features={"ocr_word_count": 2},
+                    features={
+                        "ocr_word_count": 999,
+                        "year": 2024,
+                        "unreviewed_database_field": "leak",
+                    },
                 )
                 save_ground_truth_label(
                     connection,
@@ -685,13 +691,13 @@ class MlInfrastructureTests(TestCase):
                     status="processed",
                 )
 
-            feature_summary = build_feature_snapshots(db_path=db_path, feature_set="router-v1")
+            feature_summary = build_feature_snapshots(db_path=db_path, feature_set="router-v2")
             router_summary = export_router_dataset(
                 db_path=db_path,
                 output_file=output_file,
                 label_set=DEFAULT_LABEL_SET,
                 method="text_extraction",
-                feature_set="router-v1",
+                feature_set="router-v2",
             )
             row = json.loads(output_file.read_text(encoding="utf-8").splitlines()[0])
 
@@ -699,6 +705,19 @@ class MlInfrastructureTests(TestCase):
         self.assertEqual(router_summary.rows, 1)
         self.assertFalse(row["target"]["cheap_pipeline_failed"])
         self.assertEqual(row["features"]["name_confidence"], 91)
+        self.assertEqual(row["features"]["ocr_word_count"], 2)
+        self.assertEqual(row["features"]["source"], "Aichacher Nachrichten")
+        self.assertTrue(
+            {
+                "filename_length",
+                "layout_family",
+                "year",
+                "image_mime_type",
+                "image_path_present",
+                "image_suffix",
+                "unreviewed_database_field",
+            }.isdisjoint(row["features"])
+        )
 
 
 class DbFirstExtractionTests(IsolatedAsyncioTestCase):

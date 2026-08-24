@@ -53,6 +53,23 @@ class CliOcrTests(TestCase):
             limit=None,
         )
 
+    def test_router_workflows_default_to_feature_set_v2(self) -> None:
+        parser = cli.build_parser()
+
+        feature_args = parser.parse_args(["features", "build"])
+        export_args = parser.parse_args(
+            ["dataset", "export-router", "--method", "text", "--output-file", "rows.jsonl"]
+        )
+        train_args = parser.parse_args(["router", "train", "--model-dir", "model"])
+        manifest_args = parser.parse_args(
+            ["router", "manifest", "--model-dir", "model", "--output-file", "routes.jsonl"]
+        )
+
+        self.assertEqual(feature_args.feature_set, "router-v2")
+        self.assertEqual(export_args.feature_set, "router-v2")
+        self.assertEqual(train_args.feature_set, "router-v2")
+        self.assertEqual(manifest_args.feature_set, "router-v2")
+
     def test_documentai_requires_explicit_gcp_unlock(self) -> None:
         args = cli.build_parser().parse_args(["ocr", "--engine", "documentai"])
 

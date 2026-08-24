@@ -459,7 +459,7 @@ todesanzeigen dataset export \
 Build router feature snapshots:
 
 ```sh
-todesanzeigen features build --feature-set router-v1
+todesanzeigen features build --feature-set router-v2
 ```
 
 Export supervised failure-prediction rows for the first router milestone:
@@ -468,14 +468,15 @@ Export supervised failure-prediction rows for the first router milestone:
 todesanzeigen dataset export-router \
   --label-set gt-v1 \
   --method text_extraction \
-  --feature-set router-v1 \
-  --output-file output/datasets/router-v1-text-extraction.jsonl
+  --feature-set router-v2 \
+  --output-file output/datasets/router-v2-text-extraction.jsonl
 ```
 
 The router export uses reviewed GT to mark whether the selected method produced
-an exact-record match. Features include source/year/layout metadata, image
-quality proxies, OCR text statistics, TSV confidence/layout statistics, and the
-local name-hint confidence.
+an exact-record match. Features include source metadata, image quality proxies,
+OCR text statistics, TSV confidence/layout statistics, and the local name-hint
+confidence. Filename, year, layout-family, image-path, suffix, and MIME metadata
+are intentionally excluded from model inputs.
 
 ### Learned Router Training
 
@@ -491,7 +492,7 @@ vlm      = raw image -> vision-language extraction
 The router trains from SQLite, not from the exported CSV. Each labeled training
 record is expected to point to one document/image and have:
 
-- a feature snapshot, usually `router-v1`
+- a feature snapshot, usually `router-v2`
 - a reviewed GT label in `ground_truth_labels`
 - an active OCR+LLM output in the `ocr_llm` result slot
 - optionally an active VLM output in the `vlm` result slot for routed quality/cost metrics
@@ -501,7 +502,7 @@ Build feature snapshots before training:
 ```sh
 todesanzeigen features build \
   --db state/todesanzeigen.sqlite3 \
-  --feature-set router-v1
+  --feature-set router-v2
 ```
 
 Train the router:
@@ -510,18 +511,18 @@ Train the router:
 todesanzeigen router train \
   --db state/todesanzeigen.sqlite3 \
   --label-set gt-v1 \
-  --feature-set router-v1 \
+  --feature-set router-v2 \
   --split benchmark-v1 \
-  --model-dir models/router/router-v1
+  --model-dir models/router/router-v2
 ```
 
 Training writes:
 
 ```text
-models/router/router-v1/model.joblib
-models/router/router-v1/training-report.json
-models/router/router-v1/feature-schema.json
-models/router/router-v1/thresholds.json
+models/router/router-v2/model.joblib
+models/router/router-v2/training-report.json
+models/router/router-v2/feature-schema.json
+models/router/router-v2/thresholds.json
 ```
 
 The default target is `cheap_pipeline_failed = target_field_f1 < 0.95`.
@@ -543,8 +544,8 @@ Write a routing manifest:
 todesanzeigen router manifest \
   --db state/todesanzeigen.sqlite3 \
   --label-set gt-v1 \
-  --feature-set router-v1 \
-  --model-dir models/router/router-v1 \
+  --feature-set router-v2 \
+  --model-dir models/router/router-v2 \
   --output-file output/router-manifest.jsonl
 ```
 
@@ -557,8 +558,8 @@ Useful training knobs:
 
 ```sh
 todesanzeigen router train \
-  --feature-set router-v1 \
-  --model-dir models/router/router-v1 \
+  --feature-set router-v2 \
+  --model-dir models/router/router-v2 \
   --target-f1-threshold 0.95 \
   --cheap-cost 1.0 \
   --vlm-cost 10.0 \
@@ -605,11 +606,11 @@ todesanzeigen extract --input-dir "input/Aichacher Nachrichten" --artifacts-dir 
 todesanzeigen vision-extract --input-dir "input/Aichacher Nachrichten" --source "Aichacher Nachrichten" --limit 100
 todesanzeigen review serve --reviewer "your-name"
 todesanzeigen dataset split --name benchmark-v1 --strategy source-year
-todesanzeigen features build --feature-set router-v1
+todesanzeigen features build --feature-set router-v2
 todesanzeigen eval run --label-set gt-v1 --method text_extraction --split benchmark-v1
-todesanzeigen dataset export-router --label-set gt-v1 --method text_extraction --feature-set router-v1 --output-file output/datasets/router-v1.jsonl
-todesanzeigen router train --label-set gt-v1 --feature-set router-v1 --split benchmark-v1 --model-dir models/router/router-v1
-todesanzeigen router manifest --label-set gt-v1 --feature-set router-v1 --model-dir models/router/router-v1 --output-file output/router-manifest.jsonl
+todesanzeigen dataset export-router --label-set gt-v1 --method text_extraction --feature-set router-v2 --output-file output/datasets/router-v2.jsonl
+todesanzeigen router train --label-set gt-v1 --feature-set router-v2 --split benchmark-v1 --model-dir models/router/router-v2
+todesanzeigen router manifest --label-set gt-v1 --feature-set router-v2 --model-dir models/router/router-v2 --output-file output/router-manifest.jsonl
 todesanzeigen export csv --label-set gt-v1 --output-file output/result.csv
 ```
 

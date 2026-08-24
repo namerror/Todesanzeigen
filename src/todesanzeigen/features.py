@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .feature_extraction import (
+    extract_image_features,
+    extract_ocr_text_features,
+    extract_tsv_features,
+)
 from .llm import CSV_COLUMNS
-from .ocr_filtering import parse_tesseract_word_lines
 from .storage import (
     DEFAULT_DB_PATH,
     DEFAULT_LABEL_SET,
@@ -21,7 +24,7 @@ from .storage import (
 )
 
 
-DEFAULT_FEATURE_SET = "router-v1"
+DEFAULT_FEATURE_SET = "router-v2"
 
 
 @dataclass(frozen=True)
@@ -155,101 +158,23 @@ def export_router_dataset(
 
 
 def _document_features(document: dict[str, Any]) -> dict[str, Any]:
-    image_path = Path(str(document.get("image_path", "") or ""))
-    features: dict[str, Any] = {
-        "source": str(document.get("source", "") or ""),
-        "year": document.get("year"),
-        "layout_family": str(document.get("layout_family", "") or ""),
-        "filename_length": len(str(document.get("filename_stem", "") or "")),
-        "image_mime_type": str(document.get("mime_type", "") or ""),
-    }
-    if str(image_path):
-        features.update(_image_features(image_path))
+    features: dict[str, Any] = {"source": str(document.get("source", "") or "")}
+    image_path = str(document.get("image_path", "") or "")
+    if image_path:
+        features.update(extract_image_features(Path(image_path)))
     return features
 
 
 def _ocr_features(ocr: dict[str, Any], tsv_text: str) -> dict[str, Any]:
     text = str(ocr.get("text", "") or "")
-    suspicious_chars = sum(1 for char in text if not (char.isalnum() or char.isspace()))
-    features: dict[str, Any] = {
-        "ocr_char_count": len(text),
-        "ocr_word_count": len(text.split()),
-        "ocr_line_count": len([line for line in text.splitlines() if line.strip()]),
-        "ocr_suspicious_char_ratio": _safe_div(suspicious_chars, len(text)),
-        "name_hint_length": len(str(ocr.get("name_hint", "") or "")),
-        "name_confidence": ocr.get("name_confidence"),
-    }
-    features.update(_loads(str(ocr.get("features_json", "") or "{}")))
+    features = extract_ocr_text_features(
+        text,
+        name_hint=str(ocr.get("name_hint", "") or ""),
+        name_confidence=ocr.get("name_confidence"),
+    )
     if tsv_text:
-        features.update(_tsv_features(tsv_text))
+        features.update(extract_tsv_features(tsv_text))
     return features
-
-
-def _image_features(image_path: Path) -> dict[str, Any]:
-    features: dict[str, Any] = {
-        "image_path_present": image_path.exists(),
-        "image_file_size": image_path.stat().st_size if image_path.exists() else 0,
-        "image_suffix": image_path.suffix.lower(),
-    }
-    if not image_path.exists():
-        return features
-    try:
-        from PIL import Image, ImageOps, ImageStat
-    except ImportError:
-        features["image_feature_status"] = "pillow_missing"
-        return features
-
-    try:
-        with Image.open(image_path) as image:
-            width, height = image.size
-            gray = ImageOps.grayscale(image)
-            sample = gray.resize((min(width, 64), min(height, 64)))
-            pixels = list(sample.getdata())
-            stat = ImageStat.Stat(sample)
-            mean = float(stat.mean[0])
-            stddev = float(stat.stddev[0])
-            features.update(
-                {
-                    "image_width": width,
-                    "image_height": height,
-                    "image_aspect_ratio": _safe_div(width, height),
-                    "image_megapixels": (width * height) / 1_000_000,
-                    "image_brightness": mean / 255,
-                    "image_contrast": stddev / 255,
-                    "image_sharpness_proxy": _sharpness_proxy(pixels, sample.size[0]),
-                    "image_feature_status": "ok",
-                }
-            )
-    except Exception as exc:
-        features["image_feature_status"] = "error"
-        features["image_feature_error"] = str(exc)
-    return features
-
-
-def _tsv_features(tsv_text: str) -> dict[str, Any]:
-    lines = parse_tesseract_word_lines(tsv_text)
-    words = [word for line in lines for word in line.words]
-    confidences = [
-        word.confidence for word in words if word.confidence is not None and word.confidence >= 0
-    ]
-    areas = [word.width * word.height for word in words]
-    page_width = max((word.left + word.width for word in words), default=0)
-    page_height = max((word.top + word.height for word in words), default=0)
-    page_area = page_width * page_height
-    largest_area = max(areas, default=0)
-    mean_confidence = _mean(confidences)
-    return {
-        "tsv_line_count": len(lines),
-        "tsv_word_count": len(words),
-        "tsv_mean_confidence": mean_confidence,
-        "tsv_confidence_variance": _variance(confidences, mean_confidence),
-        "tsv_low_confidence_ratio": _safe_div(
-            sum(1 for confidence in confidences if confidence < 70),
-            len(confidences),
-        ),
-        "layout_bbox_density": _safe_div(sum(areas), page_area),
-        "layout_largest_text_ratio": _safe_div(largest_area, sum(areas)),
-    }
 
 
 def _artifact_text(connection: Any, artifact_id: Any) -> str:
@@ -264,32 +189,6 @@ def _artifact_text(connection: Any, artifact_id: Any) -> str:
 
 def _exact_match(truth: dict[str, Any], prediction: dict[str, Any]) -> bool:
     return all(_clean(truth.get(column, "")) == _clean(prediction.get(column, "")) for column in CSV_COLUMNS)
-
-
-def _sharpness_proxy(pixels: list[int], width: int) -> float:
-    if len(pixels) < 2 or width < 2:
-        return 0.0
-    diffs: list[int] = []
-    for index, value in enumerate(pixels):
-        if index % width != width - 1:
-            diffs.append(abs(value - pixels[index + 1]))
-        if index + width < len(pixels):
-            diffs.append(abs(value - pixels[index + width]))
-    return _safe_div(sum(diffs), len(diffs)) / 255
-
-
-def _mean(values: list[float]) -> float:
-    return _safe_div(sum(values), len(values))
-
-
-def _variance(values: list[float], mean: float) -> float:
-    if not values:
-        return 0.0
-    return sum((value - mean) ** 2 for value in values) / len(values)
-
-
-def _safe_div(numerator: float, denominator: float) -> float:
-    return numerator / denominator if denominator else 0.0
 
 
 def _clean(value: Any) -> str:

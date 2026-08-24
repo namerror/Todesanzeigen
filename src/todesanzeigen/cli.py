@@ -21,6 +21,7 @@ from .extract import (
     reroute_candidates_to_db_async,
     select_reroute_candidates,
 )
+from .features import DEFAULT_FEATURE_SET
 from .llm import LLM_PROVIDERS, VISION_LLM_PROVIDERS, build_llm_provider, build_vision_llm_provider
 from .ocr import (
     ConfigError,
@@ -302,14 +303,14 @@ def build_parser() -> argparse.ArgumentParser:
     dataset_export_router.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     dataset_export_router.add_argument("--label-set", default=DEFAULT_LABEL_SET)
     dataset_export_router.add_argument("--method", required=True)
-    dataset_export_router.add_argument("--feature-set", default="router-v1")
+    dataset_export_router.add_argument("--feature-set", default=DEFAULT_FEATURE_SET)
     dataset_export_router.add_argument("--output-file", type=Path, required=True)
 
     features = subparsers.add_parser("features", help="Build and manage ML feature snapshots.")
     features_subparsers = features.add_subparsers(dest="features_command", required=True)
     features_build = features_subparsers.add_parser("build", help="Build router feature snapshots.")
     features_build.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
-    features_build.add_argument("--feature-set", default="router-v1")
+    features_build.add_argument("--feature-set", default=DEFAULT_FEATURE_SET)
 
     export = subparsers.add_parser("export", help="Export operational outputs from SQLite.")
     export_subparsers = export.add_subparsers(dest="export_command", required=True)
@@ -335,7 +336,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     router_train.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     router_train.add_argument("--label-set", default=DEFAULT_LABEL_SET)
-    router_train.add_argument("--feature-set", default="router-v1")
+    router_train.add_argument("--feature-set", default=DEFAULT_FEATURE_SET)
     router_train.add_argument("--split", default="")
     router_train.add_argument("--model-dir", type=Path, required=True)
     router_train.add_argument("--target-f1-threshold", type=float, default=0.95)
@@ -351,7 +352,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     router_manifest.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     router_manifest.add_argument("--label-set", default=DEFAULT_LABEL_SET)
-    router_manifest.add_argument("--feature-set", default="router-v1")
+    router_manifest.add_argument("--feature-set", default=DEFAULT_FEATURE_SET)
     router_manifest.add_argument("--model-dir", type=Path, required=True)
     router_manifest.add_argument("--output-file", type=Path, required=True)
     router_manifest.add_argument("--threshold", type=float)

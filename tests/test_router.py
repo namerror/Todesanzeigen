@@ -3,10 +3,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 
-from src.todesanzeigen.router.dataset import load_router_dataset
+from src.todesanzeigen.router.dataset import RouterRecord, load_router_dataset
 from src.todesanzeigen.router.labels import score_target_fields
 from src.todesanzeigen.router.manifest import write_router_manifest
-from src.todesanzeigen.router.model import train_router_from_db
+from src.todesanzeigen.router.model import model_record_features, train_router_from_db
 from src.todesanzeigen.storage import (
     DEFAULT_LABEL_SET,
     apply_migrations,
@@ -54,6 +54,32 @@ class RouterLabelTests(TestCase):
 
 
 class RouterDatasetTests(TestCase):
+    def test_model_inputs_come_only_from_the_feature_snapshot(self) -> None:
+        record = RouterRecord(
+            document_id=1,
+            source="Aichacher Nachrichten",
+            filename_stem="Example 2024",
+            image_path="input/example.jpg",
+            year=2024,
+            features={"source": "Aichacher Nachrichten", "ocr_word_count": 12},
+            truth=None,
+            cheap_fields=None,
+            vlm_fields=None,
+            cheap_output_id=None,
+            vlm_output_id=None,
+            cheap_metrics=None,
+            vlm_metrics=None,
+            cheap_pipeline_failed=None,
+        )
+
+        features = model_record_features(record)
+
+        self.assertEqual(features["source"], "Aichacher Nachrichten")
+        self.assertEqual(features["ocr_word_count"], 12.0)
+        self.assertNotIn("year", features)
+        self.assertNotIn("filename_stem", features)
+        self.assertNotIn("image_path", features)
+
     def test_load_router_dataset_pairs_features_gt_text_and_vlm_outputs(self) -> None:
         with TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "state" / "test.sqlite3"
