@@ -26,6 +26,9 @@ from src.todesanzeigen.storage import (
     insert_extraction_output,
     insert_label_candidate,
     load_candidate,
+    pending_review_items,
+    review_method_options,
+    reviewed_ground_truth_items,
     save_ground_truth_label,
     upsert_document,
     upsert_ocr_output,
@@ -260,6 +263,276 @@ class MlInfrastructureTests(TestCase):
             self.assertEqual(label["reviewer"], "tester")
             self.assertEqual(label["source_candidate_id"], candidate_id)
             self.assertEqual(candidate["status"], "approved")
+
+    def test_pending_review_items_can_filter_by_source_name(self) -> None:
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state" / "test.sqlite3"
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                text_document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="Text Example",
+                )
+                vision_document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="Vision Example",
+                )
+                insert_label_candidate(
+                    connection,
+                    document_id=text_document_id,
+                    source_kind="pipeline",
+                    source_name="text_extraction",
+                    fields={"name": "Text"},
+                )
+                insert_label_candidate(
+                    connection,
+                    document_id=vision_document_id,
+                    source_kind="teacher",
+                    source_name="vision_model_image_only",
+                    fields={"name": "Vision"},
+                )
+
+                items = pending_review_items(
+                    connection,
+                    source_name="vision_model_image_only",
+                )
+
+            self.assertEqual([item["filename_stem"] for item in items], ["Vision Example"])
+
+    def test_reviewed_ground_truth_items_list_label_set_documents(self) -> None:
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state" / "test.sqlite3"
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                reviewed_document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="Reviewed Example",
+                )
+                other_document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="Other Label Set",
+                )
+                candidate_id = insert_label_candidate(
+                    connection,
+                    document_id=reviewed_document_id,
+                    source_kind="teacher",
+                    source_name="vision_model_image_only",
+                    fields={"name": "Reviewed"},
+                )
+                save_ground_truth_label(
+                    connection,
+                    document_id=reviewed_document_id,
+                    label_set=DEFAULT_LABEL_SET,
+                    fields={"name": "Reviewed"},
+                    source_candidate_id=candidate_id,
+                    reviewer="tester",
+                )
+                save_ground_truth_label(
+                    connection,
+                    document_id=other_document_id,
+                    label_set="gt-v2",
+                    fields={"name": "Other"},
+                    reviewer="tester",
+                )
+
+                items = reviewed_ground_truth_items(connection, label_set=DEFAULT_LABEL_SET)
+
+            self.assertEqual([item["filename_stem"] for item in items], ["Reviewed Example"])
+            self.assertEqual(items[0]["source"], "Aichacher Nachrichten")
+            self.assertEqual(items[0]["source_candidate_id"], candidate_id)
+            self.assertEqual(items[0]["source_kind"], "teacher")
+            self.assertEqual(items[0]["source_name"], "vision_model_image_only")
+
+    def test_review_method_options_come_from_extraction_methods(self) -> None:
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state" / "test.sqlite3"
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                methods = [row["method"] for row in review_method_options(connection)]
+
+            self.assertEqual(
+                methods,
+                [
+                    "text_extraction",
+                    "vision_model_image_only",
+                    "vision_model_reroute",
+                ],
+            )
+
+    def test_review_home_page_filters_by_method_query_param(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except ModuleNotFoundError:
+            self.skipTest("fastapi is not installed")
+
+        from src.todesanzeigen.review import create_review_app
+
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state" / "test.sqlite3"
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                text_document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="Text Example",
+                )
+                vision_document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="Vision Example",
+                )
+                insert_label_candidate(
+                    connection,
+                    document_id=text_document_id,
+                    source_kind="pipeline",
+                    source_name="text_extraction",
+                    fields={"name": "Text"},
+                )
+                insert_label_candidate(
+                    connection,
+                    document_id=vision_document_id,
+                    source_kind="teacher",
+                    source_name="vision_model_image_only",
+                    fields={"name": "Vision"},
+                )
+
+            client = TestClient(create_review_app(db_path=db_path))
+            response = client.get("/?method=vision_model_image_only")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Vision Example", response.text)
+        self.assertNotIn("Text Example", response.text)
+        self.assertIn('href="/?method=text_extraction"', response.text)
+        self.assertNotIn('name="method"', response.text)
+
+    def test_review_home_page_links_reviewed_ground_truth_items(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except ModuleNotFoundError:
+            self.skipTest("fastapi is not installed")
+
+        from src.todesanzeigen.review import create_review_app
+
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state" / "test.sqlite3"
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                reviewed_document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="Reviewed Example",
+                )
+                pending_document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="Pending Example",
+                )
+                insert_label_candidate(
+                    connection,
+                    document_id=pending_document_id,
+                    source_kind="pipeline",
+                    source_name="text_extraction",
+                    fields={"name": "Pending"},
+                )
+                save_ground_truth_label(
+                    connection,
+                    document_id=reviewed_document_id,
+                    label_set=DEFAULT_LABEL_SET,
+                    fields={"name": "Reviewed"},
+                    reviewer="tester",
+                )
+
+            client = TestClient(create_review_app(db_path=db_path))
+            response = client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Pending Example", response.text)
+        self.assertIn("Reviewed Ground Truth", response.text)
+        self.assertIn("Reviewed Example", response.text)
+        self.assertIn(f'href="/documents/{reviewed_document_id}"', response.text)
+
+    def test_review_document_page_edits_existing_ground_truth_label(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except ModuleNotFoundError:
+            self.skipTest("fastapi is not installed")
+
+        from src.todesanzeigen.review import create_review_app
+
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state" / "test.sqlite3"
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="Reviewed Example",
+                )
+                original_candidate_id = insert_label_candidate(
+                    connection,
+                    document_id=document_id,
+                    source_kind="teacher",
+                    source_name="vision_model_image_only",
+                    fields={"name": "Original"},
+                )
+                save_ground_truth_label(
+                    connection,
+                    document_id=document_id,
+                    label_set=DEFAULT_LABEL_SET,
+                    fields={"name": "Original", "vorname": "Max"},
+                    source_candidate_id=original_candidate_id,
+                    reviewer="tester",
+                    review_notes="original notes",
+                )
+                newer_candidate_id = insert_label_candidate(
+                    connection,
+                    document_id=document_id,
+                    source_kind="pipeline",
+                    source_name="text_extraction",
+                    fields={"name": "Newer Candidate"},
+                )
+
+            client = TestClient(create_review_app(db_path=db_path, reviewer="editor"))
+            response = client.get(f"/documents/{document_id}")
+            self.assertEqual(response.status_code, 200)
+            self.assertIn(
+                f'name="source_candidate_id" value="{original_candidate_id}"',
+                response.text,
+            )
+            self.assertNotIn(
+                f'name="source_candidate_id" value="{newer_candidate_id}"',
+                response.text,
+            )
+
+            form_data = {column: "" for column in CSV_COLUMNS}
+            form_data.update(
+                {
+                    "name": "Edited",
+                    "vorname": "Erika",
+                    "source_candidate_id": str(original_candidate_id),
+                    "review_notes": "corrected spelling",
+                }
+            )
+            response = client.post(
+                f"/documents/{document_id}/labels",
+                data=form_data,
+                follow_redirects=False,
+            )
+
+            with connect(db_path) as connection:
+                label = connection.execute("SELECT * FROM ground_truth_labels").fetchone()
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(label["source_candidate_id"], original_candidate_id)
+        self.assertEqual(label["reviewer"], "editor")
+        self.assertEqual(label["review_notes"], "corrected spelling")
+        fields = json.loads(label["fields_json"])
+        self.assertEqual(fields["name"], "Edited")
+        self.assertEqual(fields["vorname"], "Erika")
 
     def test_evaluate_method_records_field_metrics(self) -> None:
         with TemporaryDirectory() as tmp:

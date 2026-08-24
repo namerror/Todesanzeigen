@@ -534,11 +534,19 @@ def pending_review_items(
     connection: sqlite3.Connection,
     *,
     label_set: str = DEFAULT_LABEL_SET,
+    source_name: str = "",
     limit: int = 50,
 ) -> list[sqlite3.Row]:
+    method_filter = source_name.strip()
+    params: list[Any] = [label_set]
+    method_clause = ""
+    if method_filter:
+        method_clause = "AND label_candidates.source_name = ?"
+        params.append(method_filter)
+    params.append(limit)
     return list(
         connection.execute(
-            """
+            f"""
             SELECT
                 label_candidates.id AS candidate_id,
                 documents.id AS document_id,
@@ -563,7 +571,56 @@ def pending_review_items(
                 AND ground_truth_labels.label_set = ?
             WHERE label_candidates.status = 'pending'
               AND ground_truth_labels.id IS NULL
+              {method_clause}
             ORDER BY label_candidates.created_at, label_candidates.id
+            LIMIT ?
+            """,
+            params,
+        )
+    )
+
+
+def review_method_options(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+    return list(
+        connection.execute(
+            """
+            SELECT method, method_family, description
+            FROM extraction_methods
+            ORDER BY method
+            """
+        )
+    )
+
+
+def reviewed_ground_truth_items(
+    connection: sqlite3.Connection,
+    *,
+    label_set: str = DEFAULT_LABEL_SET,
+    limit: int = 50,
+) -> list[sqlite3.Row]:
+    return list(
+        connection.execute(
+            """
+            SELECT
+                ground_truth_labels.id AS label_id,
+                ground_truth_labels.document_id,
+                ground_truth_labels.source_candidate_id,
+                ground_truth_labels.reviewer,
+                ground_truth_labels.review_notes,
+                ground_truth_labels.created_at,
+                ground_truth_labels.updated_at,
+                sources.name AS source,
+                documents.filename_stem,
+                documents.image_path,
+                label_candidates.source_kind,
+                label_candidates.source_name
+            FROM ground_truth_labels
+            JOIN documents ON documents.id = ground_truth_labels.document_id
+            JOIN sources ON sources.id = documents.source_id
+            LEFT JOIN label_candidates
+                ON label_candidates.id = ground_truth_labels.source_candidate_id
+            WHERE ground_truth_labels.label_set = ?
+            ORDER BY ground_truth_labels.updated_at DESC, ground_truth_labels.id DESC
             LIMIT ?
             """,
             (label_set, limit),

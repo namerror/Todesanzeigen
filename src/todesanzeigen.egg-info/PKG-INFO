@@ -11,6 +11,7 @@ Requires-Dist: jinja2>=3.1.0
 Requires-Dist: openai>=1.0.0
 Requires-Dist: Pillow>=10.0.0
 Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: python-multipart>=0.0.32
 Requires-Dist: uvicorn>=0.35.0
 
 # Todesanzeigen
@@ -390,6 +391,13 @@ Imported rows are stored as extraction outputs and as pending label candidates.
 They are not treated as ground truth automatically. This is intentional:
 VLM-generated or LLM-generated "ground truth" should be reviewed before it is
 used as a benchmark label.
+
+For `--candidate-kind`, the following are supported:
+- `pipeline`: a candidate from the main extraction pipeline, usually OCR+LLM.
+- `teacher`: a candidate from a teacher model, usually a VLM. Stronger results that we may review as a possible ground truth label. Default.
+- `manual_seed`: a candidate from a manual seed, usually a known good record. 
+
+Make sure to use the flags explicitly to avoid accidental mislabeling of candidates.
 
 ### Method Records And CSV Export
 

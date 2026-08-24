@@ -3,6 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+try:
+    from fastapi import Request as FastApiRequest
+except ImportError:
+    FastApiRequest = Any
+
 from .llm import CSV_COLUMNS
 from .storage import (
     DEFAULT_DB_PATH,
@@ -14,6 +19,8 @@ from .storage import (
     load_candidate,
     mark_candidate_status,
     pending_review_items,
+    review_method_options,
+    reviewed_ground_truth_items,
     save_ground_truth_label,
 )
 
@@ -25,7 +32,7 @@ def create_review_app(
     reviewer: str = "",
 ) -> Any:
     try:
-        from fastapi import FastAPI, Request
+        from fastapi import FastAPI
         from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
         from jinja2 import Template
     except ImportError as exc:
@@ -38,11 +45,33 @@ def create_review_app(
     app = FastAPI(title="Todesanzeigen Review")
 
     @app.get("/", response_class=HTMLResponse)
-    def index() -> HTMLResponse:
+    def index(method: str = "") -> HTMLResponse:
+        method_filter = method.strip()
         with connect(db_path) as connection:
-            items = [dict(row) for row in pending_review_items(connection, label_set=label_set)]
+            items = [
+                dict(row)
+                for row in pending_review_items(
+                    connection,
+                    label_set=label_set,
+                    source_name=method_filter,
+                )
+            ]
+            method_options = [dict(row) for row in review_method_options(connection)]
+            reviewed_items = [
+                dict(row)
+                for row in reviewed_ground_truth_items(
+                    connection,
+                    label_set=label_set,
+                )
+            ]
         return HTMLResponse(
-            Template(INDEX_TEMPLATE).render(items=items, label_set=label_set)
+            Template(INDEX_TEMPLATE).render(
+                items=items,
+                label_set=label_set,
+                method_filter=method_filter,
+                method_options=method_options,
+                reviewed_items=reviewed_items,
+            )
         )
 
     @app.get("/documents/{document_id}", response_class=HTMLResponse)
@@ -60,6 +89,7 @@ def create_review_app(
                 fields=fields,
                 columns=CSV_COLUMNS,
                 label_set=label_set,
+                source_candidate_id=_source_candidate_id(detail),
             )
         )
 
@@ -96,7 +126,7 @@ def create_review_app(
         return RedirectResponse(f"/documents/{document_id}", status_code=303)
 
     @app.post("/documents/{document_id}/labels")
-    async def save_label(document_id: int, request: Request) -> RedirectResponse:
+    async def save_label(document_id: int, request: FastApiRequest) -> RedirectResponse:
         form = await request.form()
         source_candidate_id = _optional_int(form.get("source_candidate_id"))
         review_notes = str(form.get("review_notes", "") or "")
@@ -141,6 +171,15 @@ def _initial_fields(detail: dict[str, Any]) -> dict[str, str]:
     return {column: "" for column in CSV_COLUMNS}
 
 
+def _source_candidate_id(detail: dict[str, Any]) -> str:
+    if detail["ground_truth"] is not None:
+        value = detail["ground_truth"].get("source_candidate_id")
+        return "" if value in (None, "") else str(value)
+    if detail["candidates"]:
+        return str(detail["candidates"][0]["id"])
+    return ""
+
+
 def _optional_int(value: Any) -> int | None:
     if value in (None, ""):
         return None
@@ -169,12 +208,25 @@ INDEX_TEMPLATE = """
     main { max-width: 980px; margin: 0 auto; padding: 24px; }
     table { width: 100%; border-collapse: collapse; background: white; }
     th, td { border-bottom: 1px solid #dde1e4; padding: 10px; text-align: left; }
+    .filters { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 16px; }
+    .filter-option { display: inline-block; padding: 8px 10px; border: 1px solid #b8c0c7; border-radius: 4px; background: white; text-decoration: none; color: #174c7c; }
+    .filter-option.active { border-color: #174c7c; background: #174c7c; color: white; }
     a { color: #174c7c; }
   </style>
 </head>
 <body>
 <main>
   <h1>Review Queue: {{ label_set }}</h1>
+  <nav class="filters" aria-label="Method filter">
+    <a class="filter-option{% if not method_filter %} active{% endif %}" href="/">All</a>
+    {% for option in method_options %}
+      <a
+        class="filter-option{% if option.method == method_filter %} active{% endif %}"
+        href="/?method={{ option.method|urlencode }}"
+        title="{{ option.description }}"
+      >{{ option.method }}</a>
+    {% endfor %}
+  </nav>
   <table>
     <thead><tr><th>Document</th><th>Source</th><th>Candidate</th><th>Image</th></tr></thead>
     <tbody>
@@ -184,6 +236,29 @@ INDEX_TEMPLATE = """
         <td>{{ item.source }}</td>
         <td>{{ item.source_kind }} {{ item.source_name }} {{ item.extraction_provider or "" }} {{ item.extraction_model or "" }}</td>
         <td>{{ item.image_path }}</td>
+      </tr>
+    {% else %}
+      <tr>
+        <td colspan="4">No pending candidates.</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <h2>Reviewed Ground Truth</h2>
+  <table>
+    <thead><tr><th>Document</th><th>Source</th><th>Candidate</th><th>Reviewer</th><th>Updated</th></tr></thead>
+    <tbody>
+    {% for item in reviewed_items %}
+      <tr>
+        <td><a href="/documents/{{ item.document_id }}">{{ item.filename_stem }}</a></td>
+        <td>{{ item.source }}</td>
+        <td>{{ item.source_kind or "" }} {{ item.source_name or "" }}</td>
+        <td>{{ item.reviewer }}</td>
+        <td>{{ item.updated_at }}</td>
+      </tr>
+    {% else %}
+      <tr>
+        <td colspan="5">No reviewed ground truth labels.</td>
       </tr>
     {% endfor %}
     </tbody>
@@ -233,7 +308,7 @@ DOCUMENT_TEMPLATE = """
   <section class="panel">
     <h2>Ground Truth Editor</h2>
     <form method="post" action="/documents/{{ detail.document.id }}/labels">
-      <input type="hidden" name="source_candidate_id" value="{{ detail.candidates[0].id if detail.candidates else '' }}">
+      <input type="hidden" name="source_candidate_id" value="{{ source_candidate_id }}">
       <div class="grid">
       {% for column in columns %}
         <div>
