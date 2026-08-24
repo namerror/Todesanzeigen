@@ -11,12 +11,20 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .llm import CSV_COLUMNS
+from .methods import (
+    DEFAULT_EXPORT_METHOD_PRIORITY,
+    GT_EXPORT_SOURCE,
+    default_route_reason,
+    method_family,
+    result_slot,
+)
 from .ocr import image_mime_type
 
 
 DEFAULT_DB_PATH = Path("state/todesanzeigen.sqlite3")
 DEFAULT_LABEL_SET = "gt-v1"
-SCHEMA_VERSION = "001_initial"
+SCHEMA_VERSION = "003_result_slot_cache"
+SUCCESSFUL_EXTRACTION_STATUSES = ("processed", "rerouted_processed", "vision_processed")
 
 
 @dataclass(frozen=True)
@@ -27,6 +35,14 @@ class DocumentRecord:
     image_path: str
     mime_type: str
     year: int | None
+
+
+@dataclass(frozen=True)
+class CsvExportSummary:
+    rows: int
+    ground_truth_rows: int
+    method_rows: dict[str, int]
+    missing_documents: int
 
 
 def connect(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -139,6 +155,49 @@ def upsert_document(
     image_path_text = _path_text(image_path)
     document_key = f"{source_name}:{image_path_text or filename_stem}"
     inferred_year = year if year is not None else infer_year(filename_stem)
+    if image_path_text:
+        existing = connection.execute(
+            "SELECT id FROM documents WHERE document_key = ?",
+            (document_key,),
+        ).fetchone()
+        if existing is None:
+            legacy_rows = connection.execute(
+                """
+                SELECT id FROM documents
+                WHERE source_id = ?
+                  AND filename_stem = ?
+                  AND image_path = ''
+                ORDER BY id
+                """,
+                (source_id, filename_stem),
+            ).fetchall()
+            if len(legacy_rows) == 1:
+                legacy_id = int(legacy_rows[0]["id"])
+                connection.execute(
+                    """
+                    UPDATE documents
+                    SET document_key = ?,
+                        filename_stem = ?,
+                        image_path = ?,
+                        image_sha256 = COALESCE(NULLIF(?, ''), image_sha256),
+                        mime_type = COALESCE(NULLIF(?, ''), mime_type),
+                        year = COALESCE(?, year),
+                        layout_family = COALESCE(NULLIF(?, ''), layout_family),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        document_key,
+                        filename_stem,
+                        image_path_text,
+                        image_sha256,
+                        mime_type,
+                        inferred_year,
+                        layout_family,
+                        legacy_id,
+                    ),
+                )
+                return legacy_id
     connection.execute(
         """
         INSERT INTO documents(
@@ -314,15 +373,31 @@ def insert_extraction_output(
     attempts: int = 0,
     estimated_tokens: int | None = None,
     source_artifact_id: int | None = None,
+    latency_ms: int | None = None,
+    cost_usd: float | None = None,
+    method_family_value: str = "",
+    route_reason: str = "",
+    route_decision: dict[str, Any] | None = None,
+    config: dict[str, Any] | None = None,
+    ocr_output_id: int | None = None,
+    result_slot_value: str = "",
+    input_fingerprint: str = "",
+    config_hash: str = "",
+    superseded_at: str | None = None,
 ) -> int:
+    family = method_family_value or method_family(method)
+    reason = route_reason or default_route_reason(method)
+    slot = result_slot_value or result_slot(method)
     cursor = connection.execute(
         """
         INSERT INTO extraction_outputs(
             document_id, run_id, method, provider, model, prompt_version,
-            fields_json, raw_response, status, error, attempts, estimated_tokens,
-            source_artifact_id
+            fields_json, raw_response, status, error, attempts, latency_ms,
+            estimated_tokens, cost_usd, source_artifact_id, method_family,
+            route_reason, route_decision_json, config_json, ocr_output_id,
+            result_slot, input_fingerprint, config_hash, superseded_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             document_id,
@@ -336,8 +411,19 @@ def insert_extraction_output(
             status,
             error,
             attempts,
+            latency_ms,
             estimated_tokens,
+            cost_usd,
             source_artifact_id,
+            family,
+            reason,
+            _json(route_decision or {}),
+            _json(config or {}),
+            ocr_output_id,
+            slot,
+            input_fingerprint,
+            config_hash,
+            superseded_at,
         ),
     )
     return int(cursor.lastrowid)
@@ -461,10 +547,17 @@ def pending_review_items(
                 documents.image_path,
                 label_candidates.source_kind,
                 label_candidates.source_name,
+                extraction_outputs.method AS extraction_method,
+                extraction_outputs.provider AS extraction_provider,
+                extraction_outputs.model AS extraction_model,
+                extraction_outputs.method_family,
+                extraction_outputs.route_reason,
                 label_candidates.created_at
             FROM label_candidates
             JOIN documents ON documents.id = label_candidates.document_id
             JOIN sources ON sources.id = documents.source_id
+            LEFT JOIN extraction_outputs
+                ON extraction_outputs.id = label_candidates.extraction_output_id
             LEFT JOIN ground_truth_labels
                 ON ground_truth_labels.document_id = documents.id
                 AND ground_truth_labels.label_set = ?
@@ -502,9 +595,18 @@ def document_review_detail(
         }
         for row in connection.execute(
             """
-            SELECT * FROM label_candidates
-            WHERE document_id = ?
-            ORDER BY created_at DESC, id DESC
+            SELECT
+                label_candidates.*,
+                extraction_outputs.method AS extraction_method,
+                extraction_outputs.provider AS extraction_provider,
+                extraction_outputs.model AS extraction_model,
+                extraction_outputs.method_family,
+                extraction_outputs.route_reason
+            FROM label_candidates
+            LEFT JOIN extraction_outputs
+                ON extraction_outputs.id = label_candidates.extraction_output_id
+            WHERE label_candidates.document_id = ?
+            ORDER BY label_candidates.created_at DESC, label_candidates.id DESC
             """,
             (document_id,),
         )
@@ -549,10 +651,118 @@ def latest_extraction_by_method(
         WHERE document_id = ? AND method = ? AND status IN (
             'processed', 'rerouted_processed', 'vision_processed'
         )
+          AND superseded_at IS NULL
         ORDER BY created_at DESC, id DESC
         LIMIT 1
         """,
         (document_id, method),
+    ).fetchone()
+
+
+def latest_active_extraction_by_slot(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+    result_slot_value: str,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT * FROM extraction_outputs
+        WHERE document_id = ?
+          AND result_slot = ?
+          AND superseded_at IS NULL
+          AND status IN ('processed', 'rerouted_processed', 'vision_processed')
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (document_id, result_slot_value),
+    ).fetchone()
+
+
+def supersede_active_extractions_by_slot(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+    result_slot_value: str,
+) -> int:
+    cursor = connection.execute(
+        """
+        UPDATE extraction_outputs
+        SET superseded_at = CURRENT_TIMESTAMP
+        WHERE document_id = ?
+          AND result_slot = ?
+          AND superseded_at IS NULL
+          AND status IN ('processed', 'rerouted_processed', 'vision_processed')
+        """,
+        (document_id, result_slot_value),
+    )
+    return int(cursor.rowcount)
+
+
+def latest_ocr_output(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT * FROM ocr_outputs
+        WHERE document_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (document_id,),
+    ).fetchone()
+
+
+def upsert_feature_snapshot(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+    feature_set: str,
+    features: dict[str, Any],
+    ocr_output_id: int | None = None,
+    config: dict[str, Any] | None = None,
+) -> int:
+    connection.execute(
+        """
+        INSERT INTO feature_snapshots(
+            document_id, ocr_output_id, feature_set, features_json, config_json
+        )
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(document_id, feature_set) DO UPDATE SET
+            ocr_output_id = excluded.ocr_output_id,
+            features_json = excluded.features_json,
+            config_json = excluded.config_json,
+            created_at = CURRENT_TIMESTAMP
+        """,
+        (document_id, ocr_output_id, feature_set, _json(features), _json(config or {})),
+    )
+    return int(
+        connection.execute(
+            """
+            SELECT id FROM feature_snapshots
+            WHERE document_id = ? AND feature_set = ?
+            """,
+            (document_id, feature_set),
+        ).fetchone()["id"]
+    )
+
+
+def latest_feature_snapshot(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+    feature_set: str,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT * FROM feature_snapshots
+        WHERE document_id = ? AND feature_set = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (document_id, feature_set),
     ).fetchone()
 
 
@@ -686,6 +896,52 @@ def insert_evaluation_result(
     )
 
 
+def export_priority_csv(
+    connection: sqlite3.Connection,
+    *,
+    output_csv: Path,
+    label_set: str = DEFAULT_LABEL_SET,
+    method_priority: tuple[str, ...] = DEFAULT_EXPORT_METHOD_PRIORITY,
+) -> CsvExportSummary:
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    method_rows = {method: 0 for method in method_priority}
+    ground_truth_count = 0
+    missing_count = 0
+    rows: list[dict[str, str]] = []
+    for document in all_documents(connection):
+        source_kind, fields = _selected_export_fields(
+            connection,
+            document_id=int(document["id"]),
+            label_set=label_set,
+            method_priority=method_priority,
+        )
+        if fields is None:
+            missing_count += 1
+            continue
+        row = _fields_for_csv(
+            fields,
+            source=str(document["source"]),
+            filename_stem=str(document["filename_stem"]),
+        )
+        rows.append(row)
+        if source_kind == GT_EXPORT_SOURCE:
+            ground_truth_count += 1
+        else:
+            method_rows[source_kind] = method_rows.get(source_kind, 0) + 1
+
+    with output_csv.open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return CsvExportSummary(
+        rows=len(rows),
+        ground_truth_rows=ground_truth_count,
+        method_rows=method_rows,
+        missing_documents=missing_count,
+    )
+
+
 def read_csv_rows(path: Path) -> list[dict[str, str]]:
     with path.open(encoding="utf-8", newline="") as handle:
         return [{column: row.get(column, "") for column in CSV_COLUMNS} for row in csv.DictReader(handle)]
@@ -707,6 +963,49 @@ def sha256_file(path: Path) -> str:
 def fields_from_form(items: Iterable[tuple[str, Any]]) -> dict[str, str]:
     values = {key: str(value) for key, value in items}
     return {column: values.get(column, "") for column in CSV_COLUMNS}
+
+
+def _selected_export_fields(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+    label_set: str,
+    method_priority: tuple[str, ...],
+) -> tuple[str, dict[str, Any] | None]:
+    ground_truth = connection.execute(
+        """
+        SELECT fields_json FROM ground_truth_labels
+        WHERE document_id = ? AND label_set = ?
+        """,
+        (document_id, label_set),
+    ).fetchone()
+    if ground_truth is not None:
+        return GT_EXPORT_SOURCE, _loads(ground_truth["fields_json"])
+
+    for method in method_priority:
+        prediction = latest_extraction_by_method(
+            connection,
+            document_id=document_id,
+            method=method,
+        )
+        if prediction is not None:
+            return method, _loads(prediction["fields_json"])
+
+    return "", None
+
+
+def _fields_for_csv(
+    fields: dict[str, Any],
+    *,
+    source: str,
+    filename_stem: str,
+) -> dict[str, str]:
+    row = _normalize_fields(fields)
+    if not row["quelle"]:
+        row["quelle"] = source
+    if not row["dateiname"]:
+        row["dateiname"] = filename_stem
+    return row
 
 
 def _normalize_fields(fields: dict[str, Any]) -> dict[str, str]:

@@ -6,8 +6,8 @@ The current workflow has separate steps:
 
 1. Run OCR on images from `input/` and write plain text artifacts to `artifacts/`.
 2. Optionally run the local TSV filter to print likely deceased names.
-3. Parse those OCR text artifacts with an LLM and write structured rows to `output/result.csv`.
-4. Import images, artifacts, extraction outputs, and review labels into a local SQLite database for evaluation and ML work.
+3. Parse OCR/image inputs with OCR+LLM or VLM methods and record structured outputs in SQLite.
+4. Review candidates into ground truth, build ML features/evaluation datasets, and export CSV only when needed.
 
 Local Tesseract OCR is the default. Google Document AI OCR is kept as a guarded legacy fallback and is blocked unless explicitly unlocked.
 
@@ -166,29 +166,30 @@ kept. The generated `name_map.json` still contains every TSV result.
 ## Structured Extraction Usage
 
 After OCR artifacts exist and `todesanzeigen filter` has written
-`artifacts/name_map.json`, extract structured CSV rows:
+`artifacts/name_map.json`, record OCR+LLM structured outputs in SQLite:
 
 ```sh
-todesanzeigen extract
+todesanzeigen extract --source "Aichacher Nachrichten"
 ```
 
 This reads `artifacts/*.txt`, requires `artifacts/name_map.json`, and writes
-`output/result.csv`. The LLM receives the OCR text plus the locally detected name
-and confidence as a hint; it does not receive the TSV layout artifact. Artifacts
-with missing name confidence or name confidence below 85.0 are skipped unless
-vision reroute is enabled. Each extraction run writes a timestamped text log
-under `logs/`.
+records to `state/todesanzeigen.sqlite3`. The LLM receives the OCR text plus the
+locally detected name and confidence as a hint; it does not receive the TSV
+layout artifact. Artifacts with missing name confidence or name confidence below
+85.0 are skipped unless vision reroute is enabled. Each extraction run writes a
+timestamped text log under `logs/` and JSONL checkpoints for resumability.
 
 Common options:
 
 ```sh
 todesanzeigen extract --limit 10
-todesanzeigen extract --artifacts-dir artifacts --output-file output/result.csv
+todesanzeigen extract --artifacts-dir artifacts --db state/todesanzeigen.sqlite3
 todesanzeigen extract --source "Augsburger Allgemeine"
 todesanzeigen extract --provider qwen
 todesanzeigen extract --provider qwen --concurrency 10
 todesanzeigen extract --name-confidence-threshold 90 --log-dir logs
 todesanzeigen extract --reroute --input-dir input --reroute-provider qwen
+todesanzeigen extract --force
 ```
 
 The extraction step makes remote API calls to the configured LLM provider. Local
@@ -196,17 +197,28 @@ OCR does not remove LLM usage. Rerun OCR with `--overwrite` if you have old
 text-only artifacts without matching TSV files, then run `todesanzeigen filter`
 before extraction.
 
-Extraction is checkpointed by default. Every `extract` run writes completed,
-skipped, rerouted, and failed file records to `logs/results.jsonl` unless
-`--resume-from` points at another JSONL checkpoint. Existing `processed` and
-`rerouted_processed` records are reused on the next run. Existing
-`skipped_low_confidence` records are reused when reroute is off, but retried
-through the vision provider when `--reroute` is enabled.
+SQLite is the authoritative cache for extraction outputs. Before a model
+request is scheduled, the command checks whether the same document already has
+an active successful row for the requested result slot. `text_extraction` uses
+the `ocr_llm` slot. Direct VLM extraction and low-confidence VLM reroute both
+use the `vlm` slot, so those two VLM paths do not coexist for the same
+document. A cache hit returns `cached_existing`, avoids the provider call, and
+does not insert a duplicate extraction row. Pass `--force` to supersede the
+active row for that slot and run the provider again.
+
+Extraction is still checkpointed by default for run-level audit and local
+resume. Every `extract` run writes completed, skipped, cached, rerouted, and
+failed file records to `logs/results.jsonl` unless `--resume-from` points at
+another JSONL checkpoint. Existing `processed` and `rerouted_processed`
+checkpoint records are reused only after the DB cache check. Existing
+`skipped_low_confidence` checkpoint records are reused when reroute is off, but
+retried through the vision provider when `--reroute` is enabled.
 
 With `--reroute`, low-confidence cases are sent to the configured vision model
-using the original source image. Successful reroutes are merged into the normal
-CSV with status `rerouted_processed` in JSONL logs. Reroute audit records are
-also written to `logs/reroute-results.jsonl` unless overridden:
+using the original source image. Successful reroutes are stored as
+`method=vision_model_reroute`, `method_family=vlm`, and
+`route_reason=low_confidence`. Reroute audit records are also written to
+`logs/reroute-results.jsonl` unless overridden:
 
 ```sh
 todesanzeigen extract \
@@ -219,7 +231,7 @@ todesanzeigen extract \
 The JSONL records include `method`, `provider`, `model`, `source_image`,
 `ocr_artifact`, `tsv_artifact`, `original_name_hint`,
 `original_name_confidence`, and `threshold` so rerouted rows can be audited
-without changing the CSV schema.
+alongside the database records.
 
 Extraction is sequential by default. Passing `--concurrency` greater than `1`
 enables concurrent extraction with retry and rate limiting. Qwen runs default to
@@ -249,7 +261,7 @@ todesanzeigen reroute \
   --input-dir "input/Aichacher Nachrichten" \
   --artifacts-dir "artifacts/Aichacher Nachrichten" \
   --low-confidence-file logs/aichacher_nachrichten/filter-low-confidence.jsonl \
-  --output-file output/aichacher-rerouted.csv
+  --source "Aichacher Nachrichten"
 ```
 
 You can also source candidates from an existing extraction checkpoint:
@@ -267,13 +279,13 @@ Useful selection and merge options:
 todesanzeigen reroute --only "Aichacher Nachrichten 2023_063.txt"
 todesanzeigen reroute --sample-ratio 0.1 --sample-seed 42
 todesanzeigen reroute --limit 20
-todesanzeigen reroute --merge-output-file output/result.csv
+todesanzeigen reroute --force
 ```
 
-Standalone reroute writes `output/rerouted.csv` by default and records audit
-details in `logs/reroute-results.jsonl`. When `--merge-output-file` is passed,
-rerouted rows are merged into that CSV by `dateiname`, replacing any existing
-row for the same notice.
+Standalone reroute records VLM outputs in SQLite and writes audit details in
+`logs/reroute-results.jsonl`. It uses the same `vlm` result slot as
+`vision-extract`, so an existing direct VLM result prevents a reroute call for
+the same document unless `--force` is passed.
 
 ## Image-Only Vision Extraction
 
@@ -283,17 +295,17 @@ running OCR, TSV filtering, or low-confidence reroute selection:
 ```sh
 todesanzeigen vision-extract \
   --input-dir "input/Aichacher Nachrichten" \
-  --output-file output/ground-truth/aichacher-vlm.csv \
+  --source "Aichacher Nachrichten" \
   --provider qwen \
   --model qwen-vl-ocr \
   --limit 25 \
   --sample-seed 42
 ```
 
-This writes the same CSV schema as normal extraction, with `dateiname` set from
-the image stem. Results are checkpointed by default in
-`logs/vision-results.jsonl`, and audit records use
-`method=vision_model_image_only`.
+This records candidate rows in SQLite with `method=vision_model_image_only`,
+`method_family=vlm`, and `route_reason=image_only`. Results are checkpointed by
+default in `logs/vision-results.jsonl`. The default candidate kind is `teacher`
+because this command is intended to bootstrap review candidates for ground truth.
 
 Useful dataset selection options:
 
@@ -302,14 +314,15 @@ todesanzeigen vision-extract --only "Aichacher Nachrichten 2023_063.jpg"
 todesanzeigen vision-extract --sample-ratio 0.05 --sample-seed 42
 todesanzeigen vision-extract --limit 20
 todesanzeigen vision-extract --concurrency 3 --rpm-limit 100 --tpm-limit 200000
+todesanzeigen vision-extract --force
 ```
 
 ## ML Infrastructure Usage
 
-The file-based OCR and extraction commands remain the operational pipeline. The
-SQLite workflow adds a durable project state for ML work: document inventory,
-artifact lineage, model outputs, teacher candidates, reviewed ground truth,
-dataset splits, and evaluation results.
+OCR artifacts remain files, but extraction outputs are now DB-first. SQLite is
+the durable project state for document inventory, artifact lineage, method
+outputs, teacher/pipeline candidates, reviewed ground truth, feature snapshots,
+dataset splits, evaluation results, and final CSV export.
 
 The default database path is:
 
@@ -363,6 +376,38 @@ They are not treated as ground truth automatically. This is intentional:
 VLM-generated or LLM-generated "ground truth" should be reviewed before it is
 used as a benchmark label.
 
+For `--candidate-kind`, the following are supported:
+- `pipeline`: a candidate from the main extraction pipeline, usually OCR+LLM.
+- `teacher`: a candidate from a teacher model, usually a VLM. Stronger results that we may review as a possible ground truth label. Default.
+- `manual_seed`: a candidate from a manual seed, usually a known good record. 
+
+Make sure to use the flags explicitly to avoid accidental mislabeling of candidates.
+
+### Method Records And CSV Export
+
+Extraction methods are stored separately for the same document:
+
+```text
+text_extraction           method_family=ocr_llm, result_slot=ocr_llm
+vision_model_image_only   method_family=vlm, result_slot=vlm, route_reason=image_only
+vision_model_reroute      method_family=vlm, result_slot=vlm, route_reason=low_confidence
+```
+
+Reviewed ground truth is stored only in `ground_truth_labels`. It is not mirrored
+as another extraction method. Extraction commands do not write the operational
+CSV directly; generate it from the DB when needed:
+
+```sh
+todesanzeigen export csv \
+  --db state/todesanzeigen.sqlite3 \
+  --label-set gt-v1 \
+  --output-file output/result.csv
+```
+
+CSV priority is: reviewed GT, image-only VLM, low-confidence VLM reroute,
+OCR+LLM text extraction, then no row. Superseded extraction rows are ignored by
+this export.
+
 ### Label Review
 
 Start the local review UI:
@@ -411,6 +456,27 @@ todesanzeigen dataset export \
   --output-file output/datasets/benchmark-v1.jsonl
 ```
 
+Build router feature snapshots:
+
+```sh
+todesanzeigen features build --feature-set router-v1
+```
+
+Export supervised failure-prediction rows for the first router milestone:
+
+```sh
+todesanzeigen dataset export-router \
+  --label-set gt-v1 \
+  --method text_extraction \
+  --feature-set router-v1 \
+  --output-file output/datasets/router-v1-text-extraction.jsonl
+```
+
+The router export uses reviewed GT to mark whether the selected method produced
+an exact-record match. Features include source/year/layout metadata, image
+quality proxies, OCR text statistics, TSV confidence/layout statistics, and the
+local name-hint confidence.
+
 ### Evaluation
 
 Evaluate the latest outputs for a method against reviewed labels:
@@ -439,15 +505,17 @@ document field comparisons are stored in `evaluation_results`.
 For a first benchmark pass:
 
 ```sh
+todesanzeigen db init
 todesanzeigen ocr --input-dir "input/Aichacher Nachrichten" --artifacts-dir "artifacts/Aichacher Nachrichten"
 todesanzeigen filter --artifacts-dir "artifacts/Aichacher Nachrichten"
 todesanzeigen extract --input-dir "input/Aichacher Nachrichten" --artifacts-dir "artifacts/Aichacher Nachrichten" --source "Aichacher Nachrichten"
-todesanzeigen db init
-todesanzeigen ingest source --source "Aichacher Nachrichten" --input-dir "input/Aichacher Nachrichten" --artifacts-dir "artifacts/Aichacher Nachrichten" --layout-family clean
-todesanzeigen ingest results --output-csv output/result.csv --method text_extraction --candidate-kind teacher
+todesanzeigen vision-extract --input-dir "input/Aichacher Nachrichten" --source "Aichacher Nachrichten" --limit 100
 todesanzeigen review serve --reviewer "your-name"
 todesanzeigen dataset split --name benchmark-v1 --strategy source-year
+todesanzeigen features build --feature-set router-v1
 todesanzeigen eval run --label-set gt-v1 --method text_extraction --split benchmark-v1
+todesanzeigen dataset export-router --label-set gt-v1 --method text_extraction --feature-set router-v1 --output-file output/datasets/router-v1.jsonl
+todesanzeigen export csv --label-set gt-v1 --output-file output/result.csv
 ```
 
 ## Google Document AI Fallback

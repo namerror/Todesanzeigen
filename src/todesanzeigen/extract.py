@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import json
 import math
 import random
@@ -13,6 +14,12 @@ from pathlib import Path
 from typing import Any
 
 from .llm import CSV_COLUMNS, LlmProvider, VisionLlmProvider
+from .methods import (
+    TEXT_EXTRACTION_METHOD,
+    VISION_IMAGE_ONLY_METHOD,
+    VISION_REROUTE_METHOD,
+    result_slot,
+)
 from .ocr import discover_images, image_mime_type
 from .ocr_filtering import is_below_confidence_threshold, name_map_artifact_path
 
@@ -55,12 +62,27 @@ class RerouteCandidate:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class DbExtractionRecord:
+    result: ExtractionResult
+    method: str
+    name_hint: NameHint | None = None
+    threshold: float | None = None
+    reason: str = ""
+    raw_response: str = ""
+    attempts: int = 0
+    estimated_tokens: int | None = None
+    latency_ms: int | None = None
+    image_path: Path | None = None
+    prompt_version: str = "death_notice_v1"
+    provider_name: str = ""
+    model_name: str = ""
+
+
 DEFAULT_NAME_CONFIDENCE_THRESHOLD = 85.0
-TEXT_EXTRACTION_METHOD = "text_extraction"
-VISION_REROUTE_METHOD = "vision_model_reroute"
-VISION_IMAGE_ONLY_METHOD = "vision_model_image_only"
 VISION_PROCESSED_STATUS = "vision_processed"
 VISION_FAILED_STATUS = "vision_failed"
+CACHED_EXISTING_STATUS = "cached_existing"
 PROCESSED_STATUSES = {"processed", "rerouted_processed", VISION_PROCESSED_STATUS}
 CHECKPOINT_REUSE_STATUSES = {"processed", "rerouted_processed", "skipped_low_confidence"}
 LLM_EXCLUDED_COLUMNS = {"foto", "bemerkungen", "quelle", "dateiname"}
@@ -976,6 +998,595 @@ async def extract_images_to_csv_async(
     return ordered_results
 
 
+async def extract_artifacts_to_db_async(
+    artifacts_dir: Path,
+    db_path: Path,
+    provider: LlmProvider,
+    *,
+    input_dir: Path = Path("input"),
+    source: str = "",
+    limit: int | None = None,
+    name_confidence_threshold: float = DEFAULT_NAME_CONFIDENCE_THRESHOLD,
+    log_file: Path | None = None,
+    checkpoint_file: Path | None = None,
+    resume_from: Path | None = None,
+    settings: AsyncExtractionSettings | None = None,
+    reroute_settings: VisionRerouteSettings | None = None,
+    candidate_kind: str = "pipeline",
+    force: bool = False,
+) -> list[ExtractionResult]:
+    settings = settings or AsyncExtractionSettings()
+    _validate_async_settings(settings, reroute_settings)
+    _ensure_db_ready(db_path)
+
+    artifacts = discover_artifacts(artifacts_dir)
+    if limit is not None:
+        artifacts = artifacts[:limit]
+
+    name_map = load_name_map(artifacts_dir)
+    _initialize_log(log_file, "DB extraction")
+    checkpoint_path = _checkpoint_path(checkpoint_file, resume_from, log_file)
+    if checkpoint_path is not None:
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_path.touch()
+    reroute_checkpoint_path = reroute_settings.results_file if reroute_settings else None
+    if reroute_checkpoint_path is not None:
+        reroute_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        reroute_checkpoint_path.touch()
+
+    resumed_records = _load_completed_checkpoint_db_records(
+        artifacts_dir,
+        resume_from or checkpoint_file,
+        reuse_skipped_low_confidence=reroute_settings is None,
+    )
+    records_by_name: dict[str, DbExtractionRecord] = {}
+    limiter = AsyncLlmRateLimiter(settings.rpm_limit, settings.tpm_limit)
+    checkpoint_lock = asyncio.Lock()
+    reroute_checkpoint_lock = asyncio.Lock()
+    semaphore = asyncio.Semaphore(settings.concurrency)
+    reroute_semaphore = asyncio.Semaphore(
+        reroute_settings.concurrency if reroute_settings else 1
+    )
+
+    async def append_checkpoint_records(
+        filename: str,
+        record: DbExtractionRecord,
+    ) -> None:
+        metadata = _db_record_checkpoint_metadata(record)
+        await _append_checkpoint_record_async(
+            checkpoint_path,
+            checkpoint_lock,
+            filename,
+            record.result,
+            record.attempts,
+            metadata=metadata,
+        )
+        if (
+            reroute_checkpoint_path is not None
+            and reroute_checkpoint_path != checkpoint_path
+            and record.method == VISION_REROUTE_METHOD
+        ):
+            await _append_checkpoint_record_async(
+                reroute_checkpoint_path,
+                reroute_checkpoint_lock,
+                filename,
+                record.result,
+                record.attempts,
+                metadata=metadata,
+            )
+
+    async def process_artifact(artifact_path: Path, name_hint: NameHint) -> DbExtractionRecord:
+        async with semaphore:
+            started = time.perf_counter()
+            try:
+                row, raw_response, attempts, estimated_tokens = await _extract_artifact_db_payload(
+                    artifact_path,
+                    provider,
+                    name_hint=name_hint,
+                    source=source,
+                    limiter=limiter,
+                    max_retries=settings.max_retries,
+                )
+                result = ExtractionResult(artifact_path, "processed", row)
+                record = DbExtractionRecord(
+                    result=result,
+                    method=TEXT_EXTRACTION_METHOD,
+                    name_hint=name_hint,
+                    threshold=name_confidence_threshold,
+                    raw_response=raw_response,
+                    attempts=attempts,
+                    estimated_tokens=estimated_tokens,
+                    latency_ms=_elapsed_ms(started),
+                    provider_name=_provider_name(provider),
+                    model_name=_model_name(provider),
+                )
+                await append_checkpoint_records(artifact_path.name, record)
+                return record
+            except Exception as exc:
+                result = ExtractionResult(artifact_path, "failed", error=str(exc))
+                _write_extraction_error(log_file, artifact_path.name, exc)
+                record = DbExtractionRecord(
+                    result=result,
+                    method=TEXT_EXTRACTION_METHOD,
+                    name_hint=name_hint,
+                    threshold=name_confidence_threshold,
+                    reason="extraction_failed",
+                    attempts=settings.max_retries + 1,
+                    latency_ms=_elapsed_ms(started),
+                    provider_name=_provider_name(provider),
+                    model_name=_model_name(provider),
+                )
+                await append_checkpoint_records(artifact_path.name, record)
+                return record
+
+    async def process_reroute_artifact(
+        artifact_path: Path,
+        name_hint: NameHint,
+    ) -> DbExtractionRecord:
+        assert reroute_settings is not None
+        async with reroute_semaphore:
+            started = time.perf_counter()
+            image_path: Path | None = None
+            try:
+                image_path = find_image_for_artifact(artifact_path, reroute_settings.input_dir)
+                (
+                    row,
+                    raw_response,
+                    attempts,
+                    estimated_tokens,
+                ) = await _extract_artifact_with_vision_db_payload(
+                    artifact_path,
+                    image_path,
+                    reroute_settings.provider,
+                    name_hint=name_hint,
+                    source=source,
+                    limiter=limiter,
+                    max_retries=settings.max_retries,
+                )
+                result = ExtractionResult(artifact_path, "rerouted_processed", row)
+                record = DbExtractionRecord(
+                    result=result,
+                    method=VISION_REROUTE_METHOD,
+                    name_hint=name_hint,
+                    threshold=name_confidence_threshold,
+                    reason=_low_confidence_reason(name_hint.confidence),
+                    raw_response=raw_response,
+                    attempts=attempts,
+                    estimated_tokens=estimated_tokens,
+                    latency_ms=_elapsed_ms(started),
+                    image_path=image_path,
+                    provider_name=_provider_name(reroute_settings.provider),
+                    model_name=_model_name(reroute_settings.provider),
+                )
+                await append_checkpoint_records(artifact_path.name, record)
+                return record
+            except Exception as exc:
+                result = ExtractionResult(artifact_path, "rerouted_failed", error=str(exc))
+                _write_extraction_error(
+                    log_file,
+                    artifact_path.name,
+                    exc,
+                    method=VISION_REROUTE_METHOD,
+                )
+                attempts = 0 if image_path is None else settings.max_retries + 1
+                record = DbExtractionRecord(
+                    result=result,
+                    method=VISION_REROUTE_METHOD,
+                    name_hint=name_hint,
+                    threshold=name_confidence_threshold,
+                    reason=_low_confidence_reason(name_hint.confidence),
+                    attempts=attempts,
+                    latency_ms=_elapsed_ms(started),
+                    image_path=image_path,
+                    provider_name=_provider_name(reroute_settings.provider),
+                    model_name=_model_name(reroute_settings.provider),
+                )
+                await append_checkpoint_records(artifact_path.name, record)
+                return record
+
+    tasks: list[asyncio.Task[DbExtractionRecord]] = []
+    for artifact_path in artifacts:
+        try:
+            name_hint = name_map[artifact_path.name]
+        except KeyError as exc:
+            raise ValueError(
+                f"Missing OCR name map entry for {artifact_path.name}. "
+                "Run `todesanzeigen filter` for the same artifacts before extracting."
+            ) from exc
+        below_threshold = _is_below_confidence_threshold(name_hint, name_confidence_threshold)
+        request_method = (
+            VISION_REROUTE_METHOD
+            if below_threshold and reroute_settings is not None
+            else TEXT_EXTRACTION_METHOD
+        )
+        cached_record = _cached_db_record_for_request(
+            db_path,
+            artifact_path=artifact_path,
+            method=request_method,
+            source=source,
+            input_dir=(
+                reroute_settings.input_dir
+                if request_method == VISION_REROUTE_METHOD and reroute_settings is not None
+                else input_dir
+            ),
+            name_hint=name_hint,
+            threshold=name_confidence_threshold,
+            reason=(
+                _low_confidence_reason(name_hint.confidence)
+                if request_method == VISION_REROUTE_METHOD or below_threshold
+                else ""
+            ),
+            force=force,
+        )
+        if cached_record is not None:
+            records_by_name[artifact_path.name] = cached_record
+            await append_checkpoint_records(artifact_path.name, cached_record)
+            continue
+
+        resumed_record = None if force else resumed_records.get(artifact_path.name)
+        if resumed_record is not None:
+            records_by_name[artifact_path.name] = resumed_record
+            continue
+
+        if below_threshold:
+            _write_low_confidence_warning(
+                log_file,
+                artifact_path.name,
+                name_hint.confidence,
+                name_confidence_threshold,
+            )
+            if reroute_settings is not None:
+                tasks.append(asyncio.create_task(process_reroute_artifact(artifact_path, name_hint)))
+                continue
+
+            result = ExtractionResult(artifact_path, "skipped_low_confidence")
+            record = DbExtractionRecord(
+                result=result,
+                method=TEXT_EXTRACTION_METHOD,
+                name_hint=name_hint,
+                threshold=name_confidence_threshold,
+                reason=_low_confidence_reason(name_hint.confidence),
+                provider_name=_provider_name(provider),
+                model_name=_model_name(provider),
+            )
+            records_by_name[artifact_path.name] = record
+            await append_checkpoint_records(artifact_path.name, record)
+            continue
+
+        tasks.append(asyncio.create_task(process_artifact(artifact_path, name_hint)))
+
+    for record in await asyncio.gather(*tasks):
+        records_by_name[record.result.artifact_path.name] = record
+
+    ordered_records = [records_by_name[path.name] for path in artifacts]
+    _persist_db_extraction_records(
+        db_path,
+        ordered_records,
+        command="extract",
+        source=source,
+        input_dir=input_dir,
+        artifacts_dir=artifacts_dir,
+        candidate_kind=candidate_kind,
+        run_method=TEXT_EXTRACTION_METHOD,
+        run_provider=_provider_name(provider),
+        run_model=_model_name(provider),
+        run_config={
+            "name_confidence_threshold": name_confidence_threshold,
+            "reroute": reroute_settings is not None,
+            "checkpoint_file": str(checkpoint_path or ""),
+        },
+    )
+    return [record.result for record in ordered_records]
+
+
+async def reroute_candidates_to_db_async(
+    candidates: list[RerouteCandidate],
+    db_path: Path,
+    provider: VisionLlmProvider,
+    *,
+    input_dir: Path,
+    source: str = "",
+    log_file: Path | None = None,
+    results_file: Path | None = None,
+    settings: AsyncExtractionSettings | None = None,
+    concurrency: int = 1,
+    candidate_kind: str = "pipeline",
+    force: bool = False,
+) -> list[ExtractionResult]:
+    settings = settings or AsyncExtractionSettings()
+    if concurrency < 1:
+        raise ValueError("Vision reroute concurrency must be at least 1.")
+    if settings.max_retries < 0:
+        raise ValueError("LLM max retries must be at least 0.")
+    _ensure_db_ready(db_path)
+
+    _initialize_log(log_file, "DB vision reroute")
+    if results_file is not None:
+        results_file.parent.mkdir(parents=True, exist_ok=True)
+        results_file.touch()
+
+    limiter = AsyncLlmRateLimiter(settings.rpm_limit, settings.tpm_limit)
+    checkpoint_lock = asyncio.Lock()
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def process_candidate(candidate: RerouteCandidate) -> DbExtractionRecord:
+        async with semaphore:
+            started = time.perf_counter()
+            image_path: Path | None = None
+            try:
+                image_path = find_image_for_artifact(candidate.artifact_path, input_dir)
+                (
+                    row,
+                    raw_response,
+                    attempts,
+                    estimated_tokens,
+                ) = await _extract_artifact_with_vision_db_payload(
+                    candidate.artifact_path,
+                    image_path,
+                    provider,
+                    name_hint=candidate.name_hint,
+                    source=source,
+                    limiter=limiter,
+                    max_retries=settings.max_retries,
+                )
+                result = ExtractionResult(candidate.artifact_path, "rerouted_processed", row)
+                record = DbExtractionRecord(
+                    result=result,
+                    method=VISION_REROUTE_METHOD,
+                    name_hint=candidate.name_hint,
+                    threshold=candidate.threshold,
+                    reason=candidate.reason or _low_confidence_reason(candidate.name_hint.confidence),
+                    raw_response=raw_response,
+                    attempts=attempts,
+                    estimated_tokens=estimated_tokens,
+                    latency_ms=_elapsed_ms(started),
+                    image_path=image_path,
+                    provider_name=_provider_name(provider),
+                    model_name=_model_name(provider),
+                )
+                await _append_checkpoint_record_async(
+                    results_file,
+                    checkpoint_lock,
+                    candidate.artifact_path.name,
+                    result,
+                    attempts,
+                    metadata=_db_record_checkpoint_metadata(record),
+                )
+                return record
+            except Exception as exc:
+                result = ExtractionResult(candidate.artifact_path, "rerouted_failed", error=str(exc))
+                _write_extraction_error(
+                    log_file,
+                    candidate.artifact_path.name,
+                    exc,
+                    method=VISION_REROUTE_METHOD,
+                )
+                attempts = 0 if image_path is None else settings.max_retries + 1
+                record = DbExtractionRecord(
+                    result=result,
+                    method=VISION_REROUTE_METHOD,
+                    name_hint=candidate.name_hint,
+                    threshold=candidate.threshold,
+                    reason=candidate.reason or _low_confidence_reason(candidate.name_hint.confidence),
+                    attempts=attempts,
+                    latency_ms=_elapsed_ms(started),
+                    image_path=image_path,
+                    provider_name=_provider_name(provider),
+                    model_name=_model_name(provider),
+                )
+                await _append_checkpoint_record_async(
+                    results_file,
+                    checkpoint_lock,
+                    candidate.artifact_path.name,
+                    result,
+                    attempts,
+                    metadata=_db_record_checkpoint_metadata(record),
+                )
+                return record
+
+    records_by_name: dict[str, DbExtractionRecord] = {}
+    tasks: list[asyncio.Task[DbExtractionRecord]] = []
+    for candidate in candidates:
+        cached_record = _cached_db_record_for_request(
+            db_path,
+            artifact_path=candidate.artifact_path,
+            method=VISION_REROUTE_METHOD,
+            source=source,
+            input_dir=input_dir,
+            name_hint=candidate.name_hint,
+            threshold=candidate.threshold,
+            reason=candidate.reason or _low_confidence_reason(candidate.name_hint.confidence),
+            force=force,
+        )
+        if cached_record is not None:
+            records_by_name[candidate.artifact_path.name] = cached_record
+            await _append_checkpoint_record_async(
+                results_file,
+                checkpoint_lock,
+                candidate.artifact_path.name,
+                cached_record.result,
+                cached_record.attempts,
+                metadata=_db_record_checkpoint_metadata(cached_record),
+            )
+            continue
+        tasks.append(asyncio.create_task(process_candidate(candidate)))
+
+    for record in await asyncio.gather(*tasks):
+        records_by_name[record.result.artifact_path.name] = record
+
+    records = [records_by_name[candidate.artifact_path.name] for candidate in candidates]
+    _persist_db_extraction_records(
+        db_path,
+        records,
+        command="reroute",
+        source=source,
+        input_dir=input_dir,
+        artifacts_dir=Path(""),
+        candidate_kind=candidate_kind,
+        run_method=VISION_REROUTE_METHOD,
+        run_provider=_provider_name(provider),
+        run_model=_model_name(provider),
+        run_config={"results_file": str(results_file or "")},
+    )
+    return [record.result for record in records]
+
+
+async def extract_images_to_db_async(
+    input_dir: Path,
+    db_path: Path,
+    provider: VisionLlmProvider,
+    *,
+    source: str = "",
+    limit: int | None = None,
+    only: list[str] | None = None,
+    sample_ratio: float | None = None,
+    sample_seed: int = 0,
+    log_file: Path | None = None,
+    results_file: Path | None = None,
+    resume_from: Path | None = None,
+    settings: AsyncExtractionSettings | None = None,
+    candidate_kind: str = "teacher",
+    force: bool = False,
+) -> list[ExtractionResult]:
+    settings = settings or AsyncExtractionSettings()
+    if settings.concurrency < 1:
+        raise ValueError("Vision extraction concurrency must be at least 1.")
+    if settings.max_retries < 0:
+        raise ValueError("LLM max retries must be at least 0.")
+    _ensure_db_ready(db_path)
+
+    images = select_image_paths(
+        discover_images(input_dir),
+        only=only,
+        sample_ratio=sample_ratio,
+        sample_seed=sample_seed,
+        limit=limit,
+    )
+    _initialize_log(log_file, "DB image-only vision extraction")
+    checkpoint_path = results_file or resume_from
+    resume_path = resume_from or results_file
+    if checkpoint_path is None and log_file is not None:
+        checkpoint_path = log_file.with_suffix(".results.jsonl")
+    if checkpoint_path is not None:
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_path.touch()
+
+    resumed_records = _load_completed_image_checkpoint_db_records(input_dir, resume_path)
+    records_by_name: dict[str, DbExtractionRecord] = {}
+    limiter = AsyncLlmRateLimiter(settings.rpm_limit, settings.tpm_limit)
+    checkpoint_lock = asyncio.Lock()
+    semaphore = asyncio.Semaphore(settings.concurrency)
+
+    async def process_image(image_path: Path) -> DbExtractionRecord:
+        async with semaphore:
+            started = time.perf_counter()
+            try:
+                row, raw_response, attempts, estimated_tokens = await _extract_image_db_payload(
+                    image_path,
+                    provider,
+                    source=source,
+                    limiter=limiter,
+                    max_retries=settings.max_retries,
+                )
+                result = ExtractionResult(image_path, VISION_PROCESSED_STATUS, row)
+                record = DbExtractionRecord(
+                    result=result,
+                    method=VISION_IMAGE_ONLY_METHOD,
+                    reason="image_only",
+                    raw_response=raw_response,
+                    attempts=attempts,
+                    estimated_tokens=estimated_tokens,
+                    latency_ms=_elapsed_ms(started),
+                    image_path=image_path,
+                    provider_name=_provider_name(provider),
+                    model_name=_model_name(provider),
+                )
+                await _append_checkpoint_record_async(
+                    checkpoint_path,
+                    checkpoint_lock,
+                    image_path.name,
+                    result,
+                    attempts,
+                    metadata=_db_record_checkpoint_metadata(record),
+                )
+                return record
+            except Exception as exc:
+                result = ExtractionResult(image_path, VISION_FAILED_STATUS, error=str(exc))
+                _write_extraction_error(log_file, image_path.name, exc, method=VISION_IMAGE_ONLY_METHOD)
+                record = DbExtractionRecord(
+                    result=result,
+                    method=VISION_IMAGE_ONLY_METHOD,
+                    reason="image_only",
+                    attempts=settings.max_retries + 1,
+                    latency_ms=_elapsed_ms(started),
+                    image_path=image_path,
+                    provider_name=_provider_name(provider),
+                    model_name=_model_name(provider),
+                )
+                await _append_checkpoint_record_async(
+                    checkpoint_path,
+                    checkpoint_lock,
+                    image_path.name,
+                    result,
+                    record.attempts,
+                    metadata=_db_record_checkpoint_metadata(record),
+                )
+                return record
+
+    tasks: list[asyncio.Task[DbExtractionRecord]] = []
+    for image_path in images:
+        cached_record = _cached_db_record_for_request(
+            db_path,
+            artifact_path=image_path,
+            method=VISION_IMAGE_ONLY_METHOD,
+            source=source,
+            input_dir=input_dir,
+            image_path=image_path,
+            reason="image_only",
+            force=force,
+        )
+        if cached_record is not None:
+            records_by_name[image_path.name] = cached_record
+            await _append_checkpoint_record_async(
+                checkpoint_path,
+                checkpoint_lock,
+                image_path.name,
+                cached_record.result,
+                cached_record.attempts,
+                metadata=_db_record_checkpoint_metadata(cached_record),
+            )
+            continue
+
+        resumed_record = None if force else resumed_records.get(image_path.name)
+        if resumed_record is not None:
+            records_by_name[image_path.name] = resumed_record
+            continue
+        tasks.append(asyncio.create_task(process_image(image_path)))
+
+    for record in await asyncio.gather(*tasks):
+        records_by_name[record.result.artifact_path.name] = record
+
+    ordered_records = [records_by_name[path.name] for path in images]
+    _persist_db_extraction_records(
+        db_path,
+        ordered_records,
+        command="vision-extract",
+        source=source,
+        input_dir=input_dir,
+        artifacts_dir=Path(""),
+        candidate_kind=candidate_kind,
+        run_method=VISION_IMAGE_ONLY_METHOD,
+        run_provider=_provider_name(provider),
+        run_model=_model_name(provider),
+        run_config={
+            "results_file": str(checkpoint_path or ""),
+            "sample_ratio": sample_ratio,
+            "sample_seed": sample_seed,
+        },
+    )
+    return [record.result for record in ordered_records]
+
+
 def merge_rows_into_csv(output_csv: Path, rows: list[dict[str, str] | None]) -> None:
     clean_rows = [row for row in rows if row is not None]
     if not clean_rows:
@@ -1005,6 +1616,607 @@ def _write_results_csv(output_csv: Path, results: list[ExtractionResult]) -> Non
         for result in results:
             if result.status in PROCESSED_STATUSES and result.row is not None:
                 writer.writerow(result.row)
+
+
+def _validate_async_settings(
+    settings: AsyncExtractionSettings,
+    reroute_settings: VisionRerouteSettings | None = None,
+) -> None:
+    if settings.concurrency < 1:
+        raise ValueError("LLM extraction concurrency must be at least 1.")
+    if settings.max_retries < 0:
+        raise ValueError("LLM max retries must be at least 0.")
+    if reroute_settings is not None and reroute_settings.concurrency < 1:
+        raise ValueError("Vision reroute concurrency must be at least 1.")
+
+
+def _initialize_log(log_file: Path | None, title: str) -> None:
+    if log_file is None:
+        return
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text(
+        f"{title} log started {datetime.now().isoformat(timespec='seconds')}\n",
+        encoding="utf-8",
+    )
+
+
+def _checkpoint_path(
+    checkpoint_file: Path | None,
+    resume_from: Path | None,
+    log_file: Path | None,
+) -> Path | None:
+    path = checkpoint_file or resume_from
+    if path is None and log_file is not None:
+        path = log_file.with_suffix(".results.jsonl")
+    return path
+
+
+def _ensure_db_ready(db_path: Path) -> None:
+    from .storage import apply_migrations
+
+    apply_migrations(db_path)
+
+
+def _cached_db_record_for_request(
+    db_path: Path,
+    *,
+    artifact_path: Path,
+    method: str,
+    source: str,
+    input_dir: Path,
+    name_hint: NameHint | None = None,
+    threshold: float | None = None,
+    reason: str = "",
+    image_path: Path | None = None,
+    force: bool = False,
+) -> DbExtractionRecord | None:
+    from .storage import (
+        connect,
+        latest_active_extraction_by_slot,
+        sha256_file,
+        supersede_active_extractions_by_slot,
+        upsert_document,
+    )
+
+    resolved_image = image_path or _safe_record_image_path(artifact_path, input_dir)
+    image_digest = (
+        sha256_file(resolved_image)
+        if resolved_image is not None and resolved_image.exists() and resolved_image.is_file()
+        else ""
+    )
+    slot = result_slot(method)
+
+    with connect(db_path) as connection:
+        document_id: int | None = None
+        if source:
+            document_id = upsert_document(
+                connection,
+                source_name=source,
+                filename_stem=artifact_path.stem,
+                image_path=resolved_image or "",
+                image_sha256=image_digest,
+                mime_type=image_mime_type(resolved_image) if resolved_image is not None else "",
+            )
+        elif resolved_image is not None:
+            existing_document = connection.execute(
+                """
+                SELECT id FROM documents
+                WHERE image_path = ?
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                """,
+                (str(resolved_image),),
+            ).fetchone()
+            document_id = int(existing_document["id"]) if existing_document is not None else None
+
+        if document_id is None:
+            return None
+
+        if force:
+            supersede_active_extractions_by_slot(
+                connection,
+                document_id=document_id,
+                result_slot_value=slot,
+            )
+            return None
+
+        existing = latest_active_extraction_by_slot(
+            connection,
+            document_id=document_id,
+            result_slot_value=slot,
+        )
+        if existing is None:
+            return None
+
+        return DbExtractionRecord(
+            result=ExtractionResult(
+                artifact_path,
+                CACHED_EXISTING_STATUS,
+                _fields_from_output_row(existing),
+            ),
+            method=str(existing["method"]),
+            name_hint=name_hint,
+            threshold=threshold,
+            reason=reason or str(existing["route_reason"] or "cached_existing"),
+            attempts=0,
+            estimated_tokens=0,
+            latency_ms=0,
+            image_path=resolved_image,
+            provider_name=str(existing["provider"] or ""),
+            model_name=str(existing["model"] or ""),
+        )
+
+
+def _safe_record_image_path(artifact_path: Path, input_dir: Path) -> Path | None:
+    if image_mime_type(artifact_path):
+        return artifact_path
+    if artifact_path.suffix != ".txt":
+        return None
+    try:
+        return find_image_for_artifact(artifact_path, input_dir)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+
+
+def _fields_from_output_row(row: Any) -> dict[str, str]:
+    try:
+        data = json.loads(row["fields_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(key): "" if value is None else str(value) for key, value in data.items()}
+
+
+def _persist_db_extraction_records(
+    db_path: Path,
+    records: list[DbExtractionRecord],
+    *,
+    command: str,
+    source: str,
+    input_dir: Path,
+    artifacts_dir: Path,
+    candidate_kind: str,
+    run_method: str,
+    run_provider: str,
+    run_model: str,
+    run_config: dict[str, Any],
+) -> None:
+    del artifacts_dir
+    from .storage import (
+        apply_migrations,
+        connect,
+        create_run,
+        finish_run,
+        insert_extraction_output,
+        insert_label_candidate,
+        record_artifact,
+        sha256_file,
+        upsert_document,
+        upsert_ocr_output,
+    )
+
+    apply_migrations(db_path)
+    with connect(db_path) as connection:
+        run_id = create_run(
+            connection,
+            command=command,
+            method=run_method,
+            provider=run_provider,
+            model=run_model,
+            config=run_config,
+        )
+        try:
+            for record in records:
+                result = record.result
+                if result.status == CACHED_EXISTING_STATUS:
+                    continue
+                row = result.row or {}
+                source_name = source or row.get("quelle", "") or "unknown"
+                filename_stem = row.get("dateiname", "") or result.artifact_path.stem
+                image_path = _record_image_path(record, input_dir)
+                image_digest = (
+                    sha256_file(image_path)
+                    if image_path is not None and image_path.exists() and image_path.is_file()
+                    else ""
+                )
+                document_id = upsert_document(
+                    connection,
+                    source_name=source_name,
+                    filename_stem=filename_stem,
+                    image_path=image_path or "",
+                    image_sha256=image_digest,
+                    mime_type=image_mime_type(image_path) if image_path is not None else "",
+                )
+                image_artifact_id = None
+                if image_path is not None:
+                    image_artifact_id = record_artifact(
+                        connection,
+                        document_id=document_id,
+                        run_id=run_id,
+                        artifact_type="source_image",
+                        path=image_path,
+                        producer=record.method,
+                    )
+
+                text_artifact_id = None
+                tsv_artifact_id = None
+                ocr_output_id = None
+                if result.artifact_path.suffix == ".txt":
+                    text_artifact_id = record_artifact(
+                        connection,
+                        document_id=document_id,
+                        run_id=run_id,
+                        artifact_type="ocr_text",
+                        path=result.artifact_path,
+                        producer="tesseract",
+                    )
+                    tsv_path = result.artifact_path.with_suffix(".tsv")
+                    if tsv_path.exists():
+                        tsv_artifact_id = record_artifact(
+                            connection,
+                            document_id=document_id,
+                            run_id=run_id,
+                            artifact_type="ocr_tsv",
+                            path=tsv_path,
+                            producer="tesseract",
+                        )
+                    text = (
+                        result.artifact_path.read_text(encoding="utf-8")
+                        if result.artifact_path.exists()
+                        else ""
+                    )
+                    ocr_output_id = upsert_ocr_output(
+                        connection,
+                        document_id=document_id,
+                        run_id=run_id,
+                        text=text,
+                        text_artifact_id=text_artifact_id,
+                        tsv_artifact_id=tsv_artifact_id,
+                        features=_basic_ocr_features(text, tsv_path if tsv_path.exists() else None),
+                        name_hint=record.name_hint.name if record.name_hint is not None else "",
+                        name_confidence=(
+                            record.name_hint.confidence if record.name_hint is not None else None
+                        ),
+                    )
+
+                source_artifact_id = image_artifact_id if record.method.startswith("vision") else text_artifact_id
+                config_hash = _stable_config_hash(
+                    {
+                        **run_config,
+                        "method": record.method,
+                        "provider": record.provider_name,
+                        "model": record.model_name,
+                        "prompt_version": record.prompt_version,
+                    }
+                )
+                output_id = insert_extraction_output(
+                    connection,
+                    document_id=document_id,
+                    run_id=run_id,
+                    method=record.method,
+                    provider=record.provider_name,
+                    model=record.model_name,
+                    prompt_version=record.prompt_version,
+                    fields=row,
+                    status=result.status,
+                    raw_response=record.raw_response,
+                    error=result.error or "",
+                    attempts=record.attempts,
+                    estimated_tokens=record.estimated_tokens,
+                    source_artifact_id=source_artifact_id,
+                    latency_ms=record.latency_ms,
+                    route_reason=record.reason,
+                    route_decision=_route_decision(record),
+                    config=run_config,
+                    ocr_output_id=ocr_output_id,
+                    result_slot_value=result_slot(record.method),
+                    input_fingerprint=_record_input_fingerprint(record, input_dir, sha256_file),
+                    config_hash=config_hash,
+                )
+                if result.status in PROCESSED_STATUSES and result.row is not None:
+                    insert_label_candidate(
+                        connection,
+                        document_id=document_id,
+                        extraction_output_id=output_id,
+                        source_kind=candidate_kind,
+                        source_name=record.method,
+                        fields=result.row,
+                    )
+            finish_run(connection, run_id)
+        except Exception:
+            finish_run(connection, run_id, status="failed")
+            raise
+
+
+def _record_image_path(record: DbExtractionRecord, input_dir: Path) -> Path | None:
+    if record.image_path is not None:
+        return record.image_path
+    artifact_path = record.result.artifact_path
+    if image_mime_type(artifact_path):
+        return artifact_path
+    if artifact_path.suffix == ".txt":
+        try:
+            return find_image_for_artifact(artifact_path, input_dir)
+        except FileNotFoundError:
+            return None
+    return None
+
+
+def _record_input_fingerprint(
+    record: DbExtractionRecord,
+    input_dir: Path,
+    sha256_file_func: Any,
+) -> str:
+    input_path = (
+        _record_image_path(record, input_dir)
+        if result_slot(record.method) == result_slot(VISION_IMAGE_ONLY_METHOD)
+        else record.result.artifact_path
+    )
+    if input_path is None or not input_path.exists() or not input_path.is_file():
+        return ""
+    return str(sha256_file_func(input_path))
+
+
+def _stable_config_hash(config: dict[str, Any]) -> str:
+    payload = json.dumps(config, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _route_decision(record: DbExtractionRecord) -> dict[str, Any]:
+    decision: dict[str, Any] = {
+        "method": record.method,
+        "status": record.result.status,
+    }
+    if record.threshold is not None:
+        decision["threshold"] = record.threshold
+    if record.reason:
+        decision["reason"] = record.reason
+    if record.name_hint is not None:
+        decision["original_name_hint"] = record.name_hint.name
+        decision["original_name_confidence"] = record.name_hint.confidence
+    if record.image_path is not None:
+        decision["source_image"] = str(record.image_path)
+    return decision
+
+
+def _db_record_checkpoint_metadata(record: DbExtractionRecord) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "method": record.method,
+        "provider": record.provider_name or None,
+        "model": record.model_name or None,
+        "route_reason": record.reason,
+    }
+    if record.result.artifact_path.suffix == ".txt":
+        metadata["ocr_artifact"] = str(record.result.artifact_path)
+        metadata["tsv_artifact"] = str(record.result.artifact_path.with_suffix(".tsv"))
+    if record.image_path is not None:
+        metadata["source_image"] = str(record.image_path)
+        metadata["mime_type"] = image_mime_type(record.image_path)
+    if record.name_hint is not None:
+        metadata["original_name_hint"] = record.name_hint.name
+        metadata["original_name_confidence"] = record.name_hint.confidence
+    if record.threshold is not None:
+        metadata["threshold"] = record.threshold
+    if record.reason:
+        metadata["reason"] = record.reason
+    if record.estimated_tokens is not None:
+        metadata["estimated_tokens"] = record.estimated_tokens
+    if record.latency_ms is not None:
+        metadata["latency_ms"] = record.latency_ms
+    return metadata
+
+
+def _load_completed_checkpoint_db_records(
+    artifacts_dir: Path,
+    checkpoint_path: Path | None,
+    *,
+    reuse_skipped_low_confidence: bool = True,
+) -> dict[str, DbExtractionRecord]:
+    if checkpoint_path is None or not checkpoint_path.exists():
+        return {}
+
+    records: dict[str, DbExtractionRecord] = {}
+    for record in _read_jsonl_records(checkpoint_path):
+        filename = record.get("filename")
+        status = record.get("status")
+        if not isinstance(filename, str) or status not in CHECKPOINT_REUSE_STATUSES:
+            continue
+        if status == "skipped_low_confidence" and not reuse_skipped_low_confidence:
+            continue
+        row = record.get("row") if status in PROCESSED_STATUSES else None
+        if row is not None and not isinstance(row, dict):
+            continue
+        method = str(record.get("method") or "")
+        if not method:
+            method = VISION_REROUTE_METHOD if status == "rerouted_processed" else TEXT_EXTRACTION_METHOD
+        source_image = record.get("source_image")
+        records[filename] = DbExtractionRecord(
+            result=ExtractionResult(
+                artifacts_dir / filename,
+                str(status),
+                row={key: str(value) for key, value in row.items()} if row is not None else None,
+            ),
+            method=method,
+            name_hint=NameHint(
+                str(record.get("original_name_hint") or ""),
+                _optional_float(record.get("original_name_confidence")),
+            ),
+            threshold=_optional_float(record.get("threshold")),
+            reason=str(record.get("reason") or record.get("route_reason") or ""),
+            attempts=int(record.get("attempts") or 0),
+            estimated_tokens=(
+                int(record["estimated_tokens"]) if record.get("estimated_tokens") is not None else None
+            ),
+            latency_ms=int(record["latency_ms"]) if record.get("latency_ms") is not None else None,
+            image_path=Path(source_image) if isinstance(source_image, str) and source_image else None,
+            provider_name=str(record.get("provider") or ""),
+            model_name=str(record.get("model") or ""),
+        )
+    return records
+
+
+def _load_completed_image_checkpoint_db_records(
+    input_dir: Path,
+    checkpoint_path: Path | None,
+) -> dict[str, DbExtractionRecord]:
+    if checkpoint_path is None or not checkpoint_path.exists():
+        return {}
+
+    records: dict[str, DbExtractionRecord] = {}
+    for record in _read_jsonl_records(checkpoint_path):
+        filename = record.get("filename")
+        status = record.get("status")
+        method = record.get("method")
+        if (
+            not isinstance(filename, str)
+            or status != VISION_PROCESSED_STATUS
+            or method != VISION_IMAGE_ONLY_METHOD
+        ):
+            continue
+        row = record.get("row")
+        if not isinstance(row, dict):
+            continue
+        image_path = input_dir / filename
+        records[filename] = DbExtractionRecord(
+            result=ExtractionResult(
+                image_path,
+                VISION_PROCESSED_STATUS,
+                row={key: str(value) for key, value in row.items()},
+            ),
+            method=VISION_IMAGE_ONLY_METHOD,
+            reason=str(record.get("reason") or record.get("route_reason") or "image_only"),
+            attempts=int(record.get("attempts") or 0),
+            estimated_tokens=(
+                int(record["estimated_tokens"]) if record.get("estimated_tokens") is not None else None
+            ),
+            latency_ms=int(record["latency_ms"]) if record.get("latency_ms") is not None else None,
+            image_path=image_path,
+            provider_name=str(record.get("provider") or ""),
+            model_name=str(record.get("model") or ""),
+        )
+    return records
+
+
+async def _extract_artifact_db_payload(
+    artifact_path: Path,
+    provider: LlmProvider,
+    *,
+    name_hint: NameHint,
+    source: str,
+    limiter: AsyncLlmRateLimiter,
+    max_retries: int,
+) -> tuple[dict[str, str], str, int, int]:
+    ocr_text = artifact_path.read_text(encoding="utf-8")
+    filename = artifact_path.stem
+    prompt = build_extraction_prompt(
+        ocr_text,
+        filename=filename,
+        source=source,
+        name_hint=name_hint,
+    )
+    estimated_tokens = estimate_llm_tokens(prompt)
+    attempts = 0
+    while True:
+        attempts += 1
+        await limiter.acquire(estimated_tokens)
+        try:
+            response_text = await provider.async_complete(prompt)
+            data = parse_json_object(response_text)
+            return normalize_record(data, filename=filename, source=source), response_text, attempts, estimated_tokens
+        except Exception as exc:
+            if attempts > max_retries or not _is_transient_llm_error(exc):
+                raise
+            await asyncio.sleep(_retry_delay_seconds(attempts))
+
+
+async def _extract_artifact_with_vision_db_payload(
+    artifact_path: Path,
+    image_path: Path,
+    provider: VisionLlmProvider,
+    *,
+    name_hint: NameHint,
+    source: str,
+    limiter: AsyncLlmRateLimiter,
+    max_retries: int,
+) -> tuple[dict[str, str], str, int, int]:
+    ocr_text = artifact_path.read_text(encoding="utf-8") if artifact_path.exists() else ""
+    mime_type = image_mime_type(image_path)
+    if mime_type is None:
+        raise ValueError(f"Unsupported image type for reroute: {image_path}")
+    filename = artifact_path.stem
+    prompt = build_vision_extraction_prompt(
+        ocr_text,
+        filename=filename,
+        source=source,
+        name_hint=name_hint,
+    )
+    estimated_tokens = estimate_vision_llm_tokens(prompt, image_path)
+    attempts = 0
+    while True:
+        attempts += 1
+        await limiter.acquire(estimated_tokens)
+        try:
+            response_text = await provider.async_vision_complete(prompt, image_path, mime_type)
+            data = parse_json_object(response_text)
+            return normalize_record(data, filename=filename, source=source), response_text, attempts, estimated_tokens
+        except Exception:
+            if attempts > max_retries:
+                raise
+            await asyncio.sleep(_retry_delay_seconds(attempts))
+
+
+async def _extract_image_db_payload(
+    image_path: Path,
+    provider: VisionLlmProvider,
+    *,
+    source: str,
+    limiter: AsyncLlmRateLimiter,
+    max_retries: int,
+) -> tuple[dict[str, str], str, int, int]:
+    mime_type = image_mime_type(image_path)
+    if mime_type is None:
+        raise ValueError(f"Unsupported image type for vision extraction: {image_path}")
+    filename = image_path.stem
+    prompt = build_image_only_vision_extraction_prompt(
+        filename=filename,
+        source=source,
+    )
+    estimated_tokens = estimate_vision_llm_tokens(prompt, image_path)
+    attempts = 0
+    while True:
+        attempts += 1
+        await limiter.acquire(estimated_tokens)
+        try:
+            response_text = await provider.async_vision_complete(prompt, image_path, mime_type)
+            data = parse_json_object(response_text)
+            return normalize_record(data, filename=filename, source=source), response_text, attempts, estimated_tokens
+        except Exception:
+            if attempts > max_retries:
+                raise
+            await asyncio.sleep(_retry_delay_seconds(attempts))
+
+
+def _basic_ocr_features(text: str, tsv_path: Path | None) -> dict[str, Any]:
+    features: dict[str, Any] = {
+        "ocr_char_count": len(text),
+        "ocr_word_count": len(text.split()),
+    }
+    if tsv_path is not None and tsv_path.exists():
+        features["tsv_line_count"] = len(tsv_path.read_text(encoding="utf-8").splitlines())
+    return features
+
+
+def _elapsed_ms(started: float) -> int:
+    return int((time.perf_counter() - started) * 1000)
+
+
+def _provider_name(provider: object) -> str:
+    return str(getattr(provider, "provider_name", "") or "")
+
+
+def _model_name(provider: object) -> str:
+    return str(getattr(provider, "model_name", "") or "")
 
 
 def _load_low_confidence_file_candidates(

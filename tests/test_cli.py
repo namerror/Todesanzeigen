@@ -2,6 +2,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import AsyncMock, patch
 
@@ -159,15 +160,59 @@ class CliOcrTests(TestCase):
             output.getvalue(),
         )
 
+    def test_ingest_results_command_passes_input_dir(self) -> None:
+        args = cli.build_parser().parse_args(
+            [
+                "ingest",
+                "results",
+                "--db",
+                "state/test.sqlite3",
+                "--source",
+                "Aichacher Nachrichten",
+                "--output-csv",
+                "output/result.csv",
+                "--method",
+                "text_extraction",
+                "--candidate-kind",
+                "pipeline",
+                "--input-dir",
+                "input/Aichacher Nachrichten",
+            ]
+        )
+
+        with patch("src.todesanzeigen.ingest.ingest_results") as ingest_results:
+            ingest_results.return_value = SimpleNamespace(
+                extraction_outputs=0,
+                label_candidates=0,
+                run_id="run-1",
+            )
+            output = StringIO()
+            with redirect_stdout(output):
+                status = cli.run_ingest_command(args)
+
+        self.assertEqual(status, 0)
+        ingest_results.assert_called_once_with(
+            db_path=Path("state/test.sqlite3"),
+            source="Aichacher Nachrichten",
+            output_csv=Path("output/result.csv"),
+            results_file=None,
+            method="text_extraction",
+            provider="",
+            model="",
+            candidate_kind="pipeline",
+            input_dir=Path("input/Aichacher Nachrichten"),
+        )
+        self.assertIn("Run run-1", output.getvalue())
+
     def test_extract_command_passes_threshold_and_log_file(self) -> None:
         with patch.dict("src.todesanzeigen.cli.os.environ", {}, clear=True):
             args = cli.build_parser().parse_args(
                 [
                     "extract",
+                    "--db",
+                    "state/test.sqlite3",
                     "--artifacts-dir",
                     "custom-artifacts",
-                    "--output-file",
-                    "custom-output/result.csv",
                     "--source",
                     "Testquelle",
                     "--limit",
@@ -182,7 +227,7 @@ class CliOcrTests(TestCase):
         with (
             patch("src.todesanzeigen.cli.build_llm_provider", return_value="provider") as build_provider,
             patch(
-                "src.todesanzeigen.cli.extract_artifacts_to_csv_async",
+                "src.todesanzeigen.cli.extract_artifacts_to_db_async",
                 new=AsyncMock(return_value=[]),
             ) as extract,
         ):
@@ -195,8 +240,9 @@ class CliOcrTests(TestCase):
         kwargs = extract.call_args.kwargs
         self.assertEqual(
             extract.call_args.args,
-            (Path("custom-artifacts"), Path("custom-output/result.csv"), "provider"),
+            (Path("custom-artifacts"), Path("state/test.sqlite3"), "provider"),
         )
+        self.assertEqual(kwargs["input_dir"], Path("input"))
         self.assertEqual(kwargs["source"], "Testquelle")
         self.assertEqual(kwargs["limit"], 2)
         self.assertEqual(kwargs["name_confidence_threshold"], 90)
@@ -205,7 +251,7 @@ class CliOcrTests(TestCase):
         self.assertEqual(kwargs["checkpoint_file"], Path("custom-logs/results.jsonl"))
         self.assertEqual(kwargs["resume_from"], Path("custom-logs/results.jsonl"))
         self.assertEqual(kwargs["settings"].concurrency, 1)
-        self.assertIn("0 rows written", output.getvalue())
+        self.assertIn("0 successful outputs recorded", output.getvalue())
         self.assertIn("0 skipped", output.getvalue())
         self.assertIn("Checkpoint written to custom-logs/results.jsonl", output.getvalue())
 
@@ -220,7 +266,7 @@ class CliOcrTests(TestCase):
         with (
             patch("src.todesanzeigen.cli.build_llm_provider", return_value="provider") as build_provider,
             patch(
-                "src.todesanzeigen.cli.extract_artifacts_to_csv_async",
+                "src.todesanzeigen.cli.extract_artifacts_to_db_async",
                 new=AsyncMock(return_value=[]),
             ),
         ):
@@ -249,7 +295,7 @@ class CliOcrTests(TestCase):
         with (
             patch("src.todesanzeigen.cli.build_llm_provider", return_value="provider") as build_provider,
             patch(
-                "src.todesanzeigen.cli.extract_artifacts_to_csv_async",
+                "src.todesanzeigen.cli.extract_artifacts_to_db_async",
                 new=AsyncMock(return_value=[]),
             ) as async_extract,
         ):
@@ -260,7 +306,7 @@ class CliOcrTests(TestCase):
         self.assertEqual(status, 0)
         build_provider.assert_called_once_with("qwen")
         kwargs = async_extract.call_args.kwargs
-        self.assertEqual(async_extract.call_args.args, (Path("artifacts"), Path("output/result.csv"), "provider"))
+        self.assertEqual(async_extract.call_args.args, (Path("artifacts"), Path("state/todesanzeigen.sqlite3"), "provider"))
         self.assertEqual(kwargs["settings"].concurrency, 10)
         self.assertEqual(kwargs["settings"].rpm_limit, 100)
         self.assertEqual(kwargs["settings"].tpm_limit, 200000)
@@ -275,7 +321,7 @@ class CliOcrTests(TestCase):
         with (
             patch("src.todesanzeigen.cli.build_llm_provider", return_value="provider"),
             patch(
-                "src.todesanzeigen.cli.extract_artifacts_to_csv_async",
+                "src.todesanzeigen.cli.extract_artifacts_to_db_async",
                 new=AsyncMock(return_value=[]),
             ) as async_extract,
         ):
@@ -310,7 +356,7 @@ class CliOcrTests(TestCase):
                 return_value="vision-provider",
             ) as build_vision_provider,
             patch(
-                "src.todesanzeigen.cli.extract_artifacts_to_csv_async",
+                "src.todesanzeigen.cli.extract_artifacts_to_db_async",
                 new=AsyncMock(return_value=[]),
             ) as async_extract,
         ):
@@ -339,14 +385,12 @@ class CliOcrTests(TestCase):
         args = cli.build_parser().parse_args(
             [
                 "reroute",
+                "--db",
+                "state/test.sqlite3",
                 "--artifacts-dir",
                 "custom-artifacts",
                 "--input-dir",
                 "custom-input",
-                "--output-file",
-                "custom-output/rerouted.csv",
-                "--merge-output-file",
-                "custom-output/result.csv",
                 "--low-confidence-file",
                 "logs/filter-low-confidence.jsonl",
                 "--only",
@@ -368,7 +412,7 @@ class CliOcrTests(TestCase):
             patch("src.todesanzeigen.cli.load_reroute_candidates", return_value=["a", "b"]) as load_candidates,
             patch("src.todesanzeigen.cli.select_reroute_candidates", return_value=["a"]) as select_candidates,
             patch(
-                "src.todesanzeigen.cli.reroute_candidates_to_csv_async",
+                "src.todesanzeigen.cli.reroute_candidates_to_db_async",
                 new=AsyncMock(return_value=[]),
             ) as reroute_async,
         ):
@@ -391,20 +435,20 @@ class CliOcrTests(TestCase):
             sample_seed=0,
             limit=1,
         )
-        self.assertEqual(reroute_async.call_args.args, (["a"], Path("custom-output/rerouted.csv"), "vision-provider"))
+        self.assertEqual(reroute_async.call_args.args, (["a"], Path("state/test.sqlite3"), "vision-provider"))
         kwargs = reroute_async.call_args.kwargs
         self.assertEqual(kwargs["input_dir"], Path("custom-input"))
-        self.assertEqual(kwargs["merge_output_file"], Path("custom-output/result.csv"))
+        self.assertEqual(kwargs["candidate_kind"], "pipeline")
         self.assertIn("Vision reroute complete", output.getvalue())
 
     def test_vision_extract_command_processes_selected_images(self) -> None:
         args = cli.build_parser().parse_args(
             [
                 "vision-extract",
+                "--db",
+                "state/test.sqlite3",
                 "--input-dir",
                 "custom-input",
-                "--output-file",
-                "custom-output/vision.csv",
                 "--source",
                 "Ground Truth",
                 "--provider",
@@ -440,7 +484,7 @@ class CliOcrTests(TestCase):
                 return_value="vision-provider",
             ) as build_vision_provider,
             patch(
-                "src.todesanzeigen.cli.extract_images_to_csv_async",
+                "src.todesanzeigen.cli.extract_images_to_db_async",
                 new=AsyncMock(return_value=[]),
             ) as vision_extract_async,
         ):
@@ -452,7 +496,7 @@ class CliOcrTests(TestCase):
         build_vision_provider.assert_called_once_with("gemini", "gemini-2.5-pro")
         self.assertEqual(
             vision_extract_async.call_args.args,
-            (Path("custom-input"), Path("custom-output/vision.csv"), "vision-provider"),
+            (Path("custom-input"), Path("state/test.sqlite3"), "vision-provider"),
         )
         kwargs = vision_extract_async.call_args.kwargs
         self.assertEqual(kwargs["source"], "Ground Truth")
@@ -467,4 +511,5 @@ class CliOcrTests(TestCase):
         self.assertEqual(kwargs["settings"].rpm_limit, 100)
         self.assertEqual(kwargs["settings"].tpm_limit, 200000)
         self.assertEqual(kwargs["settings"].max_retries, 2)
+        self.assertEqual(kwargs["candidate_kind"], "teacher")
         self.assertIn("Vision extraction complete", output.getvalue())

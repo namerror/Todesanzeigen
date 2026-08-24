@@ -182,7 +182,7 @@ INDEX_TEMPLATE = """
       <tr>
         <td><a href="/documents/{{ item.document_id }}">{{ item.filename_stem }}</a></td>
         <td>{{ item.source }}</td>
-        <td>{{ item.source_kind }} {{ item.source_name }}</td>
+        <td>{{ item.source_kind }} {{ item.source_name }} {{ item.extraction_provider or "" }} {{ item.extraction_model or "" }}</td>
         <td>{{ item.image_path }}</td>
       </tr>
     {% endfor %}
@@ -249,7 +249,12 @@ DOCUMENT_TEMPLATE = """
     <h2>Candidates</h2>
     {% for candidate in detail.candidates %}
       <div class="candidate">
-        <div>{{ candidate.source_kind }} {{ candidate.source_name }} | {{ candidate.status }}</div>
+        <div>
+          {{ candidate.source_kind }} {{ candidate.source_name }} |
+          {{ candidate.extraction_provider or "" }} {{ candidate.extraction_model or "" }} |
+          {{ candidate.method_family or "" }} {{ candidate.route_reason or "" }} |
+          {{ candidate.status }}
+        </div>
         <form method="post" action="/candidates/{{ candidate.id }}/approve">
           <button type="submit">Approve As Ground Truth</button>
         </form>

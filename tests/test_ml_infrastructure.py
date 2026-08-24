@@ -2,19 +2,33 @@ import csv
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest import TestCase
+from unittest import IsolatedAsyncioTestCase, TestCase
 
 from src.todesanzeigen.evaluation import evaluate_method
+from src.todesanzeigen.extract import (
+    CACHED_EXISTING_STATUS,
+    AsyncExtractionSettings,
+    NameHint,
+    RerouteCandidate,
+    extract_artifacts_to_db_async,
+    extract_images_to_db_async,
+    reroute_candidates_to_db_async,
+)
+from src.todesanzeigen.features import build_feature_snapshots, export_router_dataset
 from src.todesanzeigen.ingest import ingest_results, ingest_source
 from src.todesanzeigen.llm import CSV_COLUMNS
 from src.todesanzeigen.storage import (
     DEFAULT_LABEL_SET,
     apply_migrations,
     connect,
+    create_run,
+    export_priority_csv,
     insert_extraction_output,
     insert_label_candidate,
     load_candidate,
     save_ground_truth_label,
+    upsert_document,
+    upsert_ocr_output,
 )
 
 
@@ -26,7 +40,14 @@ class MlInfrastructureTests(TestCase):
             first = apply_migrations(db_path)
             second = apply_migrations(db_path)
 
-            self.assertEqual(first, ["001_initial"])
+            self.assertEqual(
+                first,
+                [
+                    "001_initial",
+                    "002_method_lineage_features",
+                    "003_result_slot_cache",
+                ],
+            )
             self.assertEqual(second, [])
             with connect(db_path) as connection:
                 tables = {
@@ -38,6 +59,8 @@ class MlInfrastructureTests(TestCase):
             self.assertIn("documents", tables)
             self.assertIn("ground_truth_labels", tables)
             self.assertIn("evaluation_results", tables)
+            self.assertIn("extraction_methods", tables)
+            self.assertIn("feature_snapshots", tables)
 
     def test_ingest_source_records_images_artifacts_and_ocr_outputs(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -127,6 +150,82 @@ class MlInfrastructureTests(TestCase):
             self.assertEqual(output_total["count"], 1)
             self.assertEqual(candidate_total["count"], 1)
 
+    def test_ingest_results_can_repair_legacy_document_image_path(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "state" / "test.sqlite3"
+            input_dir = root / "input" / "Aichacher Nachrichten"
+            input_dir.mkdir(parents=True)
+            image_path = input_dir / "Example 2024_001.jpg"
+            image_path.write_bytes(b"image")
+            output_csv = root / "result.csv"
+            with output_csv.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        **{column: "" for column in CSV_COLUMNS},
+                        "name": "Mustermann",
+                        "quelle": "Aichacher Nachrichten",
+                        "dateiname": "Example 2024_ 001",
+                    }
+                )
+
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                legacy_document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="Example 2024_ 001",
+                )
+
+            summary = ingest_results(
+                db_path=db_path,
+                source="Aichacher Nachrichten",
+                output_csv=output_csv,
+                method="text_extraction",
+                candidate_kind="pipeline",
+                input_dir=input_dir,
+            )
+            second = ingest_results(
+                db_path=db_path,
+                source="Aichacher Nachrichten",
+                output_csv=output_csv,
+                method="text_extraction",
+                candidate_kind="pipeline",
+                input_dir=input_dir,
+            )
+
+            self.assertEqual(summary.extraction_outputs, 1)
+            self.assertEqual(summary.label_candidates, 1)
+            self.assertEqual(second.extraction_outputs, 0)
+            self.assertEqual(second.label_candidates, 0)
+            with connect(db_path) as connection:
+                documents = connection.execute("SELECT * FROM documents").fetchall()
+                document = documents[0]
+                source_image_artifacts = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM artifacts
+                    WHERE artifact_type = 'source_image'
+                    """
+                ).fetchone()
+                outputs = connection.execute(
+                    "SELECT COUNT(*) AS count FROM extraction_outputs"
+                ).fetchone()
+                candidates = connection.execute(
+                    "SELECT COUNT(*) AS count FROM label_candidates"
+                ).fetchone()
+
+        self.assertEqual(len(documents), 1)
+        self.assertEqual(document["id"], legacy_document_id)
+        self.assertEqual(document["filename_stem"], "Example 2024_ 001")
+        self.assertEqual(document["image_path"], str(image_path))
+        self.assertTrue(document["image_sha256"])
+        self.assertEqual(document["mime_type"], "image/jpeg")
+        self.assertEqual(source_image_artifacts["count"], 1)
+        self.assertEqual(outputs["count"], 1)
+        self.assertEqual(candidates["count"], 1)
+
     def test_candidate_approval_writes_ground_truth_label(self) -> None:
         with TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "state" / "test.sqlite3"
@@ -204,3 +303,397 @@ class MlInfrastructureTests(TestCase):
                 eval_result = connection.execute("SELECT * FROM evaluation_results").fetchone()
             self.assertEqual(eval_run["method"], "text_extraction")
             self.assertEqual(eval_result["exact_match"], 0)
+
+    def test_export_priority_csv_prefers_ground_truth_then_vlm_then_text(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "state" / "test.sqlite3"
+            output_csv = root / "output" / "result.csv"
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                gt_document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="gt-doc",
+                )
+                vlm_document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="vlm-doc",
+                )
+                text_document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="text-doc",
+                )
+                upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="missing-doc",
+                )
+                save_ground_truth_label(
+                    connection,
+                    document_id=gt_document_id,
+                    label_set=DEFAULT_LABEL_SET,
+                    fields={"name": "Ground Truth", "dateiname": "gt-doc"},
+                )
+                insert_extraction_output(
+                    connection,
+                    document_id=gt_document_id,
+                    run_id=None,
+                    method="vision_model_image_only",
+                    fields={"name": "Ignored Vision"},
+                    status="vision_processed",
+                )
+                insert_extraction_output(
+                    connection,
+                    document_id=vlm_document_id,
+                    run_id=None,
+                    method="vision_model_image_only",
+                    fields={"name": "Vision"},
+                    status="vision_processed",
+                )
+                insert_extraction_output(
+                    connection,
+                    document_id=text_document_id,
+                    run_id=None,
+                    method="text_extraction",
+                    fields={"name": "Text"},
+                    status="processed",
+                )
+
+                summary = export_priority_csv(connection, output_csv=output_csv)
+
+            with output_csv.open(encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(summary.rows, 3)
+        self.assertEqual(summary.ground_truth_rows, 1)
+        self.assertEqual(summary.method_rows["vision_model_image_only"], 1)
+        self.assertEqual(summary.method_rows["text_extraction"], 1)
+        self.assertEqual(summary.missing_documents, 1)
+        self.assertEqual([row["name"] for row in rows], ["Ground Truth", "Text", "Vision"])
+
+    def test_feature_snapshots_and_router_export(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "state" / "test.sqlite3"
+            output_file = root / "output" / "router.jsonl"
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="Example 2024",
+                    layout_family="clean",
+                )
+                run_id = create_run(connection, command="test", method="source_inventory")
+                upsert_ocr_output(
+                    connection,
+                    document_id=document_id,
+                    run_id=run_id,
+                    text="Max Mustermann",
+                    name_hint="Max Mustermann",
+                    name_confidence=91,
+                    features={"ocr_word_count": 2},
+                )
+                save_ground_truth_label(
+                    connection,
+                    document_id=document_id,
+                    label_set=DEFAULT_LABEL_SET,
+                    fields={"name": "Mustermann", "vorname": "Max"},
+                )
+                insert_extraction_output(
+                    connection,
+                    document_id=document_id,
+                    run_id=None,
+                    method="text_extraction",
+                    fields={"name": "Mustermann", "vorname": "Max"},
+                    status="processed",
+                )
+
+            feature_summary = build_feature_snapshots(db_path=db_path, feature_set="router-v1")
+            router_summary = export_router_dataset(
+                db_path=db_path,
+                output_file=output_file,
+                label_set=DEFAULT_LABEL_SET,
+                method="text_extraction",
+                feature_set="router-v1",
+            )
+            row = json.loads(output_file.read_text(encoding="utf-8").splitlines()[0])
+
+        self.assertEqual(feature_summary.snapshots, 1)
+        self.assertEqual(router_summary.rows, 1)
+        self.assertFalse(row["target"]["cheap_pipeline_failed"])
+        self.assertEqual(row["features"]["name_confidence"], 91)
+
+
+class DbFirstExtractionTests(IsolatedAsyncioTestCase):
+    async def test_extract_artifacts_to_db_records_output_and_candidate(self) -> None:
+        class Provider:
+            provider_name = "fake"
+            model_name = "fake-model"
+
+            async def async_complete(self, prompt: str) -> str:
+                return json.dumps({"name": "Mustermann", "vorname": "Max"})
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "state" / "test.sqlite3"
+            artifacts_dir = root / "artifacts"
+            input_dir = root / "input"
+            artifacts_dir.mkdir()
+            input_dir.mkdir()
+            (artifacts_dir / "example.txt").write_text("Max Mustermann", encoding="utf-8")
+            (artifacts_dir / "name_map.json").write_text(
+                json.dumps({"example.txt": {"name": "Max Mustermann", "confidence": 93}}),
+                encoding="utf-8",
+            )
+            (input_dir / "example.jpg").write_bytes(b"image")
+
+            results = await extract_artifacts_to_db_async(
+                artifacts_dir,
+                db_path,
+                Provider(),
+                input_dir=input_dir,
+                source="Aichacher Nachrichten",
+                settings=AsyncExtractionSettings(max_retries=0),
+            )
+
+            with connect(db_path) as connection:
+                output = connection.execute("SELECT * FROM extraction_outputs").fetchone()
+                candidate = connection.execute("SELECT * FROM label_candidates").fetchone()
+                document = connection.execute("SELECT * FROM documents").fetchone()
+
+        self.assertEqual(results[0].status, "processed")
+        self.assertEqual(output["method"], "text_extraction")
+        self.assertEqual(output["method_family"], "ocr_llm")
+        self.assertEqual(output["result_slot"], "ocr_llm")
+        self.assertTrue(output["input_fingerprint"])
+        self.assertTrue(output["config_hash"])
+        self.assertEqual(output["provider"], "fake")
+        self.assertEqual(json.loads(output["fields_json"])["name"], "Mustermann")
+        self.assertEqual(candidate["source_kind"], "pipeline")
+        self.assertEqual(document["image_path"], str(input_dir / "example.jpg"))
+
+    async def test_text_extraction_uses_db_cache_before_provider_call(self) -> None:
+        class FailingProvider:
+            provider_name = "fake"
+            model_name = "fake-model"
+
+            async def async_complete(self, prompt: str) -> str:
+                raise AssertionError("provider should not be called for cached text output")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "state" / "test.sqlite3"
+            artifacts_dir = root / "artifacts"
+            input_dir = root / "input"
+            artifacts_dir.mkdir()
+            input_dir.mkdir()
+            artifact_path = artifacts_dir / "example.txt"
+            image_path = input_dir / "example.jpg"
+            artifact_path.write_text("Max Mustermann", encoding="utf-8")
+            image_path.write_bytes(b"image")
+            (artifacts_dir / "name_map.json").write_text(
+                json.dumps({"example.txt": {"name": "Max Mustermann", "confidence": 93}}),
+                encoding="utf-8",
+            )
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="example",
+                    image_path=image_path,
+                )
+                insert_extraction_output(
+                    connection,
+                    document_id=document_id,
+                    run_id=None,
+                    method="text_extraction",
+                    fields={"name": "Cached Text"},
+                    status="processed",
+                )
+
+            results = await extract_artifacts_to_db_async(
+                artifacts_dir,
+                db_path,
+                FailingProvider(),
+                input_dir=input_dir,
+                source="Aichacher Nachrichten",
+                settings=AsyncExtractionSettings(max_retries=0),
+            )
+
+            with connect(db_path) as connection:
+                output_count = connection.execute("SELECT COUNT(*) AS count FROM extraction_outputs").fetchone()["count"]
+
+        self.assertEqual(results[0].status, CACHED_EXISTING_STATUS)
+        self.assertEqual(results[0].row["name"], "Cached Text")
+        self.assertEqual(output_count, 1)
+
+    async def test_image_only_vlm_uses_reroute_cache_slot(self) -> None:
+        class FailingVisionProvider:
+            provider_name = "fake-vision"
+            model_name = "fake-vision-model"
+
+            async def async_vision_complete(self, prompt: str, image_path: Path, mime_type: str) -> str:
+                raise AssertionError("provider should not be called for cached VLM output")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "state" / "test.sqlite3"
+            input_dir = root / "input"
+            input_dir.mkdir()
+            image_path = input_dir / "example.jpg"
+            image_path.write_bytes(b"image")
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="example",
+                    image_path=image_path,
+                )
+                insert_extraction_output(
+                    connection,
+                    document_id=document_id,
+                    run_id=None,
+                    method="vision_model_reroute",
+                    fields={"name": "Cached VLM"},
+                    status="rerouted_processed",
+                )
+
+            results = await extract_images_to_db_async(
+                input_dir,
+                db_path,
+                FailingVisionProvider(),
+                source="Aichacher Nachrichten",
+                settings=AsyncExtractionSettings(max_retries=0),
+            )
+
+            with connect(db_path) as connection:
+                output_count = connection.execute("SELECT COUNT(*) AS count FROM extraction_outputs").fetchone()["count"]
+
+        self.assertEqual(results[0].status, CACHED_EXISTING_STATUS)
+        self.assertEqual(results[0].row["name"], "Cached VLM")
+        self.assertEqual(output_count, 1)
+
+    async def test_reroute_uses_image_only_vlm_cache_slot(self) -> None:
+        class FailingVisionProvider:
+            provider_name = "fake-vision"
+            model_name = "fake-vision-model"
+
+            async def async_vision_complete(self, prompt: str, image_path: Path, mime_type: str) -> str:
+                raise AssertionError("provider should not be called for cached VLM output")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "state" / "test.sqlite3"
+            artifacts_dir = root / "artifacts"
+            input_dir = root / "input"
+            artifacts_dir.mkdir()
+            input_dir.mkdir()
+            artifact_path = artifacts_dir / "example.txt"
+            image_path = input_dir / "example.jpg"
+            artifact_path.write_text("Max Mustermann", encoding="utf-8")
+            image_path.write_bytes(b"image")
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="example",
+                    image_path=image_path,
+                )
+                insert_extraction_output(
+                    connection,
+                    document_id=document_id,
+                    run_id=None,
+                    method="vision_model_image_only",
+                    fields={"name": "Cached Direct VLM"},
+                    status="vision_processed",
+                )
+
+            results = await reroute_candidates_to_db_async(
+                [RerouteCandidate(artifact_path, NameHint("Max Mustermann", 60), 85)],
+                db_path,
+                FailingVisionProvider(),
+                input_dir=input_dir,
+                source="Aichacher Nachrichten",
+                settings=AsyncExtractionSettings(max_retries=0),
+            )
+
+            with connect(db_path) as connection:
+                output_count = connection.execute("SELECT COUNT(*) AS count FROM extraction_outputs").fetchone()["count"]
+
+        self.assertEqual(results[0].status, CACHED_EXISTING_STATUS)
+        self.assertEqual(results[0].row["name"], "Cached Direct VLM")
+        self.assertEqual(output_count, 1)
+
+    async def test_force_text_extraction_supersedes_existing_slot(self) -> None:
+        class Provider:
+            provider_name = "fake"
+            model_name = "fake-model"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def async_complete(self, prompt: str) -> str:
+                self.calls += 1
+                return json.dumps({"name": "Fresh Text"})
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "state" / "test.sqlite3"
+            artifacts_dir = root / "artifacts"
+            input_dir = root / "input"
+            artifacts_dir.mkdir()
+            input_dir.mkdir()
+            artifact_path = artifacts_dir / "example.txt"
+            image_path = input_dir / "example.jpg"
+            artifact_path.write_text("Max Mustermann", encoding="utf-8")
+            image_path.write_bytes(b"image")
+            (artifacts_dir / "name_map.json").write_text(
+                json.dumps({"example.txt": {"name": "Max Mustermann", "confidence": 93}}),
+                encoding="utf-8",
+            )
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="example",
+                    image_path=image_path,
+                )
+                insert_extraction_output(
+                    connection,
+                    document_id=document_id,
+                    run_id=None,
+                    method="text_extraction",
+                    fields={"name": "Old Text"},
+                    status="processed",
+                )
+
+            provider = Provider()
+            results = await extract_artifacts_to_db_async(
+                artifacts_dir,
+                db_path,
+                provider,
+                input_dir=input_dir,
+                source="Aichacher Nachrichten",
+                settings=AsyncExtractionSettings(max_retries=0),
+                force=True,
+            )
+
+            with connect(db_path) as connection:
+                rows = connection.execute(
+                    "SELECT * FROM extraction_outputs ORDER BY id"
+                ).fetchall()
+
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(results[0].status, "processed")
+        self.assertEqual(len(rows), 2)
+        self.assertIsNotNone(rows[0]["superseded_at"])
+        self.assertIsNone(rows[1]["superseded_at"])
+        self.assertEqual(json.loads(rows[1]["fields_json"])["name"], "Fresh Text")

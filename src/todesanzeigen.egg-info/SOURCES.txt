@@ -5,8 +5,10 @@ src/todesanzeigen/__init__.py
 src/todesanzeigen/cli.py
 src/todesanzeigen/evaluation.py
 src/todesanzeigen/extract.py
+src/todesanzeigen/features.py
 src/todesanzeigen/ingest.py
 src/todesanzeigen/llm.py
+src/todesanzeigen/methods.py
 src/todesanzeigen/ocr.py
 src/todesanzeigen/ocr_filtering.py
 src/todesanzeigen/review.py

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -150,9 +151,11 @@ def ingest_results(
     provider: str = "",
     model: str = "",
     candidate_kind: str = "teacher",
+    input_dir: Path | None = None,
 ) -> ResultsIngestSummary:
     if output_csv is None and results_file is None:
         raise ValueError("at least one of output_csv or results_file is required")
+    image_index = _source_image_index(input_dir) if input_dir is not None else None
     apply_migrations(db_path)
     with connect(db_path) as connection:
         run_id = create_run(
@@ -166,6 +169,7 @@ def ingest_results(
                 "output_csv": str(output_csv or ""),
                 "results_file": str(results_file or ""),
                 "candidate_kind": candidate_kind,
+                "input_dir": str(input_dir or ""),
             },
         )
         output_count = 0
@@ -180,7 +184,21 @@ def ingest_results(
                 producer="ingest results",
             )
             for row in read_csv_rows(output_csv):
-                document_id = _document_for_row(connection, row, source)
+                document_id, image_path = _document_for_row(
+                    connection,
+                    row,
+                    source,
+                    image_index,
+                )
+                if image_path is not None:
+                    record_artifact(
+                        connection,
+                        document_id=document_id,
+                        run_id=run_id,
+                        artifact_type="source_image",
+                        path=image_path,
+                        producer="ingest results",
+                    )
                 output_id, created = _get_or_create_extraction_output(
                     connection,
                     document_id=document_id,
@@ -216,7 +234,21 @@ def ingest_results(
                 row = record.get("row")
                 if record.get("status") not in PROCESSED_STATUSES or not isinstance(row, dict):
                     continue
-                document_id = _document_for_row(connection, row, source)
+                document_id, image_path = _document_for_row(
+                    connection,
+                    row,
+                    source,
+                    image_index,
+                )
+                if image_path is not None:
+                    record_artifact(
+                        connection,
+                        document_id=document_id,
+                        run_id=run_id,
+                        artifact_type="source_image",
+                        path=image_path,
+                        producer="ingest results",
+                    )
                 record_method = str(record.get("method") or method)
                 output_id, created = _get_or_create_extraction_output(
                     connection,
@@ -246,16 +278,59 @@ def ingest_results(
     return ResultsIngestSummary(output_count, candidate_count, run_id)
 
 
-def _document_for_row(connection: Any, row: dict[str, Any], source: str) -> int:
+def _document_for_row(
+    connection: Any,
+    row: dict[str, Any],
+    source: str,
+    image_index: dict[str, list[Path]] | None = None,
+) -> tuple[int, Path | None]:
     source_name = source or str(row.get("quelle", "") or "unknown")
     filename_stem = str(row.get("dateiname", "") or "").strip()
     if not filename_stem:
         raise ValueError("result row is missing dateiname")
-    return upsert_document(
+    image_path = _resolve_source_image(filename_stem, image_index)
+    image_digest = (
+        sha256_file(image_path)
+        if image_path is not None and image_path.exists() and image_path.is_file()
+        else ""
+    )
+    document_id = upsert_document(
         connection,
         source_name=source_name,
         filename_stem=filename_stem,
+        image_path=image_path or "",
+        image_sha256=image_digest,
+        mime_type=image_mime_type(image_path) if image_path is not None else "",
     )
+    return document_id, image_path
+
+
+def _source_image_index(input_dir: Path) -> dict[str, list[Path]]:
+    index: dict[str, list[Path]] = {}
+    for image_path in _discover_images_recursive(input_dir):
+        index.setdefault(_normalized_filename_stem(image_path.stem), []).append(image_path)
+    return index
+
+
+def _resolve_source_image(
+    filename_stem: str,
+    image_index: dict[str, list[Path]] | None,
+) -> Path | None:
+    if image_index is None:
+        return None
+    matches = image_index.get(_normalized_filename_stem(filename_stem), [])
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise ValueError(f"No source image found for result row dateiname: {filename_stem}")
+    paths = ", ".join(str(path) for path in matches)
+    raise ValueError(f"Ambiguous source images for result row dateiname {filename_stem}: {paths}")
+
+
+def _normalized_filename_stem(value: str) -> str:
+    normalized = re.sub(r"\s+", " ", value.strip())
+    normalized = re.sub(r"\s*_\s*", "_", normalized)
+    return normalized.casefold()
 
 
 def _get_or_create_extraction_output(

@@ -11,13 +11,14 @@ from pathlib import Path
 from .extract import (
     DEFAULT_NAME_CONFIDENCE_THRESHOLD,
     AsyncExtractionSettings,
+    CACHED_EXISTING_STATUS,
     VISION_FAILED_STATUS,
     VISION_PROCESSED_STATUS,
     VisionRerouteSettings,
-    extract_artifacts_to_csv_async,
-    extract_images_to_csv_async,
+    extract_artifacts_to_db_async,
+    extract_images_to_db_async,
     load_reroute_candidates,
-    reroute_candidates_to_csv_async,
+    reroute_candidates_to_db_async,
     select_reroute_candidates,
 )
 from .llm import LLM_PROVIDERS, VISION_LLM_PROVIDERS, build_llm_provider, build_vision_llm_provider
@@ -31,6 +32,9 @@ from .ocr import (
 )
 from .ocr_filtering import filter_artifact_names, name_map_artifact_path
 from .storage import DEFAULT_DB_PATH, DEFAULT_LABEL_SET
+
+
+CANDIDATE_KINDS = ("teacher", "pipeline", "manual_seed")
 
 
 def _load_dotenv() -> None:
@@ -67,10 +71,10 @@ def build_parser() -> argparse.ArgumentParser:
     ocr.add_argument("--overwrite", action="store_true")
     ocr.add_argument("--limit", type=int)
 
-    extract = subparsers.add_parser("extract", help="Parse OCR artifacts and write output/result.csv.")
+    extract = subparsers.add_parser("extract", help="Parse OCR artifacts and record DB outputs.")
+    extract.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     extract.add_argument("--input-dir", type=Path, default=Path("input"))
     extract.add_argument("--artifacts-dir", type=Path, default=Path("artifacts"))
-    extract.add_argument("--output-file", type=Path, default=Path("output/result.csv"))
     extract.add_argument(
         "--provider",
         choices=LLM_PROVIDERS,
@@ -105,6 +109,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=_env_int("TODESANZEIGEN_LLM_MAX_RETRIES", 5),
     )
     extract.add_argument("--resume-from", type=Path)
+    extract.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run even when a successful DB result already exists for the method slot.",
+    )
     extract.add_argument("--reroute", action="store_true")
     extract.add_argument(
         "--reroute-provider",
@@ -117,6 +126,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--reroute-concurrency",
         type=int,
         default=_env_int("TODESANZEIGEN_REROUTE_CONCURRENCY", 1),
+    )
+    extract.add_argument(
+        "--candidate-kind",
+        choices=CANDIDATE_KINDS,
+        default="pipeline",
     )
 
     filter_parser = subparsers.add_parser(
@@ -136,10 +150,9 @@ def build_parser() -> argparse.ArgumentParser:
         "reroute",
         help="Run direct vision extraction for low-confidence or selected artifacts.",
     )
+    reroute.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     reroute.add_argument("--input-dir", type=Path, default=Path("input"))
     reroute.add_argument("--artifacts-dir", type=Path, default=Path("artifacts"))
-    reroute.add_argument("--output-file", type=Path, default=Path("output/rerouted.csv"))
-    reroute.add_argument("--merge-output-file", type=Path)
     reroute.add_argument("--source", default=os.getenv("TODESANZEIGEN_SOURCE", ""))
     reroute.add_argument(
         "--provider",
@@ -161,6 +174,11 @@ def build_parser() -> argparse.ArgumentParser:
     reroute.add_argument("--log-dir", type=Path, default=Path("logs"))
     reroute.add_argument("--results-file", type=Path, default=Path("logs/reroute-results.jsonl"))
     reroute.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run even when a successful DB VLM result already exists.",
+    )
+    reroute.add_argument(
         "--concurrency",
         type=int,
         default=_env_int("TODESANZEIGEN_REROUTE_CONCURRENCY", 1),
@@ -172,13 +190,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=_env_int("TODESANZEIGEN_LLM_MAX_RETRIES", 5),
     )
+    reroute.add_argument(
+        "--candidate-kind",
+        choices=CANDIDATE_KINDS,
+        default="pipeline",
+    )
 
     vision_extract = subparsers.add_parser(
         "vision-extract",
         help="Run image-only vision extraction for source images.",
     )
+    vision_extract.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     vision_extract.add_argument("--input-dir", type=Path, default=Path("input"))
-    vision_extract.add_argument("--output-file", type=Path, default=Path("output/vision-result.csv"))
     vision_extract.add_argument("--source", default=os.getenv("TODESANZEIGEN_SOURCE", ""))
     vision_extract.add_argument(
         "--provider",
@@ -202,6 +225,11 @@ def build_parser() -> argparse.ArgumentParser:
     vision_extract.add_argument("--log-dir", type=Path, default=Path("logs"))
     vision_extract.add_argument("--results-file", type=Path)
     vision_extract.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run even when a successful DB VLM result already exists.",
+    )
+    vision_extract.add_argument(
         "--concurrency",
         type=int,
         default=_env_int(
@@ -215,6 +243,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-retries",
         type=int,
         default=_env_int("TODESANZEIGEN_LLM_MAX_RETRIES", 5),
+    )
+    vision_extract.add_argument(
+        "--candidate-kind",
+        choices=CANDIDATE_KINDS,
+        default="teacher",
     )
 
     db = subparsers.add_parser("db", help="Manage the local SQLite project database.")
@@ -236,6 +269,7 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_results.add_argument("--source", default="")
     ingest_results.add_argument("--output-csv", type=Path)
     ingest_results.add_argument("--results-file", type=Path)
+    ingest_results.add_argument("--input-dir", type=Path)
     ingest_results.add_argument("--method", default="csv_import")
     ingest_results.add_argument("--provider", default="")
     ingest_results.add_argument("--model", default="")
@@ -261,6 +295,28 @@ def build_parser() -> argparse.ArgumentParser:
     dataset_export.add_argument("--label-set", default=DEFAULT_LABEL_SET)
     dataset_export.add_argument("--output-file", type=Path, required=True)
     dataset_export.add_argument("--format", choices=["jsonl"], default="jsonl")
+    dataset_export_router = dataset_subparsers.add_parser(
+        "export-router",
+        help="Export feature/label rows for failure prediction.",
+    )
+    dataset_export_router.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    dataset_export_router.add_argument("--label-set", default=DEFAULT_LABEL_SET)
+    dataset_export_router.add_argument("--method", required=True)
+    dataset_export_router.add_argument("--feature-set", default="router-v1")
+    dataset_export_router.add_argument("--output-file", type=Path, required=True)
+
+    features = subparsers.add_parser("features", help="Build and manage ML feature snapshots.")
+    features_subparsers = features.add_subparsers(dest="features_command", required=True)
+    features_build = features_subparsers.add_parser("build", help="Build router feature snapshots.")
+    features_build.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    features_build.add_argument("--feature-set", default="router-v1")
+
+    export = subparsers.add_parser("export", help="Export operational outputs from SQLite.")
+    export_subparsers = export.add_subparsers(dest="export_command", required=True)
+    export_csv = export_subparsers.add_parser("csv", help="Export final prioritized CSV rows.")
+    export_csv.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    export_csv.add_argument("--label-set", default=DEFAULT_LABEL_SET)
+    export_csv.add_argument("--output-file", type=Path, default=Path("output/result.csv"))
 
     eval_parser = subparsers.add_parser("eval", help="Evaluate extraction outputs against ground truth labels.")
     eval_subparsers = eval_parser.add_subparsers(dest="eval_command", required=True)
@@ -365,10 +421,11 @@ def run_extract_command(args: argparse.Namespace) -> int:
         rpm_limit = 600 if rpm_limit is None else rpm_limit
         tpm_limit = 500000 if tpm_limit is None else tpm_limit
     results = asyncio.run(
-        extract_artifacts_to_csv_async(
+        extract_artifacts_to_db_async(
             args.artifacts_dir,
-            args.output_file,
+            args.db,
             provider,
+            input_dir=args.input_dir,
             source=args.source,
             limit=args.limit,
             name_confidence_threshold=args.name_confidence_threshold,
@@ -382,17 +439,20 @@ def run_extract_command(args: argparse.Namespace) -> int:
                 max_retries=args.max_retries,
             ),
             reroute_settings=reroute_settings,
+            candidate_kind=args.candidate_kind,
+            force=args.force,
         )
     )
     processed = sum(1 for result in results if result.status == "processed")
     rerouted = sum(1 for result in results if result.status == "rerouted_processed")
+    cached = sum(1 for result in results if result.status == CACHED_EXISTING_STATUS)
     skipped = sum(1 for result in results if result.status == "skipped_low_confidence")
     failed = sum(1 for result in results if result.status in {"failed", "rerouted_failed"})
-    rows_written = processed + rerouted
+    rows_recorded = processed + rerouted
     reroute_note = f" Reroute checkpoint written to {reroute_results_file}." if args.reroute else ""
     print(
-        f"Extraction complete: {rows_written} rows written to {args.output_file}; "
-        f"{skipped} skipped; {rerouted} rerouted; {failed} failed. "
+        f"Extraction complete: {rows_recorded} successful outputs recorded in {args.db}; "
+        f"{cached} cached; {skipped} skipped; {rerouted} rerouted; {failed} failed. "
         f"Log written to {log_file}. Checkpoint written to {checkpoint_file}."
         f"{reroute_note}"
     )
@@ -433,15 +493,14 @@ def run_reroute_command(args: argparse.Namespace) -> int:
     )
     log_file = args.log_dir / f"reroute-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"
     results = asyncio.run(
-        reroute_candidates_to_csv_async(
+        reroute_candidates_to_db_async(
             selected_candidates,
-            args.output_file,
+            args.db,
             provider,
             input_dir=args.input_dir,
             source=args.source,
             log_file=log_file,
             results_file=args.results_file,
-            merge_output_file=args.merge_output_file,
             settings=AsyncExtractionSettings(
                 concurrency=args.concurrency,
                 rpm_limit=args.rpm_limit,
@@ -449,15 +508,17 @@ def run_reroute_command(args: argparse.Namespace) -> int:
                 max_retries=args.max_retries,
             ),
             concurrency=args.concurrency,
+            candidate_kind=args.candidate_kind,
+            force=args.force,
         )
     )
     rerouted = sum(1 for result in results if result.status == "rerouted_processed")
+    cached = sum(1 for result in results if result.status == CACHED_EXISTING_STATUS)
     failed = sum(1 for result in results if result.status == "rerouted_failed")
-    merge_note = f" Merged into {args.merge_output_file}." if args.merge_output_file else ""
     print(
-        f"Vision reroute complete: {rerouted} rows written to {args.output_file}; "
-        f"{failed} failed. Log written to {log_file}. "
-        f"Results written to {args.results_file}.{merge_note}"
+        f"Vision reroute complete: {rerouted} successful outputs recorded in {args.db}; "
+        f"{cached} cached; {failed} failed. Log written to {log_file}. "
+        f"Results written to {args.results_file}."
     )
     return 0
 
@@ -482,9 +543,9 @@ def run_vision_extract_command(args: argparse.Namespace) -> int:
         tpm_limit = 500000 if tpm_limit is None else tpm_limit
 
     results = asyncio.run(
-        extract_images_to_csv_async(
+        extract_images_to_db_async(
             args.input_dir,
-            args.output_file,
+            args.db,
             provider,
             source=args.source,
             limit=args.limit,
@@ -499,13 +560,17 @@ def run_vision_extract_command(args: argparse.Namespace) -> int:
                 tpm_limit=tpm_limit,
                 max_retries=args.max_retries,
             ),
+            candidate_kind=args.candidate_kind,
+            force=args.force,
         )
     )
     processed = sum(1 for result in results if result.status == VISION_PROCESSED_STATUS)
+    cached = sum(1 for result in results if result.status == CACHED_EXISTING_STATUS)
     failed = sum(1 for result in results if result.status == VISION_FAILED_STATUS)
     print(
-        f"Vision extraction complete: {processed} rows written to {args.output_file}; "
-        f"{failed} failed. Log written to {log_file}. Results written to {results_file}."
+        f"Vision extraction complete: {processed} successful outputs recorded in {args.db}; "
+        f"{cached} cached; {failed} failed. Log written to {log_file}. "
+        f"Results written to {results_file}."
     )
     return 0
 
@@ -582,6 +647,7 @@ def run_ingest_command(args: argparse.Namespace) -> int:
             provider=args.provider,
             model=args.model,
             candidate_kind=args.candidate_kind,
+            input_dir=args.input_dir,
         )
         print(
             f"Ingested {summary.extraction_outputs} extraction outputs and "
@@ -618,7 +684,62 @@ def run_dataset_command(args: argparse.Namespace) -> int:
         )
         print(f"Exported {len(rows)} dataset rows to {args.output_file}.")
         return 0
+    if args.dataset_command == "export-router":
+        from .features import export_router_dataset
+
+        summary = export_router_dataset(
+            db_path=args.db,
+            output_file=args.output_file,
+            label_set=args.label_set,
+            method=args.method,
+            feature_set=args.feature_set,
+        )
+        print(
+            f"Exported {summary.rows} router rows to {summary.output_file}; "
+            f"missing_features={summary.missing_features}; "
+            f"missing_predictions={summary.missing_predictions}."
+        )
+        return 0
     raise ValueError(f"Unsupported dataset command: {args.dataset_command}")
+
+
+def run_features_command(args: argparse.Namespace) -> int:
+    if args.features_command == "build":
+        from .features import build_feature_snapshots
+
+        summary = build_feature_snapshots(
+            db_path=args.db,
+            feature_set=args.feature_set,
+        )
+        print(
+            f"Feature set {summary.feature_set} built: "
+            f"{summary.snapshots} snapshots for {summary.documents} documents."
+        )
+        return 0
+    raise ValueError(f"Unsupported features command: {args.features_command}")
+
+
+def run_export_command(args: argparse.Namespace) -> int:
+    if args.export_command == "csv":
+        from .storage import apply_migrations, connect, export_priority_csv
+
+        apply_migrations(args.db)
+        with connect(args.db) as connection:
+            summary = export_priority_csv(
+                connection,
+                output_csv=args.output_file,
+                label_set=args.label_set,
+            )
+        method_parts = ", ".join(
+            f"{method}={count}" for method, count in summary.method_rows.items()
+        )
+        print(
+            f"Exported {summary.rows} rows to {args.output_file}; "
+            f"ground_truth={summary.ground_truth_rows}; {method_parts}; "
+            f"missing_documents={summary.missing_documents}."
+        )
+        return 0
+    raise ValueError(f"Unsupported export command: {args.export_command}")
 
 
 def run_eval_command(args: argparse.Namespace) -> int:
@@ -722,6 +843,10 @@ def main(argv: list[str] | None = None) -> int:
             return run_ingest_command(args)
         if args.command == "dataset":
             return run_dataset_command(args)
+        if args.command == "features":
+            return run_features_command(args)
+        if args.command == "export":
+            return run_export_command(args)
         if args.command == "eval":
             return run_eval_command(args)
         if args.command == "review":
