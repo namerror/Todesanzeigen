@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .llm import CSV_COLUMNS, LlmProvider, VisionLlmProvider
+from .llm import CSV_COLUMNS, STORED_COLUMNS, LlmProvider, VisionLlmProvider
 from .methods import (
     TEXT_EXTRACTION_METHOD,
     VISION_IMAGE_ONLY_METHOD,
@@ -22,6 +22,7 @@ from .methods import (
 )
 from .ocr import discover_images, image_mime_type
 from .ocr_filtering import is_below_confidence_threshold, name_map_artifact_path
+from .normalization import fields_for_csv, normalize_stored_fields
 
 
 @dataclass(frozen=True)
@@ -74,7 +75,7 @@ class DbExtractionRecord:
     estimated_tokens: int | None = None
     latency_ms: int | None = None
     image_path: Path | None = None
-    prompt_version: str = "death_notice_v1"
+    prompt_version: str = "death_notice_v2"
     provider_name: str = ""
     model_name: str = ""
 
@@ -86,7 +87,7 @@ CACHED_EXISTING_STATUS = "cached_existing"
 PROCESSED_STATUSES = {"processed", "rerouted_processed", VISION_PROCESSED_STATUS}
 CHECKPOINT_REUSE_STATUSES = {"processed", "rerouted_processed", "skipped_low_confidence"}
 LLM_EXCLUDED_COLUMNS = {"foto", "bemerkungen", "quelle", "dateiname"}
-LLM_PROMPT_COLUMNS = [column for column in CSV_COLUMNS if column not in LLM_EXCLUDED_COLUMNS]
+LLM_PROMPT_COLUMNS = [column for column in STORED_COLUMNS if column not in LLM_EXCLUDED_COLUMNS]
 
 
 def discover_artifacts(artifacts_dir: Path) -> list[Path]:
@@ -115,6 +116,11 @@ Gib ausschliesslich ein einzelnes valides JSON-Objekt zurueck. Verwende exakt di
 Regeln:
 - confidence_score ist eine Zahl von 0 bis 1 als String, z.B. "0.82".
 - Fehlende oder unsichere Felder bleiben "".
+- geburtsdatum und sterbedatum muessen exakt DD.MM.YYYY verwenden, z.B. "04.09.1937".
+- Ort und Wohnort sind dasselbe Konzept. Gib nur ort zurueck.
+- Bei mehreren sonstigen Orten kommt der zuerst genannte in ort; weitere kommen in weitere_orte.
+- Orte, die als geburtsort oder sterbeort zugeordnet sind, kommen nicht zusaetzlich in ort oder weitere_orte.
+- Stehen Geburts- und Sterbedatum nebeneinander und direkt darunter zwei Orte, ordne den linken Ort dem Geburtsdatum und den rechten Ort dem Sterbedatum zu.
 - Unsicherheiten, OCR-Probleme und Interpretationshinweise kommen in zusaetzliche_hinweise.
 - Erfinde keine Daten.
 - Nutze das lokale OCR-Name-Signal als Zusatzhinweis fuer den Namen der verstorbenen Person.
@@ -148,6 +154,11 @@ Regeln:
 - Lies den Text direkt aus dem Bild. Das Bild ist die massgebliche Quelle.
 - confidence_score ist eine Zahl von 0 bis 1 als String, z.B. "0.82".
 - Fehlende oder unsichere Felder bleiben "".
+- geburtsdatum und sterbedatum muessen exakt DD.MM.YYYY verwenden, z.B. "04.09.1937".
+- Ort und Wohnort sind dasselbe Konzept. Gib nur ort zurueck.
+- Bei mehreren sonstigen Orten kommt der zuerst genannte in ort; weitere kommen in weitere_orte.
+- Orte, die als geburtsort oder sterbeort zugeordnet sind, kommen nicht zusaetzlich in ort oder weitere_orte.
+- Stehen Geburts- und Sterbedatum nebeneinander und direkt darunter zwei Orte, ordne den linken Ort dem Geburtsdatum und den rechten Ort dem Sterbedatum zu.
 - Unsicherheiten, schwer lesbare Stellen und Interpretationshinweise kommen in zusaetzliche_hinweise.
 - Erfinde keine Daten.
 - Nutze den OCR-Text und das lokale OCR-Name-Signal nur als Zusatzhinweise.
@@ -177,6 +188,11 @@ Regeln:
 - Das Bild ist die einzige Quelle.
 - confidence_score ist eine Zahl von 0 bis 1 als String, z.B. "0.82".
 - Fehlende oder unsichere Felder bleiben "".
+- geburtsdatum und sterbedatum muessen exakt DD.MM.YYYY verwenden, z.B. "04.09.1937".
+- Ort und Wohnort sind dasselbe Konzept. Gib nur ort zurueck.
+- Bei mehreren sonstigen Orten kommt der zuerst genannte in ort; weitere kommen in weitere_orte.
+- Orte, die als geburtsort oder sterbeort zugeordnet sind, kommen nicht zusaetzlich in ort oder weitere_orte.
+- Orte direkt unter Geburts- und Sterbedatum werden anhand ihrer visuellen Position zugeordnet.
 - Unsicherheiten, schwer lesbare Stellen und Interpretationshinweise kommen in zusaetzliche_hinweise.
 - Erfinde keine Daten.
 """
@@ -286,24 +302,14 @@ def parse_json_object(response_text: str) -> dict[str, Any]:
 
 
 def normalize_record(data: dict[str, Any], *, filename: str, source: str = "") -> dict[str, str]:
-    row: dict[str, str] = {}
-    for column in CSV_COLUMNS:
-        value = data.get(column, "")
-        if value is None:
-            value = ""
-        elif isinstance(value, list):
-            value = "; ".join(str(item) for item in value if item is not None)
-        elif isinstance(value, dict):
-            value = json.dumps(value, ensure_ascii=False, sort_keys=True)
-        else:
-            value = str(value)
-        row[column] = value
-
-    row["foto"] = ""
-    row["bemerkungen"] = ""
-    row["quelle"] = source
-    row["dateiname"] = filename
-    return row
+    record = {
+        **data,
+        "foto": "",
+        "bemerkungen": "",
+        "quelle": source,
+        "dateiname": filename,
+    }
+    return normalize_stored_fields(record)
 
 
 def extract_artifact(
@@ -418,7 +424,7 @@ def extract_artifacts_to_csv(
                 source=source,
                 name_hint=name_hint,
             )
-            writer.writerow(row)
+            writer.writerow(fields_for_csv(row))
             results.append(ExtractionResult(artifact_path, "processed", row))
 
     return results
@@ -661,7 +667,7 @@ async def extract_artifacts_to_csv_async(
         writer.writeheader()
         for result in ordered_results:
             if result.status in PROCESSED_STATUSES and result.row is not None:
-                writer.writerow(result.row)
+                writer.writerow(fields_for_csv(result.row))
 
     return ordered_results
 
@@ -1598,14 +1604,14 @@ def merge_rows_into_csv(output_csv: Path, rows: list[dict[str, str] | None]) -> 
             for row in csv.DictReader(csv_file):
                 filename = row.get("dateiname", "")
                 if filename:
-                    merged_by_filename[filename] = {column: row.get(column, "") for column in CSV_COLUMNS}
+                    merged_by_filename[filename] = normalize_stored_fields(row)
     for row in clean_rows:
         merged_by_filename[row.get("dateiname", "")] = row
     with output_csv.open("w", encoding="utf-8", newline="") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=CSV_COLUMNS)
         writer.writeheader()
         for row in merged_by_filename.values():
-            writer.writerow(row)
+            writer.writerow(fields_for_csv(row))
 
 
 def _write_results_csv(output_csv: Path, results: list[ExtractionResult]) -> None:
@@ -1615,7 +1621,7 @@ def _write_results_csv(output_csv: Path, results: list[ExtractionResult]) -> Non
         writer.writeheader()
         for result in results:
             if result.status in PROCESSED_STATUSES and result.row is not None:
-                writer.writerow(result.row)
+                writer.writerow(fields_for_csv(result.row))
 
 
 def _validate_async_settings(

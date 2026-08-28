@@ -8,7 +8,7 @@ try:
 except ImportError:
     FastApiRequest = Any
 
-from .llm import CSV_COLUMNS
+from .llm import STORED_COLUMNS
 from .storage import (
     DEFAULT_DB_PATH,
     DEFAULT_LABEL_SET,
@@ -87,7 +87,7 @@ def create_review_app(
             Template(DOCUMENT_TEMPLATE).render(
                 detail=detail,
                 fields=fields,
-                columns=CSV_COLUMNS,
+                columns=STORED_COLUMNS,
                 label_set=label_set,
                 source_candidate_id=_source_candidate_id(detail),
             )
@@ -165,10 +165,10 @@ def serve_review_app(
 
 def _initial_fields(detail: dict[str, Any]) -> dict[str, str]:
     if detail["ground_truth"] is not None:
-        return {column: str(detail["ground_truth"]["fields"].get(column, "")) for column in CSV_COLUMNS}
+        return {column: str(detail["ground_truth"]["fields"].get(column, "")) for column in STORED_COLUMNS}
     if detail["candidates"]:
-        return {column: str(detail["candidates"][0]["fields"].get(column, "")) for column in CSV_COLUMNS}
-    return {column: "" for column in CSV_COLUMNS}
+        return {column: str(detail["candidates"][0]["fields"].get(column, "")) for column in STORED_COLUMNS}
+    return {column: "" for column in STORED_COLUMNS}
 
 
 def _source_candidate_id(detail: dict[str, Any]) -> str:

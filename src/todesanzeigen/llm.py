@@ -32,6 +32,8 @@ CSV_COLUMNS = [
     "confidence_score",
 ]
 
+STORED_COLUMNS = [column for column in CSV_COLUMNS if column != "wohnort"]
+
 
 class LlmProvider(Protocol):
     def complete(self, prompt: str) -> str:

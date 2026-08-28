@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .extract import PROCESSED_STATUSES
-from .llm import CSV_COLUMNS
+from .normalization import normalize_stored_fields
 from .ocr import image_mime_type
 from .storage import (
     DEFAULT_DB_PATH,
@@ -417,7 +417,7 @@ def _get_or_create_label_candidate(
 
 
 def _fields_json(fields: dict[str, Any]) -> str:
-    normalized = {column: "" if fields.get(column) is None else str(fields.get(column, "")) for column in CSV_COLUMNS}
+    normalized = normalize_stored_fields(fields)
     return json.dumps(normalized, ensure_ascii=False, sort_keys=True)
 
 

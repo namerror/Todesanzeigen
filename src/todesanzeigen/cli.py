@@ -255,6 +255,17 @@ def build_parser() -> argparse.ArgumentParser:
     db_subparsers = db.add_subparsers(dest="db_command", required=True)
     db_init = db_subparsers.add_parser("init", help="Create or migrate the SQLite database.")
     db_init.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    db_normalize = db_subparsers.add_parser(
+        "normalize-fields",
+        help="Normalize stored locations and dates, with dry-run as the default.",
+    )
+    db_normalize.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    db_normalize.add_argument(
+        "--apply",
+        action="store_true",
+        help="Back up the database and apply the reported field changes.",
+    )
+    db_normalize.add_argument("--backup-file", type=Path)
 
     ingest = subparsers.add_parser("ingest", help="Import local data and generated outputs into SQLite.")
     ingest_subparsers = ingest.add_subparsers(dest="ingest_command", required=True)
@@ -643,6 +654,28 @@ def run_db_command(args: argparse.Namespace) -> int:
         applied = apply_migrations(args.db)
         applied_note = ", ".join(applied) if applied else "no new migrations"
         print(f"Database ready at {args.db} ({applied_note}).")
+        return 0
+    if args.db_command == "normalize-fields":
+        from .maintenance import normalize_database_fields
+
+        summary = normalize_database_fields(
+            args.db,
+            apply=args.apply,
+            backup_file=args.backup_file,
+        )
+        mode = "Applied" if summary.applied else "Dry run"
+        table_parts = ", ".join(
+            f"{table}={count}" for table, count in summary.table_changes.items()
+        )
+        print(
+            f"{mode}: scanned={summary.scanned_rows}; changed={summary.changed_rows} "
+            f"({table_parts}); locations_from_wohnort={summary.locations_from_wohnort}; "
+            f"location_conflicts={summary.location_conflicts}; "
+            f"dates_normalized={summary.dates_normalized}; "
+            f"dates_unresolved={summary.dates_unresolved}."
+        )
+        if summary.backup_path is not None:
+            print(f"Backup written to {summary.backup_path}.")
         return 0
     raise ValueError(f"Unsupported db command: {args.db_command}")
 

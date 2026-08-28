@@ -10,7 +10,7 @@ from .feature_extraction import (
     extract_ocr_text_features,
     extract_tsv_features,
 )
-from .llm import CSV_COLUMNS
+from .llm import STORED_COLUMNS
 from .storage import (
     DEFAULT_DB_PATH,
     DEFAULT_LABEL_SET,
@@ -188,7 +188,10 @@ def _artifact_text(connection: Any, artifact_id: Any) -> str:
 
 
 def _exact_match(truth: dict[str, Any], prediction: dict[str, Any]) -> bool:
-    return all(_clean(truth.get(column, "")) == _clean(prediction.get(column, "")) for column in CSV_COLUMNS)
+    return all(
+        _clean(truth.get(column, "")) == _clean(prediction.get(column, ""))
+        for column in STORED_COLUMNS
+    )
 
 
 def _clean(value: Any) -> str:

@@ -406,7 +406,16 @@ todesanzeigen export csv \
 
 CSV priority is: reviewed GT, image-only VLM, low-confidence VLM reroute,
 OCR+LLM text extraction, then no row. Superseded extraction rows are ignored by
-this export.
+this export. Internally, `ort` is the single stored location field. CSV export
+copies it to both `ort` and the legacy `wohnort` column.
+
+Normalize legacy location and date fields with a dry run first, then apply the
+transactional update with an automatic timestamped backup:
+
+```sh
+todesanzeigen db normalize-fields --db state/todesanzeigen.sqlite3
+todesanzeigen db normalize-fields --db state/todesanzeigen.sqlite3 --apply
+```
 
 ### Label Review
 
@@ -530,7 +539,7 @@ Only these structured target fields are evaluated:
 
 ```text
 geschlecht, name, vorname, geburtsdatum, sterbedatum, geburtsname, titel,
-genannt, geburtsort, sterbeort, wohnort, ort, weitere_orte, beruf
+genannt, geburtsort, sterbeort, ort, weitere_orte, beruf
 ```
 
 Blank GT fields are treated as unavailable labels, not required empty outputs.

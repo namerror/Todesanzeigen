@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 
 from src.todesanzeigen.router.dataset import RouterRecord, load_router_dataset
-from src.todesanzeigen.router.labels import score_target_fields
+from src.todesanzeigen.router.labels import ROUTER_TARGET_FIELDS, score_target_fields
 from src.todesanzeigen.router.manifest import write_router_manifest
 from src.todesanzeigen.router.model import model_record_features, train_router_from_db
 from src.todesanzeigen.storage import (
@@ -20,6 +20,9 @@ from src.todesanzeigen.storage import (
 
 
 class RouterLabelTests(TestCase):
+    def test_wohnort_is_not_a_separate_router_target(self) -> None:
+        self.assertNotIn("wohnort", ROUTER_TARGET_FIELDS)
+
     def test_target_scoring_ignores_blank_truth_and_non_target_fields(self) -> None:
         metrics = score_target_fields(
             {

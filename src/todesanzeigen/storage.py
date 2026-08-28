@@ -18,6 +18,8 @@ from .methods import (
     method_family,
     result_slot,
 )
+from .normalization import fields_for_csv as project_fields_for_csv
+from .normalization import normalize_stored_fields
 from .ocr import image_mime_type
 
 
@@ -367,7 +369,7 @@ def insert_extraction_output(
     status: str,
     provider: str = "",
     model: str = "",
-    prompt_version: str = "death_notice_v1",
+    prompt_version: str = "death_notice_v2",
     raw_response: str = "",
     error: str = "",
     attempts: int = 0,
@@ -1001,7 +1003,7 @@ def export_priority_csv(
 
 def read_csv_rows(path: Path) -> list[dict[str, str]]:
     with path.open(encoding="utf-8", newline="") as handle:
-        return [{column: row.get(column, "") for column in CSV_COLUMNS} for row in csv.DictReader(handle)]
+        return [normalize_stored_fields(row) for row in csv.DictReader(handle)]
 
 
 def infer_year(value: str) -> int | None:
@@ -1019,7 +1021,7 @@ def sha256_file(path: Path) -> str:
 
 def fields_from_form(items: Iterable[tuple[str, Any]]) -> dict[str, str]:
     values = {key: str(value) for key, value in items}
-    return {column: values.get(column, "") for column in CSV_COLUMNS}
+    return normalize_stored_fields(values)
 
 
 def _selected_export_fields(
@@ -1057,20 +1059,15 @@ def _fields_for_csv(
     source: str,
     filename_stem: str,
 ) -> dict[str, str]:
-    row = _normalize_fields(fields)
-    if not row["quelle"]:
-        row["quelle"] = source
-    if not row["dateiname"]:
-        row["dateiname"] = filename_stem
-    return row
+    return project_fields_for_csv(
+        fields,
+        source=source,
+        filename_stem=filename_stem,
+    )
 
 
 def _normalize_fields(fields: dict[str, Any]) -> dict[str, str]:
-    normalized: dict[str, str] = {}
-    for column in CSV_COLUMNS:
-        value = fields.get(column, "")
-        normalized[column] = "" if value is None else str(value)
-    return normalized
+    return normalize_stored_fields(fields)
 
 
 def _optional_float(value: Any) -> float | None:

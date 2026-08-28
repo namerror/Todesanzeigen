@@ -15,7 +15,6 @@ ROUTER_TARGET_FIELDS = (
     "genannt",
     "geburtsort",
     "sterbeort",
-    "wohnort",
     "ort",
     "weitere_orte",
     "beruf",

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .llm import CSV_COLUMNS
+from .llm import STORED_COLUMNS
 from .storage import (
     DEFAULT_DB_PATH,
     apply_migrations,
@@ -117,7 +117,7 @@ def evaluate_method(
                         "prediction": "",
                         "correct": False,
                     }
-                    for column in CSV_COLUMNS
+                    for column in STORED_COLUMNS
                     if _clean(truth.get(column, ""))
                 }
                 per_document.append(
@@ -194,7 +194,7 @@ def _compare_fields(
 ) -> tuple[dict[str, dict[str, Any]], bool]:
     field_results: dict[str, dict[str, Any]] = {}
     exact = True
-    for column in CSV_COLUMNS:
+    for column in STORED_COLUMNS:
         truth_value = _clean(truth.get(column, ""))
         prediction_value = _clean(prediction.get(column, ""))
         correct = truth_value == prediction_value
