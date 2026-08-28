@@ -16,6 +16,7 @@ from .methods import (
     GT_EXPORT_SOURCE,
     default_route_reason,
     method_family,
+    requires_model,
     result_slot,
 )
 from .normalization import fields_for_csv as project_fields_for_csv
@@ -25,7 +26,7 @@ from .ocr import image_mime_type
 
 DEFAULT_DB_PATH = Path("state/todesanzeigen.sqlite3")
 DEFAULT_LABEL_SET = "gt-v1"
-SCHEMA_VERSION = "003_result_slot_cache"
+SCHEMA_VERSION = "004_require_generation_model"
 SUCCESSFUL_EXTRACTION_STATUSES = ("processed", "rerouted_processed", "vision_processed")
 
 
@@ -91,6 +92,7 @@ def create_run(
     config: dict[str, Any] | None = None,
     code_version: str = "",
 ) -> str:
+    _validate_required_model(method, model)
     run_id = str(uuid.uuid4())
     connection.execute(
         """
@@ -388,6 +390,7 @@ def insert_extraction_output(
     superseded_at: str | None = None,
 ) -> int:
     family = method_family_value or method_family(method)
+    _validate_required_model(method, model, family)
     reason = route_reason or default_route_reason(method)
     slot = result_slot_value or result_slot(method)
     cursor = connection.execute(
@@ -429,6 +432,15 @@ def insert_extraction_output(
         ),
     )
     return int(cursor.lastrowid)
+
+
+def _validate_required_model(
+    method: str,
+    model: str,
+    method_family_value: str = "",
+) -> None:
+    if requires_model(method, method_family_value) and not model.strip():
+        raise ValueError(f"model is required for model-backed extraction method: {method}")
 
 
 def insert_label_candidate(

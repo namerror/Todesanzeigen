@@ -11,6 +11,7 @@ OCR_LLM_FAMILY = "ocr_llm"
 VLM_FAMILY = "vlm"
 OCR_LLM_SLOT = "ocr_llm"
 VLM_SLOT = "vlm"
+MODEL_BACKED_FAMILIES = frozenset({OCR_LLM_FAMILY, VLM_FAMILY})
 
 GT_EXPORT_SOURCE = "ground_truth"
 DEFAULT_EXPORT_METHOD_PRIORITY = (
@@ -66,3 +67,10 @@ def default_route_reason(method: str) -> str:
 def result_slot(method: str) -> str:
     definition = METHOD_DEFINITIONS.get(method)
     return definition.result_slot if definition else method
+
+
+def requires_model(method: str, method_family_value: str = "") -> bool:
+    return (
+        method_family(method) in MODEL_BACKED_FAMILIES
+        or method_family_value in MODEL_BACKED_FAMILIES
+    )

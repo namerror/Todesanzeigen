@@ -36,6 +36,9 @@ STORED_COLUMNS = [column for column in CSV_COLUMNS if column != "wohnort"]
 
 
 class LlmProvider(Protocol):
+    provider_name: str
+    model_name: str
+
     def complete(self, prompt: str) -> str:
         """Return the model response body for one prompt."""
 

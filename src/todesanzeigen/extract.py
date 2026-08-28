@@ -1023,6 +1023,9 @@ async def extract_artifacts_to_db_async(
 ) -> list[ExtractionResult]:
     settings = settings or AsyncExtractionSettings()
     _validate_async_settings(settings, reroute_settings)
+    _require_provider_model(provider)
+    if reroute_settings is not None:
+        _require_provider_model(reroute_settings.provider)
     _ensure_db_ready(db_path)
 
     artifacts = discover_artifacts(artifacts_dir)
@@ -1304,6 +1307,7 @@ async def reroute_candidates_to_db_async(
         raise ValueError("Vision reroute concurrency must be at least 1.")
     if settings.max_retries < 0:
         raise ValueError("LLM max retries must be at least 0.")
+    _require_provider_model(provider)
     _ensure_db_ready(db_path)
 
     _initialize_log(log_file, "DB vision reroute")
@@ -1459,6 +1463,7 @@ async def extract_images_to_db_async(
         raise ValueError("Vision extraction concurrency must be at least 1.")
     if settings.max_retries < 0:
         raise ValueError("LLM max retries must be at least 0.")
+    _require_provider_model(provider)
     _ensure_db_ready(db_path)
 
     images = select_image_paths(
@@ -2223,6 +2228,13 @@ def _provider_name(provider: object) -> str:
 
 def _model_name(provider: object) -> str:
     return str(getattr(provider, "model_name", "") or "")
+
+
+def _require_provider_model(provider: object) -> str:
+    model = _model_name(provider).strip()
+    if not model:
+        raise ValueError("Model-backed extraction provider must expose a non-empty model_name.")
+    return model
 
 
 def _load_low_confidence_file_candidates(

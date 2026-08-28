@@ -1,5 +1,6 @@
 import csv
 import json
+import sqlite3
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import IsolatedAsyncioTestCase, TestCase
@@ -49,6 +50,7 @@ class MlInfrastructureTests(TestCase):
                     "001_initial",
                     "002_method_lineage_features",
                     "003_result_slot_cache",
+                    "004_require_generation_model",
                 ],
             )
             self.assertEqual(second, [])
@@ -64,6 +66,130 @@ class MlInfrastructureTests(TestCase):
             self.assertIn("evaluation_results", tables)
             self.assertIn("extraction_methods", tables)
             self.assertIn("feature_snapshots", tables)
+
+    def test_model_backed_storage_requires_model_in_application_and_database(self) -> None:
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state" / "test.sqlite3"
+            apply_migrations(db_path)
+
+            with connect(db_path) as connection:
+                document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="Example",
+                )
+                with self.assertRaisesRegex(ValueError, "model is required"):
+                    insert_extraction_output(
+                        connection,
+                        document_id=document_id,
+                        run_id=None,
+                        method="text_extraction",
+                        fields={},
+                        status="processed",
+                    )
+                with self.assertRaisesRegex(ValueError, "model is required"):
+                    insert_extraction_output(
+                        connection,
+                        document_id=document_id,
+                        run_id=None,
+                        method="text_extraction",
+                        method_family_value="manual",
+                        fields={},
+                        status="processed",
+                    )
+                with self.assertRaisesRegex(ValueError, "model is required"):
+                    create_run(connection, command="extract", method="text_extraction")
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        """
+                        INSERT INTO extraction_outputs(document_id, method, fields_json, status)
+                        VALUES (?, 'vision_model_image_only', '{}', 'vision_processed')
+                        """,
+                        (document_id,),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        """
+                        INSERT INTO runs(id, command, method)
+                        VALUES ('direct-run', 'extract', 'text_extraction')
+                        """
+                    )
+
+                output_id = insert_extraction_output(
+                    connection,
+                    document_id=document_id,
+                    run_id=None,
+                    method="text_extraction",
+                    model="test-model",
+                    fields={},
+                    status="processed",
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE extraction_outputs SET model = '' WHERE id = ?",
+                        (output_id,),
+                    )
+
+                imported_id = insert_extraction_output(
+                    connection,
+                    document_id=document_id,
+                    run_id=None,
+                    method="csv_import",
+                    fields={},
+                    status="processed",
+                )
+
+            self.assertGreater(imported_id, output_id)
+
+    def test_ingest_model_backed_results_requires_explicit_model(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaisesRegex(ValueError, "--model is required"):
+                ingest_results(
+                    db_path=root / "state" / "test.sqlite3",
+                    output_csv=root / "result.csv",
+                    method="text_extraction",
+                )
+
+    def test_ingest_jsonl_infers_model_lineage_from_checkpoint(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "state" / "test.sqlite3"
+            results_file = root / "results.jsonl"
+            results_file.write_text(
+                json.dumps(
+                    {
+                        "filename": "Example.txt",
+                        "status": "processed",
+                        "method": "text_extraction",
+                        "provider": "qwen",
+                        "model": "qwen3.6-flash",
+                        "row": {
+                            "name": "Mustermann",
+                            "quelle": "Aichacher Nachrichten",
+                            "dateiname": "Example",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            summary = ingest_results(
+                db_path=db_path,
+                results_file=results_file,
+                method="text_extraction",
+            )
+
+            with connect(db_path) as connection:
+                output = connection.execute("SELECT * FROM extraction_outputs").fetchone()
+                run = connection.execute("SELECT * FROM runs").fetchone()
+
+        self.assertEqual(summary.extraction_outputs, 1)
+        self.assertEqual(output["provider"], "qwen")
+        self.assertEqual(output["model"], "qwen3.6-flash")
+        self.assertEqual(run["provider"], "qwen")
+        self.assertEqual(run["model"], "qwen3.6-flash")
 
     def test_ingest_source_records_images_artifacts_and_ocr_outputs(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -187,6 +313,8 @@ class MlInfrastructureTests(TestCase):
                 source="Aichacher Nachrichten",
                 output_csv=output_csv,
                 method="text_extraction",
+                provider="qwen",
+                model="qwen3.6-flash",
                 candidate_kind="pipeline",
                 input_dir=input_dir,
             )
@@ -195,6 +323,8 @@ class MlInfrastructureTests(TestCase):
                 source="Aichacher Nachrichten",
                 output_csv=output_csv,
                 method="text_extraction",
+                provider="qwen",
+                model="qwen3.6-flash",
                 candidate_kind="pipeline",
                 input_dir=input_dir,
             )
@@ -557,6 +687,7 @@ class MlInfrastructureTests(TestCase):
                     document_id=document_id,
                     run_id=None,
                     method="text_extraction",
+                    model="test-text-model",
                     fields={"name": "Mustermann", "vorname": "Erika"},
                     status="processed",
                 )
@@ -615,6 +746,7 @@ class MlInfrastructureTests(TestCase):
                     document_id=gt_document_id,
                     run_id=None,
                     method="vision_model_image_only",
+                    model="test-vision-model",
                     fields={"name": "Ignored Vision"},
                     status="vision_processed",
                 )
@@ -623,6 +755,7 @@ class MlInfrastructureTests(TestCase):
                     document_id=vlm_document_id,
                     run_id=None,
                     method="vision_model_image_only",
+                    model="test-vision-model",
                     fields={"name": "Vision"},
                     status="vision_processed",
                 )
@@ -631,6 +764,7 @@ class MlInfrastructureTests(TestCase):
                     document_id=text_document_id,
                     run_id=None,
                     method="text_extraction",
+                    model="test-text-model",
                     fields={"name": "Text"},
                     status="processed",
                 )
@@ -687,6 +821,7 @@ class MlInfrastructureTests(TestCase):
                     document_id=document_id,
                     run_id=None,
                     method="text_extraction",
+                    model="test-text-model",
                     fields={"name": "Mustermann", "vorname": "Max"},
                     status="processed",
                 )
@@ -742,6 +877,7 @@ class DbFirstExtractionTests(IsolatedAsyncioTestCase):
                 encoding="utf-8",
             )
             (input_dir / "example.jpg").write_bytes(b"image")
+            checkpoint_file = root / "logs" / "results.jsonl"
 
             results = await extract_artifacts_to_db_async(
                 artifacts_dir,
@@ -749,6 +885,7 @@ class DbFirstExtractionTests(IsolatedAsyncioTestCase):
                 Provider(),
                 input_dir=input_dir,
                 source="Aichacher Nachrichten",
+                checkpoint_file=checkpoint_file,
                 settings=AsyncExtractionSettings(max_retries=0),
             )
 
@@ -756,6 +893,8 @@ class DbFirstExtractionTests(IsolatedAsyncioTestCase):
                 output = connection.execute("SELECT * FROM extraction_outputs").fetchone()
                 candidate = connection.execute("SELECT * FROM label_candidates").fetchone()
                 document = connection.execute("SELECT * FROM documents").fetchone()
+                run = connection.execute("SELECT * FROM runs WHERE command = 'extract'").fetchone()
+            checkpoint = json.loads(checkpoint_file.read_text(encoding="utf-8").splitlines()[0])
 
         self.assertEqual(results[0].status, "processed")
         self.assertEqual(output["method"], "text_extraction")
@@ -764,9 +903,79 @@ class DbFirstExtractionTests(IsolatedAsyncioTestCase):
         self.assertTrue(output["input_fingerprint"])
         self.assertTrue(output["config_hash"])
         self.assertEqual(output["provider"], "fake")
+        self.assertEqual(output["model"], "fake-model")
+        self.assertEqual(run["provider"], "fake")
+        self.assertEqual(run["model"], "fake-model")
+        self.assertEqual(checkpoint["provider"], "fake")
+        self.assertEqual(checkpoint["model"], "fake-model")
         self.assertEqual(json.loads(output["fields_json"])["name"], "Mustermann")
         self.assertEqual(candidate["source_kind"], "pipeline")
         self.assertEqual(document["image_path"], str(input_dir / "example.jpg"))
+
+    async def test_db_generation_rejects_provider_without_model_before_writing(self) -> None:
+        class ProviderWithoutModel:
+            provider_name = "fake"
+
+            async def async_complete(self, prompt: str) -> str:
+                raise AssertionError("provider should not be called")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "state" / "test.sqlite3"
+            artifacts_dir = root / "artifacts"
+            artifacts_dir.mkdir()
+
+            with self.assertRaisesRegex(ValueError, "non-empty model_name"):
+                await extract_artifacts_to_db_async(
+                    artifacts_dir,
+                    db_path,
+                    ProviderWithoutModel(),
+                )
+
+            self.assertFalse(db_path.exists())
+
+    async def test_image_only_generation_records_configured_model(self) -> None:
+        class VisionProvider:
+            provider_name = "fake-vision"
+            model_name = "fake-vision-model"
+
+            async def async_vision_complete(
+                self,
+                prompt: str,
+                image_path: Path,
+                mime_type: str,
+            ) -> str:
+                return json.dumps({"name": "Mustermann"})
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "state" / "test.sqlite3"
+            input_dir = root / "input"
+            checkpoint_file = root / "logs" / "vision-results.jsonl"
+            input_dir.mkdir()
+            (input_dir / "example.jpg").write_bytes(b"image")
+
+            results = await extract_images_to_db_async(
+                input_dir,
+                db_path,
+                VisionProvider(),
+                source="Aichacher Nachrichten",
+                results_file=checkpoint_file,
+                settings=AsyncExtractionSettings(max_retries=0),
+            )
+
+            with connect(db_path) as connection:
+                output = connection.execute("SELECT * FROM extraction_outputs").fetchone()
+                run = connection.execute(
+                    "SELECT * FROM runs WHERE command = 'vision-extract'"
+                ).fetchone()
+            checkpoint = json.loads(checkpoint_file.read_text(encoding="utf-8").splitlines()[0])
+
+        self.assertEqual(results[0].status, "vision_processed")
+        self.assertEqual(output["provider"], "fake-vision")
+        self.assertEqual(output["model"], "fake-vision-model")
+        self.assertEqual(run["model"], "fake-vision-model")
+        self.assertEqual(checkpoint["model"], "fake-vision-model")
 
     async def test_text_extraction_uses_db_cache_before_provider_call(self) -> None:
         class FailingProvider:
@@ -804,6 +1013,7 @@ class DbFirstExtractionTests(IsolatedAsyncioTestCase):
                     document_id=document_id,
                     run_id=None,
                     method="text_extraction",
+                    model="fake-model",
                     fields={"name": "Cached Text"},
                     status="processed",
                 )
@@ -852,6 +1062,7 @@ class DbFirstExtractionTests(IsolatedAsyncioTestCase):
                     document_id=document_id,
                     run_id=None,
                     method="vision_model_reroute",
+                    model="fake-vision-model",
                     fields={"name": "Cached VLM"},
                     status="rerouted_processed",
                 )
@@ -903,6 +1114,7 @@ class DbFirstExtractionTests(IsolatedAsyncioTestCase):
                     document_id=document_id,
                     run_id=None,
                     method="vision_model_image_only",
+                    model="fake-vision-model",
                     fields={"name": "Cached Direct VLM"},
                     status="vision_processed",
                 )
@@ -963,6 +1175,7 @@ class DbFirstExtractionTests(IsolatedAsyncioTestCase):
                     document_id=document_id,
                     run_id=None,
                     method="text_extraction",
+                    model="old-model",
                     fields={"name": "Old Text"},
                     status="processed",
                 )

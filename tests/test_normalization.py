@@ -102,6 +102,7 @@ def test_database_field_normalization_is_dry_run_then_backed_up_and_transactiona
                 document_id=document_id,
                 run_id=None,
                 method="text_extraction",
+                model="test-model",
                 fields={},
                 status="processed",
             )

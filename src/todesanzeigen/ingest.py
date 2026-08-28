@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .extract import PROCESSED_STATUSES
+from .methods import requires_model
 from .normalization import normalize_stored_fields
 from .ocr import image_mime_type
 from .storage import (
@@ -155,6 +156,16 @@ def ingest_results(
 ) -> ResultsIngestSummary:
     if output_csv is None and results_file is None:
         raise ValueError("at least one of output_csv or results_file is required")
+    resolved_provider = provider.strip()
+    resolved_model = model.strip()
+    if requires_model(method) and not resolved_model:
+        if output_csv is not None or results_file is None:
+            raise ValueError(
+                f"--model is required when importing model-backed extraction method: {method}"
+            )
+        inferred_provider, inferred_model = _checkpoint_lineage(results_file, method)
+        resolved_provider = resolved_provider or inferred_provider
+        resolved_model = inferred_model
     image_index = _source_image_index(input_dir) if input_dir is not None else None
     apply_migrations(db_path)
     with connect(db_path) as connection:
@@ -162,8 +173,8 @@ def ingest_results(
             connection,
             command="ingest results",
             method=method,
-            provider=provider,
-            model=model,
+            provider=resolved_provider,
+            model=resolved_model,
             config={
                 "source": source,
                 "output_csv": str(output_csv or ""),
@@ -204,8 +215,8 @@ def ingest_results(
                     document_id=document_id,
                     run_id=run_id,
                     method=method,
-                    provider=provider,
-                    model=model,
+                    provider=resolved_provider,
+                    model=resolved_model,
                     fields=row,
                     status="processed",
                     source_artifact_id=artifact_id,
@@ -255,8 +266,8 @@ def ingest_results(
                     document_id=document_id,
                     run_id=run_id,
                     method=record_method,
-                    provider=str(record.get("provider") or provider),
-                    model=str(record.get("model") or model),
+                    provider=str(record.get("provider") or resolved_provider),
+                    model=str(record.get("model") or resolved_model),
                     fields=row,
                     status=str(record.get("status") or "processed"),
                     error=str(record.get("error") or ""),
@@ -276,6 +287,35 @@ def ingest_results(
                     candidate_count += 1
         finish_run(connection, run_id)
     return ResultsIngestSummary(output_count, candidate_count, run_id)
+
+
+def _checkpoint_lineage(results_file: Path, default_method: str) -> tuple[str, str]:
+    providers: set[str] = set()
+    models: set[str] = set()
+    for record in _read_jsonl(results_file):
+        row = record.get("row")
+        if record.get("status") not in PROCESSED_STATUSES or not isinstance(row, dict):
+            continue
+        record_method = str(record.get("method") or default_method)
+        if not requires_model(record_method):
+            continue
+        record_model = str(record.get("model") or "").strip()
+        if not record_model:
+            raise ValueError(
+                f"--model is required because {results_file} contains a model-backed "
+                "record without model metadata"
+            )
+        models.add(record_model)
+        record_provider = str(record.get("provider") or "").strip()
+        if record_provider:
+            providers.add(record_provider)
+
+    if len(models) != 1:
+        raise ValueError(
+            f"--model is required because {results_file} does not contain exactly one model"
+        )
+    provider = next(iter(providers)) if len(providers) == 1 else ""
+    return provider, next(iter(models))
 
 
 def _document_for_row(

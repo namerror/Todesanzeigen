@@ -232,6 +232,7 @@ def _insert_router_document(
         document_id=document_id,
         run_id=None,
         method="text_extraction",
+        model="test-text-model",
         fields={"name": "Musterfrau" if failed else "Mustermann", "vorname": "Max"},
         status="processed",
     )
@@ -240,6 +241,7 @@ def _insert_router_document(
         document_id=document_id,
         run_id=None,
         method="vision_model_image_only",
+        model="test-vision-model",
         fields={"name": "Mustermann", "vorname": "Max"},
         status="vision_processed",
     )

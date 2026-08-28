@@ -359,6 +359,8 @@ Import existing extraction outputs:
 todesanzeigen ingest results \
   --output-csv output/result.csv \
   --method text_extraction \
+  --provider qwen \
+  --model qwen3.6-flash \
   --candidate-kind teacher
 ```
 
@@ -368,10 +370,15 @@ You can also import JSONL checkpoints:
 todesanzeigen ingest results \
   --results-file logs/aichacher_nachrichten/results.jsonl \
   --method text_extraction \
+  --provider qwen \
+  --model qwen3.6-flash \
   --candidate-kind teacher
 ```
 
 Imported rows are stored as extraction outputs and as pending label candidates.
+Model-backed methods require an exact model name. Normal `extract`, `reroute`,
+and `vision-extract` runs record the provider and model automatically; imports
+must pass `--model` because legacy CSV and JSONL files may not contain it.
 They are not treated as ground truth automatically. This is intentional:
 VLM-generated or LLM-generated "ground truth" should be reviewed before it is
 used as a benchmark label.
