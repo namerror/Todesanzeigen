@@ -55,7 +55,7 @@ def build_feature_snapshots(
             ocr = latest_ocr_output(connection, document_id=int(document["id"]))
             features = _document_features(dict(document))
             if ocr is not None:
-                features.update(_ocr_features(dict(ocr), _artifact_text(connection, ocr["tsv_artifact_id"])))
+                features.update(_ocr_features(dict(ocr), _ocr_tsv_text(ocr["tsv_path"])))
             upsert_feature_snapshot(
                 connection,
                 document_id=int(document["id"]),
@@ -177,13 +177,10 @@ def _ocr_features(ocr: dict[str, Any], tsv_text: str) -> dict[str, Any]:
     return features
 
 
-def _artifact_text(connection: Any, artifact_id: Any) -> str:
-    if artifact_id in (None, ""):
+def _ocr_tsv_text(path_value: Any) -> str:
+    if path_value in (None, ""):
         return ""
-    row = connection.execute("SELECT path FROM artifacts WHERE id = ?", (artifact_id,)).fetchone()
-    if row is None:
-        return ""
-    path = Path(row["path"])
+    path = Path(str(path_value))
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
 

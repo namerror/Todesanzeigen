@@ -19,7 +19,6 @@ from .storage import (
     insert_extraction_output,
     insert_label_candidate,
     read_csv_rows,
-    record_artifact,
     sha256_file,
     upsert_document,
     upsert_ocr_output,
@@ -87,40 +86,13 @@ def ingest_source(
                 layout_family=layout_family,
             )
             document_count += 1
-            record_artifact(
-                connection,
-                document_id=document_id,
-                run_id=run_id,
-                artifact_type="source_image",
-                path=image_path,
-                producer="ingest source",
-            )
-
             text_path = text_artifacts.get(image_path.stem)
             tsv_path = tsv_artifacts.get(image_path.stem)
-            text_artifact_id = None
-            tsv_artifact_id = None
             text = ""
             if text_path is not None:
-                text_artifact_id = record_artifact(
-                    connection,
-                    document_id=document_id,
-                    run_id=run_id,
-                    artifact_type="ocr_text",
-                    path=text_path,
-                    producer="tesseract",
-                )
                 text = text_path.read_text(encoding="utf-8")
                 text_count += 1
             if tsv_path is not None:
-                tsv_artifact_id = record_artifact(
-                    connection,
-                    document_id=document_id,
-                    run_id=run_id,
-                    artifact_type="ocr_tsv",
-                    path=tsv_path,
-                    producer="tesseract",
-                )
                 tsv_count += 1
             if text_path is not None or tsv_path is not None:
                 hint = name_map.get(f"{image_path.stem}.txt", {})
@@ -129,8 +101,10 @@ def ingest_source(
                     document_id=document_id,
                     run_id=run_id,
                     text=text,
-                    text_artifact_id=text_artifact_id,
-                    tsv_artifact_id=tsv_artifact_id,
+                    text_path=text_path or "",
+                    text_sha256=sha256_file(text_path) if text_path is not None else "",
+                    tsv_path=tsv_path or "",
+                    tsv_sha256=sha256_file(tsv_path) if tsv_path is not None else "",
                     features=_ocr_features(text, tsv_path),
                     name_hint=str(hint.get("name", "") or ""),
                     name_confidence=_optional_float(hint.get("confidence")),
@@ -178,7 +152,17 @@ def ingest_results(
             config={
                 "source": source,
                 "output_csv": str(output_csv or ""),
+                "output_csv_sha256": (
+                    sha256_file(output_csv)
+                    if output_csv is not None and output_csv.exists()
+                    else ""
+                ),
                 "results_file": str(results_file or ""),
+                "results_file_sha256": (
+                    sha256_file(results_file)
+                    if results_file is not None and results_file.exists()
+                    else ""
+                ),
                 "candidate_kind": candidate_kind,
                 "input_dir": str(input_dir or ""),
             },
@@ -186,30 +170,13 @@ def ingest_results(
         output_count = 0
         candidate_count = 0
         if output_csv is not None:
-            artifact_id = record_artifact(
-                connection,
-                document_id=None,
-                run_id=run_id,
-                artifact_type="csv_output",
-                path=output_csv,
-                producer="ingest results",
-            )
             for row in read_csv_rows(output_csv):
-                document_id, image_path = _document_for_row(
+                document_id, _ = _document_for_row(
                     connection,
                     row,
                     source,
                     image_index,
                 )
-                if image_path is not None:
-                    record_artifact(
-                        connection,
-                        document_id=document_id,
-                        run_id=run_id,
-                        artifact_type="source_image",
-                        path=image_path,
-                        producer="ingest results",
-                    )
                 output_id, created = _get_or_create_extraction_output(
                     connection,
                     document_id=document_id,
@@ -219,7 +186,6 @@ def ingest_results(
                     model=resolved_model,
                     fields=row,
                     status="processed",
-                    source_artifact_id=artifact_id,
                 )
                 output_count += 1 if created else 0
                 candidate_id = _get_or_create_label_candidate(
@@ -233,33 +199,16 @@ def ingest_results(
                 if candidate_id is not None:
                     candidate_count += 1
         if results_file is not None:
-            artifact_id = record_artifact(
-                connection,
-                document_id=None,
-                run_id=run_id,
-                artifact_type="jsonl_checkpoint",
-                path=results_file,
-                producer="ingest results",
-            )
             for record in _read_jsonl(results_file):
                 row = record.get("row")
                 if record.get("status") not in PROCESSED_STATUSES or not isinstance(row, dict):
                     continue
-                document_id, image_path = _document_for_row(
+                document_id, _ = _document_for_row(
                     connection,
                     row,
                     source,
                     image_index,
                 )
-                if image_path is not None:
-                    record_artifact(
-                        connection,
-                        document_id=document_id,
-                        run_id=run_id,
-                        artifact_type="source_image",
-                        path=image_path,
-                        producer="ingest results",
-                    )
                 record_method = str(record.get("method") or method)
                 output_id, created = _get_or_create_extraction_output(
                     connection,
@@ -272,7 +221,6 @@ def ingest_results(
                     status=str(record.get("status") or "processed"),
                     error=str(record.get("error") or ""),
                     attempts=int(record.get("attempts") or 0),
-                    source_artifact_id=artifact_id,
                 )
                 output_count += 1 if created else 0
                 candidate_id = _get_or_create_label_candidate(
@@ -385,7 +333,6 @@ def _get_or_create_extraction_output(
     status: str,
     error: str = "",
     attempts: int = 0,
-    source_artifact_id: int | None = None,
 ) -> tuple[int, bool]:
     fields_json = _fields_json(fields)
     existing = connection.execute(
@@ -416,7 +363,6 @@ def _get_or_create_extraction_output(
             status=status,
             error=error,
             attempts=attempts,
-            source_artifact_id=source_artifact_id,
         ),
         True,
     )

@@ -26,7 +26,7 @@ from .ocr import image_mime_type
 
 DEFAULT_DB_PATH = Path("state/todesanzeigen.sqlite3")
 DEFAULT_LABEL_SET = "gt-v1"
-SCHEMA_VERSION = "004_require_generation_model"
+SCHEMA_VERSION = "005_remove_artifacts"
 SUCCESSFUL_EXTRACTION_STATUSES = ("processed", "rerouted_processed", "vision_processed")
 
 
@@ -257,69 +257,16 @@ def find_document_id(
     return int(row["id"]) if row else None
 
 
-def record_artifact(
-    connection: sqlite3.Connection,
-    *,
-    document_id: int | None,
-    artifact_type: str,
-    path: Path,
-    run_id: str | None = None,
-    producer: str = "",
-) -> int:
-    path_text = _path_text(path)
-    digest = sha256_file(path) if path.exists() and path.is_file() else ""
-    if document_id is None:
-        existing = connection.execute(
-            """
-            SELECT id FROM artifacts
-            WHERE document_id IS NULL AND artifact_type = ? AND path = ?
-            """,
-            (artifact_type, path_text),
-        ).fetchone()
-        if existing is not None:
-            connection.execute(
-                """
-                UPDATE artifacts
-                SET run_id = COALESCE(?, run_id),
-                    sha256 = ?,
-                    producer = COALESCE(NULLIF(?, ''), producer)
-                WHERE id = ?
-                """,
-                (run_id, digest, producer, int(existing["id"])),
-            )
-            return int(existing["id"])
-    connection.execute(
-        """
-        INSERT INTO artifacts(document_id, run_id, artifact_type, path, sha256, producer)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(document_id, artifact_type, path) DO UPDATE SET
-            run_id = COALESCE(excluded.run_id, artifacts.run_id),
-            sha256 = excluded.sha256,
-            producer = COALESCE(NULLIF(excluded.producer, ''), artifacts.producer)
-        """,
-        (document_id, run_id, artifact_type, path_text, digest, producer),
-    )
-    return int(
-        connection.execute(
-            """
-            SELECT id FROM artifacts
-            WHERE (document_id IS ? OR document_id = ?)
-              AND artifact_type = ?
-              AND path = ?
-            """,
-            (document_id, document_id, artifact_type, path_text),
-        ).fetchone()["id"]
-    )
-
-
 def upsert_ocr_output(
     connection: sqlite3.Connection,
     *,
     document_id: int,
     run_id: str,
     text: str,
-    text_artifact_id: int | None = None,
-    tsv_artifact_id: int | None = None,
+    text_path: Path | str = "",
+    text_sha256: str = "",
+    tsv_path: Path | str = "",
+    tsv_sha256: str = "",
     settings: dict[str, Any] | None = None,
     features: dict[str, Any] | None = None,
     name_hint: str = "",
@@ -328,14 +275,16 @@ def upsert_ocr_output(
     connection.execute(
         """
         INSERT INTO ocr_outputs(
-            document_id, run_id, text, text_artifact_id, tsv_artifact_id,
+            document_id, run_id, text, text_path, text_sha256, tsv_path, tsv_sha256,
             settings_json, features_json, name_hint, name_confidence
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(document_id, run_id) DO UPDATE SET
             text = excluded.text,
-            text_artifact_id = excluded.text_artifact_id,
-            tsv_artifact_id = excluded.tsv_artifact_id,
+            text_path = excluded.text_path,
+            text_sha256 = excluded.text_sha256,
+            tsv_path = excluded.tsv_path,
+            tsv_sha256 = excluded.tsv_sha256,
             settings_json = excluded.settings_json,
             features_json = excluded.features_json,
             name_hint = excluded.name_hint,
@@ -345,8 +294,10 @@ def upsert_ocr_output(
             document_id,
             run_id,
             text,
-            text_artifact_id,
-            tsv_artifact_id,
+            _path_text(text_path),
+            text_sha256,
+            _path_text(tsv_path),
+            tsv_sha256,
             _json(settings or {}),
             _json(features or {}),
             name_hint,
@@ -376,7 +327,6 @@ def insert_extraction_output(
     error: str = "",
     attempts: int = 0,
     estimated_tokens: int | None = None,
-    source_artifact_id: int | None = None,
     latency_ms: int | None = None,
     cost_usd: float | None = None,
     method_family_value: str = "",
@@ -398,11 +348,11 @@ def insert_extraction_output(
         INSERT INTO extraction_outputs(
             document_id, run_id, method, provider, model, prompt_version,
             fields_json, raw_response, status, error, attempts, latency_ms,
-            estimated_tokens, cost_usd, source_artifact_id, method_family,
+            estimated_tokens, cost_usd, method_family,
             route_reason, route_decision_json, config_json, ocr_output_id,
             result_slot, input_fingerprint, config_hash, superseded_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             document_id,
@@ -419,7 +369,6 @@ def insert_extraction_output(
             latency_ms,
             estimated_tokens,
             cost_usd,
-            source_artifact_id,
             family,
             reason,
             _json(route_decision or {}),

@@ -320,9 +320,9 @@ todesanzeigen vision-extract --force
 ## ML Infrastructure Usage
 
 OCR artifacts remain files, but extraction outputs are now DB-first. SQLite is
-the durable project state for document inventory, artifact lineage, method
-outputs, teacher/pipeline candidates, reviewed ground truth, feature snapshots,
-dataset splits, evaluation results, and final CSV export.
+the durable project state for document inventory, OCR lineage, method outputs,
+teacher/pipeline candidates, reviewed ground truth, feature snapshots, dataset
+splits, evaluation results, and final CSV export.
 
 The default database path is:
 
@@ -330,8 +330,9 @@ The default database path is:
 state/todesanzeigen.sqlite3
 ```
 
-Local SQLite files are ignored by Git. Images and generated artifacts also stay
-as files; the database stores their relative paths and content hashes.
+Local SQLite files are ignored by Git. Images and generated OCR artifacts also
+stay as files. Source-image paths and hashes live on `documents`; OCR text/TSV
+paths and hashes live on `ocr_outputs`.
 
 Initialize or migrate the database:
 
@@ -349,9 +350,9 @@ todesanzeigen ingest source \
   --layout-family clean
 ```
 
-This records source images, OCR text artifacts, TSV artifacts, name-map hints,
-basic OCR features, and a run record. It does not move or rewrite the original
-files.
+This records source images on `documents`, OCR text and TSV metadata on
+`ocr_outputs`, name-map hints, basic OCR features, and a run record. It does not
+move or rewrite the original files.
 
 Import existing extraction outputs:
 

@@ -1274,7 +1274,6 @@ async def extract_artifacts_to_db_async(
         command="extract",
         source=source,
         input_dir=input_dir,
-        artifacts_dir=artifacts_dir,
         candidate_kind=candidate_kind,
         run_method=TEXT_EXTRACTION_METHOD,
         run_provider=_provider_name(provider),
@@ -1431,7 +1430,6 @@ async def reroute_candidates_to_db_async(
         command="reroute",
         source=source,
         input_dir=input_dir,
-        artifacts_dir=Path(""),
         candidate_kind=candidate_kind,
         run_method=VISION_REROUTE_METHOD,
         run_provider=_provider_name(provider),
@@ -1584,7 +1582,6 @@ async def extract_images_to_db_async(
         command="vision-extract",
         source=source,
         input_dir=input_dir,
-        artifacts_dir=Path(""),
         candidate_kind=candidate_kind,
         run_method=VISION_IMAGE_ONLY_METHOD,
         run_provider=_provider_name(provider),
@@ -1786,14 +1783,12 @@ def _persist_db_extraction_records(
     command: str,
     source: str,
     input_dir: Path,
-    artifacts_dir: Path,
     candidate_kind: str,
     run_method: str,
     run_provider: str,
     run_model: str,
     run_config: dict[str, Any],
 ) -> None:
-    del artifacts_dir
     from .storage import (
         apply_migrations,
         connect,
@@ -1801,7 +1796,6 @@ def _persist_db_extraction_records(
         finish_run,
         insert_extraction_output,
         insert_label_candidate,
-        record_artifact,
         sha256_file,
         upsert_document,
         upsert_ocr_output,
@@ -1839,39 +1833,9 @@ def _persist_db_extraction_records(
                     image_sha256=image_digest,
                     mime_type=image_mime_type(image_path) if image_path is not None else "",
                 )
-                image_artifact_id = None
-                if image_path is not None:
-                    image_artifact_id = record_artifact(
-                        connection,
-                        document_id=document_id,
-                        run_id=run_id,
-                        artifact_type="source_image",
-                        path=image_path,
-                        producer=record.method,
-                    )
-
-                text_artifact_id = None
-                tsv_artifact_id = None
                 ocr_output_id = None
                 if result.artifact_path.suffix == ".txt":
-                    text_artifact_id = record_artifact(
-                        connection,
-                        document_id=document_id,
-                        run_id=run_id,
-                        artifact_type="ocr_text",
-                        path=result.artifact_path,
-                        producer="tesseract",
-                    )
                     tsv_path = result.artifact_path.with_suffix(".tsv")
-                    if tsv_path.exists():
-                        tsv_artifact_id = record_artifact(
-                            connection,
-                            document_id=document_id,
-                            run_id=run_id,
-                            artifact_type="ocr_tsv",
-                            path=tsv_path,
-                            producer="tesseract",
-                        )
                     text = (
                         result.artifact_path.read_text(encoding="utf-8")
                         if result.artifact_path.exists()
@@ -1882,8 +1846,14 @@ def _persist_db_extraction_records(
                         document_id=document_id,
                         run_id=run_id,
                         text=text,
-                        text_artifact_id=text_artifact_id,
-                        tsv_artifact_id=tsv_artifact_id,
+                        text_path=result.artifact_path,
+                        text_sha256=(
+                            sha256_file(result.artifact_path)
+                            if result.artifact_path.exists()
+                            else ""
+                        ),
+                        tsv_path=tsv_path if tsv_path.exists() else "",
+                        tsv_sha256=sha256_file(tsv_path) if tsv_path.exists() else "",
                         features=_basic_ocr_features(text, tsv_path if tsv_path.exists() else None),
                         name_hint=record.name_hint.name if record.name_hint is not None else "",
                         name_confidence=(
@@ -1891,7 +1861,6 @@ def _persist_db_extraction_records(
                         ),
                     )
 
-                source_artifact_id = image_artifact_id if record.method.startswith("vision") else text_artifact_id
                 config_hash = _stable_config_hash(
                     {
                         **run_config,
@@ -1915,7 +1884,6 @@ def _persist_db_extraction_records(
                     error=result.error or "",
                     attempts=record.attempts,
                     estimated_tokens=record.estimated_tokens,
-                    source_artifact_id=source_artifact_id,
                     latency_ms=record.latency_ms,
                     route_reason=record.reason,
                     route_decision=_route_decision(record),

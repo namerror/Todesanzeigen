@@ -1,5 +1,6 @@
 import csv
 import json
+import shutil
 import sqlite3
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -31,6 +32,7 @@ from src.todesanzeigen.storage import (
     review_method_options,
     reviewed_ground_truth_items,
     save_ground_truth_label,
+    sha256_file,
     upsert_document,
     upsert_ocr_output,
 )
@@ -51,6 +53,7 @@ class MlInfrastructureTests(TestCase):
                     "002_method_lineage_features",
                     "003_result_slot_cache",
                     "004_require_generation_model",
+                    "005_remove_artifacts",
                 ],
             )
             self.assertEqual(second, [])
@@ -66,6 +69,159 @@ class MlInfrastructureTests(TestCase):
             self.assertIn("evaluation_results", tables)
             self.assertIn("extraction_methods", tables)
             self.assertIn("feature_snapshots", tables)
+            self.assertNotIn("artifacts", tables)
+
+    def test_remove_artifacts_migration_preserves_lineage_and_foreign_keys(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "state" / "test.sqlite3"
+            pre_migrations = root / "pre-migrations"
+            pre_migrations.mkdir()
+            migrations = Path(__file__).resolve().parents[1] / "migrations"
+            for name in (
+                "001_initial.sql",
+                "002_method_lineage_features.sql",
+                "003_result_slot_cache.sql",
+                "004_require_generation_model.sql",
+            ):
+                shutil.copy2(migrations / name, pre_migrations / name)
+
+            apply_migrations(db_path, pre_migrations)
+            with connect(db_path) as connection:
+                connection.execute("INSERT INTO sources(id, name) VALUES (1, 'Test Source')")
+                connection.execute(
+                    """
+                    INSERT INTO runs(id, command, method, provider, model, config_json, status)
+                    VALUES ('ocr-run', 'ingest source', 'source_inventory', '', '', '{}', 'completed')
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO runs(id, command, method, provider, model, config_json, status)
+                    VALUES (
+                        'import-run', 'ingest results', 'text_extraction', 'qwen',
+                        'qwen3.6-flash', '{"output_csv":"output/result.csv"}', 'completed'
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO documents(
+                        id, document_key, source_id, filename_stem,
+                        image_path, image_sha256, mime_type
+                    ) VALUES (
+                        10, 'Test Source:input/example.jpg', 1, 'example',
+                        'input/example.jpg', 'image-hash', 'image/jpeg'
+                    )
+                    """
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO artifacts(
+                        id, document_id, run_id, artifact_type, path, sha256, producer
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (11, 10, "ocr-run", "source_image", "input/example.jpg", "image-hash", "ingest source"),
+                        (12, 10, "ocr-run", "ocr_text", "artifacts/example.txt", "text-hash", "tesseract"),
+                        (13, 10, "ocr-run", "ocr_tsv", "artifacts/example.tsv", "tsv-hash", "tesseract"),
+                        (14, None, "import-run", "csv_output", "output/result.csv", "csv-hash", "ingest results"),
+                    ],
+                )
+                connection.execute(
+                    """
+                    INSERT INTO ocr_outputs(
+                        id, document_id, run_id, text, text_artifact_id, tsv_artifact_id
+                    ) VALUES (20, 10, 'ocr-run', 'Max Mustermann', 12, 13)
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO extraction_outputs(
+                        id, document_id, run_id, method, provider, model, fields_json,
+                        status, source_artifact_id, method_family, result_slot, ocr_output_id
+                    ) VALUES (
+                        30, 10, 'import-run', 'text_extraction', 'qwen', 'qwen3.6-flash',
+                        '{"name":"Mustermann"}', 'processed', 14, 'ocr_llm', 'ocr_llm', 20
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO label_candidates(
+                        id, document_id, extraction_output_id, source_kind, fields_json
+                    ) VALUES (40, 10, 30, 'pipeline', '{"name":"Mustermann"}')
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO feature_snapshots(
+                        id, document_id, ocr_output_id, feature_set, features_json
+                    ) VALUES (50, 10, 20, 'router-v2', '{}')
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO evaluation_runs(id, name, label_set, method)
+                    VALUES (60, 'test-eval', 'gt-v1', 'text_extraction')
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO evaluation_results(
+                        id, evaluation_run_id, document_id, extraction_output_id
+                    ) VALUES (70, 60, 10, 30)
+                    """
+                )
+
+            self.assertEqual(apply_migrations(db_path), ["005_remove_artifacts"])
+
+            with connect(db_path) as connection:
+                tables = {
+                    row["name"]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+                ocr = connection.execute("SELECT * FROM ocr_outputs WHERE id = 20").fetchone()
+                output = connection.execute(
+                    "SELECT * FROM extraction_outputs WHERE id = 30"
+                ).fetchone()
+                run = connection.execute("SELECT * FROM runs WHERE id = 'import-run'").fetchone()
+                candidate = connection.execute(
+                    "SELECT * FROM label_candidates WHERE id = 40"
+                ).fetchone()
+                feature = connection.execute(
+                    "SELECT * FROM feature_snapshots WHERE id = 50"
+                ).fetchone()
+                evaluation = connection.execute(
+                    "SELECT * FROM evaluation_results WHERE id = 70"
+                ).fetchone()
+                foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+                integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+                ocr_columns = {
+                    row["name"] for row in connection.execute("PRAGMA table_info(ocr_outputs)")
+                }
+                output_columns = {
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(extraction_outputs)")
+                }
+
+            self.assertNotIn("artifacts", tables)
+            self.assertEqual(ocr["text_path"], "artifacts/example.txt")
+            self.assertEqual(ocr["text_sha256"], "text-hash")
+            self.assertEqual(ocr["tsv_path"], "artifacts/example.tsv")
+            self.assertEqual(ocr["tsv_sha256"], "tsv-hash")
+            self.assertNotIn("text_artifact_id", ocr_columns)
+            self.assertNotIn("tsv_artifact_id", ocr_columns)
+            self.assertNotIn("source_artifact_id", output_columns)
+            self.assertEqual(output["ocr_output_id"], 20)
+            self.assertEqual(json.loads(run["config_json"])["output_csv_sha256"], "csv-hash")
+            self.assertEqual(candidate["extraction_output_id"], 30)
+            self.assertEqual(feature["ocr_output_id"], 20)
+            self.assertEqual(evaluation["extraction_output_id"], 30)
+            self.assertEqual(foreign_key_errors, [])
+            self.assertEqual(integrity, "ok")
 
     def test_model_backed_storage_requires_model_in_application_and_database(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -174,6 +330,7 @@ class MlInfrastructureTests(TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            expected_results_hash = sha256_file(results_file)
 
             summary = ingest_results(
                 db_path=db_path,
@@ -190,6 +347,9 @@ class MlInfrastructureTests(TestCase):
         self.assertEqual(output["model"], "qwen3.6-flash")
         self.assertEqual(run["provider"], "qwen")
         self.assertEqual(run["model"], "qwen3.6-flash")
+        run_config = json.loads(run["config_json"])
+        self.assertEqual(run_config["results_file"], str(results_file))
+        self.assertEqual(run_config["results_file_sha256"], expected_results_hash)
 
     def test_ingest_source_records_images_artifacts_and_ocr_outputs(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -224,6 +384,10 @@ class MlInfrastructureTests(TestCase):
                 ocr = connection.execute("SELECT * FROM ocr_outputs").fetchone()
             self.assertEqual(document["filename_stem"], "Example 2024_001")
             self.assertEqual(document["year"], 2024)
+            self.assertEqual(ocr["text_path"], str(artifacts_dir / "Example 2024_001.txt"))
+            self.assertTrue(ocr["text_sha256"])
+            self.assertEqual(ocr["tsv_path"], str(artifacts_dir / "Example 2024_001.tsv"))
+            self.assertTrue(ocr["tsv_sha256"])
             self.assertEqual(ocr["name_hint"], "Max Mustermann")
             self.assertEqual(ocr["name_confidence"], 91)
 
@@ -259,9 +423,13 @@ class MlInfrastructureTests(TestCase):
             with connect(db_path) as connection:
                 candidate = connection.execute("SELECT * FROM label_candidates").fetchone()
                 output = connection.execute("SELECT * FROM extraction_outputs").fetchone()
+                run = connection.execute("SELECT * FROM runs").fetchone()
             self.assertEqual(candidate["source_kind"], "teacher")
             self.assertEqual(candidate["confidence_score"], 0.9)
             self.assertEqual(output["method"], "vision_model_image_only")
+            run_config = json.loads(run["config_json"])
+            self.assertEqual(run_config["output_csv"], str(output_csv))
+            self.assertEqual(run_config["output_csv_sha256"], sha256_file(output_csv))
 
             second = ingest_results(
                 db_path=db_path,
@@ -336,12 +504,6 @@ class MlInfrastructureTests(TestCase):
             with connect(db_path) as connection:
                 documents = connection.execute("SELECT * FROM documents").fetchall()
                 document = documents[0]
-                source_image_artifacts = connection.execute(
-                    """
-                    SELECT COUNT(*) AS count FROM artifacts
-                    WHERE artifact_type = 'source_image'
-                    """
-                ).fetchone()
                 outputs = connection.execute(
                     "SELECT COUNT(*) AS count FROM extraction_outputs"
                 ).fetchone()
@@ -355,7 +517,6 @@ class MlInfrastructureTests(TestCase):
         self.assertEqual(document["image_path"], str(image_path))
         self.assertTrue(document["image_sha256"])
         self.assertEqual(document["mime_type"], "image/jpeg")
-        self.assertEqual(source_image_artifacts["count"], 1)
         self.assertEqual(outputs["count"], 1)
         self.assertEqual(candidates["count"], 1)
 
@@ -786,6 +947,14 @@ class MlInfrastructureTests(TestCase):
             root = Path(tmp)
             db_path = root / "state" / "test.sqlite3"
             output_file = root / "output" / "router.jsonl"
+            tsv_path = root / "artifacts" / "example.tsv"
+            tsv_path.parent.mkdir()
+            tsv_path.write_text(
+                "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\t"
+                "left\ttop\twidth\theight\tconf\ttext\n"
+                "5\t1\t1\t1\t1\t1\t10\t20\t40\t10\t90\tMax\n",
+                encoding="utf-8",
+            )
             apply_migrations(db_path)
             with connect(db_path) as connection:
                 document_id = upsert_document(
@@ -802,6 +971,8 @@ class MlInfrastructureTests(TestCase):
                     document_id=document_id,
                     run_id=run_id,
                     text="Max Mustermann",
+                    tsv_path=tsv_path,
+                    tsv_sha256=sha256_file(tsv_path),
                     name_hint="Max Mustermann",
                     name_confidence=91,
                     features={
@@ -841,6 +1012,8 @@ class MlInfrastructureTests(TestCase):
         self.assertFalse(row["target"]["cheap_pipeline_failed"])
         self.assertEqual(row["features"]["name_confidence"], 91)
         self.assertEqual(row["features"]["ocr_word_count"], 2)
+        self.assertEqual(row["features"]["tsv_word_count"], 1)
+        self.assertEqual(row["features"]["tsv_mean_confidence"], 90)
         self.assertEqual(row["features"]["source"], "Aichacher Nachrichten")
         self.assertTrue(
             {
