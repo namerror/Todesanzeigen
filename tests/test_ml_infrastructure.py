@@ -697,7 +697,7 @@ class MlInfrastructureTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("Vision Example", response.text)
         self.assertNotIn("Text Example", response.text)
-        self.assertIn('href="/?method=text_extraction"', response.text)
+        self.assertIn('href="/?view=pending&amp;method=text_extraction"', response.text)
         self.assertNotIn('name="method"', response.text)
 
     def test_review_home_page_links_reviewed_ground_truth_items(self) -> None:
@@ -736,15 +736,265 @@ class MlInfrastructureTests(TestCase):
                     fields={"name": "Reviewed"},
                     reviewer="tester",
                 )
+                newer_candidate_id = insert_label_candidate(
+                    connection,
+                    document_id=reviewed_document_id,
+                    source_kind="teacher",
+                    source_name="vision_model_image_only",
+                    fields={"name": "New Alternative"},
+                )
+                connection.execute(
+                    "UPDATE label_candidates SET created_at = datetime('now', '+1 minute') WHERE id = ?",
+                    (newer_candidate_id,),
+                )
 
             client = TestClient(create_review_app(db_path=db_path))
-            response = client.get("/")
+            pending_response = client.get("/")
+            response = client.get("/?view=reviewed")
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("Pending Example", response.text)
-        self.assertIn("Reviewed Ground Truth", response.text)
+        self.assertIn("Pending Example", pending_response.text)
+        self.assertNotIn("Reviewed Example", pending_response.text)
+        self.assertIn("Ground truth", response.text)
         self.assertIn("Reviewed Example", response.text)
-        self.assertIn(f'href="/documents/{reviewed_document_id}"', response.text)
+        self.assertIn("1 newer candidate", response.text)
+        self.assertIn(
+            f'href="/documents/{reviewed_document_id}?view=reviewed&amp;page=1"',
+            response.text,
+        )
+
+    def test_review_document_starts_empty_until_a_source_is_chosen(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except ModuleNotFoundError:
+            self.skipTest("fastapi is not installed")
+
+        from src.todesanzeigen.review import create_review_app
+
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state" / "test.sqlite3"
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="Unreviewed Example",
+                )
+                candidate_id = insert_label_candidate(
+                    connection,
+                    document_id=document_id,
+                    source_kind="pipeline",
+                    source_name="text_extraction",
+                    fields={"name": "Candidate Name", "vorname": "Candidate First"},
+                )
+
+            response = TestClient(create_review_app(db_path=db_path)).get(
+                f"/documents/{document_id}"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('id="name" name="name" value=""', response.text)
+        self.assertIn('id="source-candidate-id" type="hidden" name="source_candidate_id" value=""', response.text)
+        self.assertIn(f'data-candidate-id="{candidate_id}"', response.text)
+        self.assertIn("Candidate Name", response.text)
+        self.assertIn("Fill form", response.text)
+        self.assertIn("Approve as GT", response.text)
+
+    def test_review_document_only_shows_latest_candidate_per_method(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except ModuleNotFoundError:
+            self.skipTest("fastapi is not installed")
+
+        from src.todesanzeigen.review import create_review_app
+
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state" / "test.sqlite3"
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="Candidate Versions",
+                )
+                insert_label_candidate(
+                    connection,
+                    document_id=document_id,
+                    source_kind="pipeline",
+                    source_name="text_extraction",
+                    fields={"name": "Stale Candidate"},
+                )
+                latest_id = insert_label_candidate(
+                    connection,
+                    document_id=document_id,
+                    source_kind="pipeline",
+                    source_name="text_extraction",
+                    fields={"name": "Latest Candidate"},
+                )
+
+            response = TestClient(create_review_app(db_path=db_path)).get(
+                f"/documents/{document_id}"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Latest Candidate", response.text)
+        self.assertNotIn("Stale Candidate", response.text)
+        self.assertIn(f'data-candidate-id="{latest_id}"', response.text)
+
+    def test_direct_approval_replaces_gt_and_preserves_notes(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except ModuleNotFoundError:
+            self.skipTest("fastapi is not installed")
+
+        from src.todesanzeigen.review import create_review_app
+
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state" / "test.sqlite3"
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="Replacement Example",
+                )
+                original_id = insert_label_candidate(
+                    connection,
+                    document_id=document_id,
+                    source_kind="pipeline",
+                    source_name="text_extraction",
+                    fields={"name": "Original"},
+                )
+                replacement_id = insert_label_candidate(
+                    connection,
+                    document_id=document_id,
+                    source_kind="teacher",
+                    source_name="vision_model_image_only",
+                    fields={"name": "Replacement"},
+                )
+                original_label_id = save_ground_truth_label(
+                    connection,
+                    document_id=document_id,
+                    label_set=DEFAULT_LABEL_SET,
+                    fields={"name": "Original"},
+                    source_candidate_id=original_id,
+                    reviewer="first reviewer",
+                    review_notes="keep this context",
+                )
+
+            response = TestClient(
+                create_review_app(db_path=db_path, reviewer="second reviewer")
+            ).post(
+                f"/candidates/{replacement_id}/approve",
+                data={"continue_mode": "stay"},
+                follow_redirects=False,
+            )
+            with connect(db_path) as connection:
+                labels = connection.execute("SELECT * FROM ground_truth_labels").fetchall()
+                candidates = {
+                    row["id"]: row["status"]
+                    for row in connection.execute("SELECT id, status FROM label_candidates")
+                }
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], f"/documents/{document_id}")
+        self.assertEqual(len(labels), 1)
+        self.assertEqual(labels[0]["id"], original_label_id)
+        self.assertEqual(labels[0]["source_candidate_id"], replacement_id)
+        self.assertEqual(labels[0]["review_notes"], "keep this context")
+        self.assertEqual(json.loads(labels[0]["fields_json"])["name"], "Replacement")
+        self.assertEqual(candidates[original_id], "superseded")
+        self.assertEqual(candidates[replacement_id], "approved")
+
+    def test_needs_review_leaves_record_pending_and_advances(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except ModuleNotFoundError:
+            self.skipTest("fastapi is not installed")
+
+        from src.todesanzeigen.review import create_review_app
+
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state" / "test.sqlite3"
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                first_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="First Pending",
+                )
+                second_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="Second Pending",
+                )
+                candidate_id = insert_label_candidate(
+                    connection,
+                    document_id=first_id,
+                    source_kind="pipeline",
+                    source_name="text_extraction",
+                    fields={"name": "First"},
+                )
+                insert_label_candidate(
+                    connection,
+                    document_id=second_id,
+                    source_kind="pipeline",
+                    source_name="text_extraction",
+                    fields={"name": "Second"},
+                )
+
+            response = TestClient(create_review_app(db_path=db_path)).post(
+                f"/documents/{first_id}/needs-review",
+                follow_redirects=False,
+            )
+            with connect(db_path) as connection:
+                gt_count = connection.execute(
+                    "SELECT COUNT(*) AS count FROM ground_truth_labels"
+                ).fetchone()["count"]
+                candidate_status = load_candidate(connection, candidate_id)["status"]
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], f"/documents/{second_id}")
+        self.assertEqual(gt_count, 0)
+        self.assertEqual(candidate_status, "pending")
+
+    def test_label_form_rejects_candidate_from_another_document(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except ModuleNotFoundError:
+            self.skipTest("fastapi is not installed")
+
+        from src.todesanzeigen.review import create_review_app
+
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state" / "test.sqlite3"
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="Target",
+                )
+                other_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="Other",
+                )
+                other_candidate_id = insert_label_candidate(
+                    connection,
+                    document_id=other_id,
+                    source_kind="pipeline",
+                    source_name="text_extraction",
+                    fields={"name": "Wrong Document"},
+                )
+
+            response = TestClient(create_review_app(db_path=db_path)).post(
+                f"/documents/{document_id}/labels",
+                data={"name": "Invalid", "source_candidate_id": str(other_candidate_id)},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("does not belong", response.text)
 
     def test_review_document_page_edits_existing_ground_truth_label(self) -> None:
         try:

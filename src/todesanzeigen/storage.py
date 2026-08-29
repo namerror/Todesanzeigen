@@ -433,6 +433,26 @@ def save_ground_truth_label(
     reviewer: str = "",
     review_notes: str = "",
 ) -> int:
+    previous = connection.execute(
+        """
+        SELECT source_candidate_id
+        FROM ground_truth_labels
+        WHERE ground_truth_labels.document_id = ?
+          AND ground_truth_labels.label_set = ?
+        """,
+        (document_id, label_set),
+    ).fetchone()
+    if source_candidate_id is not None:
+        candidate = connection.execute(
+            "SELECT document_id FROM label_candidates WHERE id = ?",
+            (source_candidate_id,),
+        ).fetchone()
+        if candidate is None:
+            raise ValueError(f"Label candidate does not exist: {source_candidate_id}")
+        if int(candidate["document_id"]) != document_id:
+            raise ValueError(
+                f"Label candidate {source_candidate_id} does not belong to document {document_id}"
+            )
     connection.execute(
         """
         INSERT INTO ground_truth_labels(
@@ -455,6 +475,12 @@ def save_ground_truth_label(
             review_notes,
         ),
     )
+    previous_candidate_id = previous["source_candidate_id"] if previous is not None else None
+    if previous_candidate_id is not None and previous_candidate_id != source_candidate_id:
+        connection.execute(
+            "UPDATE label_candidates SET status = 'superseded' WHERE id = ?",
+            (previous_candidate_id,),
+        )
     if source_candidate_id is not None:
         connection.execute(
             "UPDATE label_candidates SET status = 'approved' WHERE id = ?",
@@ -499,6 +525,7 @@ def pending_review_items(
     label_set: str = DEFAULT_LABEL_SET,
     source_name: str = "",
     limit: int = 50,
+    offset: int = 0,
 ) -> list[sqlite3.Row]:
     method_filter = source_name.strip()
     params: list[Any] = [label_set]
@@ -506,41 +533,94 @@ def pending_review_items(
     if method_filter:
         method_clause = "AND label_candidates.source_name = ?"
         params.append(method_filter)
-    params.append(limit)
+    params.extend((limit, offset))
     return list(
         connection.execute(
             f"""
             SELECT
-                label_candidates.id AS candidate_id,
                 documents.id AS document_id,
                 sources.name AS source,
                 documents.filename_stem,
                 documents.image_path,
-                label_candidates.source_kind,
-                label_candidates.source_name,
-                extraction_outputs.method AS extraction_method,
-                extraction_outputs.provider AS extraction_provider,
-                extraction_outputs.model AS extraction_model,
-                extraction_outputs.method_family,
-                extraction_outputs.route_reason,
-                label_candidates.created_at
-            FROM label_candidates
-            JOIN documents ON documents.id = label_candidates.document_id
+                COUNT(label_candidates.id) AS candidate_count,
+                GROUP_CONCAT(DISTINCT label_candidates.source_name) AS candidate_methods,
+                MIN(label_candidates.created_at) AS first_candidate_at
+            FROM documents
             JOIN sources ON sources.id = documents.source_id
-            LEFT JOIN extraction_outputs
-                ON extraction_outputs.id = label_candidates.extraction_output_id
+            JOIN label_candidates ON label_candidates.document_id = documents.id
             LEFT JOIN ground_truth_labels
                 ON ground_truth_labels.document_id = documents.id
                 AND ground_truth_labels.label_set = ?
-            WHERE label_candidates.status = 'pending'
-              AND ground_truth_labels.id IS NULL
+            WHERE ground_truth_labels.id IS NULL
               {method_clause}
-            ORDER BY label_candidates.created_at, label_candidates.id
-            LIMIT ?
+            GROUP BY documents.id
+            ORDER BY first_candidate_at, documents.id
+            LIMIT ? OFFSET ?
             """,
             params,
         )
     )
+
+
+def pending_review_count(
+    connection: sqlite3.Connection,
+    *,
+    label_set: str = DEFAULT_LABEL_SET,
+    source_name: str = "",
+) -> int:
+    method_filter = source_name.strip()
+    params: list[Any] = [label_set]
+    method_clause = ""
+    if method_filter:
+        method_clause = "AND label_candidates.source_name = ?"
+        params.append(method_filter)
+    row = connection.execute(
+        f"""
+        SELECT COUNT(DISTINCT documents.id) AS count
+        FROM documents
+        JOIN label_candidates ON label_candidates.document_id = documents.id
+        LEFT JOIN ground_truth_labels
+            ON ground_truth_labels.document_id = documents.id
+            AND ground_truth_labels.label_set = ?
+        WHERE ground_truth_labels.id IS NULL
+          {method_clause}
+        """,
+        params,
+    ).fetchone()
+    return int(row["count"])
+
+
+def next_pending_review_document(
+    connection: sqlite3.Connection,
+    *,
+    current_document_id: int,
+    label_set: str = DEFAULT_LABEL_SET,
+    source_name: str = "",
+) -> int | None:
+    method_filter = source_name.strip()
+    params: list[Any] = [label_set, current_document_id]
+    method_clause = ""
+    if method_filter:
+        method_clause = "AND label_candidates.source_name = ?"
+        params.append(method_filter)
+    row = connection.execute(
+        f"""
+        SELECT documents.id, MIN(label_candidates.created_at) AS first_candidate_at
+        FROM documents
+        JOIN label_candidates ON label_candidates.document_id = documents.id
+        LEFT JOIN ground_truth_labels
+            ON ground_truth_labels.document_id = documents.id
+            AND ground_truth_labels.label_set = ?
+        WHERE ground_truth_labels.id IS NULL
+          AND documents.id != ?
+          {method_clause}
+        GROUP BY documents.id
+        ORDER BY first_candidate_at, documents.id
+        LIMIT 1
+        """,
+        params,
+    ).fetchone()
+    return int(row["id"]) if row is not None else None
 
 
 def review_method_options(connection: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -560,6 +640,7 @@ def reviewed_ground_truth_items(
     *,
     label_set: str = DEFAULT_LABEL_SET,
     limit: int = 50,
+    offset: int = 0,
 ) -> list[sqlite3.Row]:
     return list(
         connection.execute(
@@ -576,7 +657,14 @@ def reviewed_ground_truth_items(
                 documents.filename_stem,
                 documents.image_path,
                 label_candidates.source_kind,
-                label_candidates.source_name
+                label_candidates.source_name,
+                (
+                    SELECT COUNT(*)
+                    FROM label_candidates AS newer_candidates
+                    WHERE newer_candidates.document_id = ground_truth_labels.document_id
+                      AND newer_candidates.status = 'pending'
+                      AND newer_candidates.created_at > ground_truth_labels.updated_at
+                ) AS newer_candidate_count
             FROM ground_truth_labels
             JOIN documents ON documents.id = ground_truth_labels.document_id
             JOIN sources ON sources.id = documents.source_id
@@ -584,11 +672,23 @@ def reviewed_ground_truth_items(
                 ON label_candidates.id = ground_truth_labels.source_candidate_id
             WHERE ground_truth_labels.label_set = ?
             ORDER BY ground_truth_labels.updated_at DESC, ground_truth_labels.id DESC
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
-            (label_set, limit),
+            (label_set, limit, offset),
         )
     )
+
+
+def reviewed_ground_truth_count(
+    connection: sqlite3.Connection,
+    *,
+    label_set: str = DEFAULT_LABEL_SET,
+) -> int:
+    row = connection.execute(
+        "SELECT COUNT(*) AS count FROM ground_truth_labels WHERE label_set = ?",
+        (label_set,),
+    ).fetchone()
+    return int(row["count"])
 
 
 def document_review_detail(
@@ -608,12 +708,8 @@ def document_review_detail(
     ).fetchone()
     if document is None:
         raise ValueError(f"Document does not exist: {document_id}")
-    candidates = [
-        {
-            **dict(row),
-            "fields": _loads(row["fields_json"]),
-        }
-        for row in connection.execute(
+    candidate_rows = list(
+        connection.execute(
             """
             SELECT
                 label_candidates.*,
@@ -621,7 +717,9 @@ def document_review_detail(
                 extraction_outputs.provider AS extraction_provider,
                 extraction_outputs.model AS extraction_model,
                 extraction_outputs.method_family,
-                extraction_outputs.route_reason
+                extraction_outputs.route_reason,
+                extraction_outputs.result_slot,
+                extraction_outputs.superseded_at
             FROM label_candidates
             LEFT JOIN extraction_outputs
                 ON extraction_outputs.id = label_candidates.extraction_output_id
@@ -630,11 +728,35 @@ def document_review_detail(
             """,
             (document_id,),
         )
-    ]
+    )
+    candidates: list[dict[str, Any]] = []
+    seen_methods: set[str] = set()
+    for row in candidate_rows:
+        method_key = str(
+            row["extraction_method"] or row["source_name"] or row["source_kind"] or row["id"]
+        )
+        if method_key in seen_methods:
+            continue
+        seen_methods.add(method_key)
+        candidates.append({**dict(row), "fields": _loads(row["fields_json"])})
     ground_truth = connection.execute(
         """
-        SELECT * FROM ground_truth_labels
-        WHERE document_id = ? AND label_set = ?
+        SELECT
+            ground_truth_labels.*,
+            label_candidates.source_kind AS source_kind,
+            label_candidates.source_name AS source_name,
+            extraction_outputs.method AS extraction_method,
+            extraction_outputs.provider AS extraction_provider,
+            extraction_outputs.model AS extraction_model,
+            extraction_outputs.method_family AS method_family,
+            extraction_outputs.route_reason AS route_reason
+        FROM ground_truth_labels
+        LEFT JOIN label_candidates
+            ON label_candidates.id = ground_truth_labels.source_candidate_id
+        LEFT JOIN extraction_outputs
+            ON extraction_outputs.id = label_candidates.extraction_output_id
+        WHERE ground_truth_labels.document_id = ?
+          AND ground_truth_labels.label_set = ?
         """,
         (document_id, label_set),
     ).fetchone()

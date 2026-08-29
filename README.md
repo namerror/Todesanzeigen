@@ -439,10 +439,18 @@ Then open:
 http://127.0.0.1:8000
 ```
 
-The review UI shows pending candidates, the source image, the latest OCR text,
-and an editable structured-label form. You can approve a candidate directly or
-edit fields before saving. Saved labels are written to the default label set
-`gt-v1`.
+The review UI has separate **Needs review** and **Ground truth** views. On a
+record page it shows the source image, OCR text, current GT when available, and
+a field-by-field comparison of the latest result from each extraction method.
+The GT editor starts empty for an unreviewed record: use **Fill form** on the
+text or VLM result to choose an explicit starting source, or enter a label
+manually. **Approve as GT** accepts a method result directly.
+
+There is one GT row per document and label set. Saving or approving a different
+source replaces that row rather than creating another one; the UI asks for
+confirmation when a direct approval would replace existing GT. **Needs review
+— next** leaves the record pending and moves on without changing candidate
+statuses. Saved labels use the default label set `gt-v1`.
 
 Use a custom label set when needed:
 
