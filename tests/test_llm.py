@@ -5,6 +5,8 @@ from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import Mock, patch
 
 from src.todesanzeigen.llm import (
+    MODEL_RESPONSE_COLUMNS,
+    QWEN_VISION_RESPONSE_FORMAT,
     QwenProvider,
     QwenSettings,
     QwenVisionProvider,
@@ -144,7 +146,7 @@ class QwenVisionSettingsTests(TestCase):
             settings = QwenVisionSettings.from_env()
 
         self.assertEqual(settings.api_key, "key")
-        self.assertEqual(settings.model, "qwen-vl-ocr")
+        self.assertEqual(settings.model, "qwen3.7-plus-2026-05-26")
         self.assertEqual(
             settings.base_url,
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -261,7 +263,7 @@ class QwenVisionProviderTests(TestCase):
                 provider = QwenVisionProvider(
                     QwenVisionSettings(
                         api_key="key",
-                        model="qwen-vl-ocr",
+                        model="qwen3.7-plus-2026-05-26",
                         base_url="https://example.test/compatible-mode/v1",
                     )
                 )
@@ -270,8 +272,16 @@ class QwenVisionProviderTests(TestCase):
         self.assertEqual(result, '{"name":"Vision"}')
         completions.create.assert_called_once()
         kwargs = completions.create.call_args.kwargs
-        self.assertEqual(kwargs["model"], "qwen-vl-ocr")
-        self.assertEqual(kwargs["response_format"], {"type": "json_object"})
+        self.assertEqual(kwargs["model"], "qwen3.7-plus-2026-05-26")
+        self.assertEqual(kwargs["response_format"], QWEN_VISION_RESPONSE_FORMAT)
+        self.assertEqual(kwargs["extra_body"], {"enable_thinking": False})
+        schema = kwargs["response_format"]["json_schema"]["schema"]
+        self.assertEqual(schema["required"], MODEL_RESPONSE_COLUMNS)
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(
+            schema["properties"]["geschlecht"]["enum"],
+            ["", "männlich", "weiblich"],
+        )
         content = kwargs["messages"][0]["content"]
         self.assertEqual(content[0], {"type": "text", "text": "Bitte JSON extrahieren."})
         self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
@@ -318,3 +328,39 @@ class QwenAsyncProviderTests(IsolatedAsyncioTestCase):
             response_format={"type": "json_object"},
             temperature=0,
         )
+
+    async def test_qwen_vision_provider_uses_strict_schema_without_thinking(self) -> None:
+        completion = types.SimpleNamespace(
+            choices=[
+                types.SimpleNamespace(
+                    message=types.SimpleNamespace(content='{"nachname":"Mustermann"}')
+                )
+            ]
+        )
+        calls = Mock()
+
+        async def create_completion(**kwargs: object) -> object:
+            calls(**kwargs)
+            return completion
+
+        async_client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(
+                completions=types.SimpleNamespace(create=create_completion)
+            )
+        )
+        openai_module = types.ModuleType("openai")
+        openai_module.OpenAI = Mock()
+        openai_module.AsyncOpenAI = Mock(return_value=async_client)
+
+        with TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "example.jpg"
+            image_path.write_bytes(b"image-bytes")
+            with patch.dict("sys.modules", {"openai": openai_module}):
+                provider = QwenVisionProvider(QwenVisionSettings(api_key="key"))
+                result = await provider.async_vision_complete(
+                    "Bitte JSON extrahieren.", image_path, "image/jpeg"
+                )
+
+        self.assertEqual(result, '{"nachname":"Mustermann"}')
+        self.assertEqual(calls.call_args.kwargs["response_format"], QWEN_VISION_RESPONSE_FORMAT)
+        self.assertEqual(calls.call_args.kwargs["extra_body"], {"enable_thinking": False})

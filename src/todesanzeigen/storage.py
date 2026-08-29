@@ -322,7 +322,7 @@ def insert_extraction_output(
     status: str,
     provider: str = "",
     model: str = "",
-    prompt_version: str = "death_notice_v2",
+    prompt_version: str = "death_notice_v3",
     raw_response: str = "",
     error: str = "",
     attempts: int = 0,

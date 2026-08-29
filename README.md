@@ -65,13 +65,13 @@ Qwen base URLs are region-specific. Override `QWEN_BASE_URL` if your API key is
 for another region, such as `https://dashscope-us.aliyuncs.com/compatible-mode/v1`
 for US Virginia.
 
-Low-confidence OCR/name cases can be sent directly to a vision model. Qwen OCR
-is the default reroute provider:
+Low-confidence OCR/name cases can be sent directly to a vision model. Qwen is
+the default reroute provider:
 
 ```sh
 TODESANZEIGEN_REROUTE_PROVIDER=qwen
-TODESANZEIGEN_REROUTE_MODEL=qwen-vl-ocr
-QWEN_VISION_MODEL=qwen-vl-ocr
+TODESANZEIGEN_REROUTE_MODEL=qwen3.7-plus-2026-05-26
+QWEN_VISION_MODEL=qwen3.7-plus-2026-05-26
 QWEN_VISION_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 ```
 
@@ -91,7 +91,7 @@ defaults to the reroute provider settings, but can be configured separately:
 
 ```sh
 TODESANZEIGEN_VISION_PROVIDER=qwen
-TODESANZEIGEN_VISION_MODEL=qwen-vl-ocr
+TODESANZEIGEN_VISION_MODEL=qwen3.7-plus-2026-05-26
 TODESANZEIGEN_VISION_CONCURRENCY=1
 ```
 
@@ -297,7 +297,7 @@ todesanzeigen vision-extract \
   --input-dir "input/Aichacher Nachrichten" \
   --source "Aichacher Nachrichten" \
   --provider qwen \
-  --model qwen-vl-ocr \
+  --model qwen3.7-plus-2026-05-26 \
   --limit 25 \
   --sample-seed 42
 ```
@@ -306,6 +306,8 @@ This records candidate rows in SQLite with `method=vision_model_image_only`,
 `method_family=vlm`, and `route_reason=image_only`. Results are checkpointed by
 default in `logs/vision-results.jsonl`. The default candidate kind is `teacher`
 because this command is intended to bootstrap review candidates for ground truth.
+Qwen vision requests use a strict response schema. The model sees `nachname`,
+while SQLite and CSV output retain the legacy `name` field for compatibility.
 
 Useful dataset selection options:
 

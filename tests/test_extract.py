@@ -8,6 +8,9 @@ from unittest.mock import patch
 from src.todesanzeigen.extract import (
     AsyncExtractionSettings,
     VisionRerouteSettings,
+    build_extraction_prompt,
+    build_image_only_vision_extraction_prompt,
+    build_vision_extraction_prompt,
     discover_artifacts,
     estimate_llm_tokens,
     extract_artifacts_to_csv,
@@ -16,6 +19,7 @@ from src.todesanzeigen.extract import (
     extract_images_to_csv_async,
     load_reroute_candidates,
     load_name_map,
+    normalize_record,
     parse_json_object,
     reroute_candidates_to_csv_async,
     select_image_paths,
@@ -121,16 +125,59 @@ class ExtractTests(TestCase):
             self.assertIn('"Max Mustermann"', provider.prompts[0])
             self.assertNotIn("OCR-Layout aus TSV", provider.prompts[0])
             prompt_fields = provider.prompts[0].split("Regeln:")[0]
+            prompt_keys = prompt_fields.strip().splitlines()[-1].split(", ")
+            self.assertIn("nachname", prompt_keys)
+            self.assertNotIn("name", prompt_keys)
             self.assertNotIn("foto", prompt_fields)
             self.assertNotIn("bemerkungen", prompt_fields)
             self.assertNotIn("quelle", prompt_fields)
             self.assertNotIn("dateiname", prompt_fields)
             self.assertNotIn("wohnort", prompt_fields)
             self.assertIn("DD.MM.YYYY", provider.prompts[0])
-            self.assertIn("direkt darunter zwei Orte", provider.prompts[0])
+            self.assertNotIn("direkt darunter zwei Orte", provider.prompts[0])
+            self.assertNotIn("Ort und Wohnort", provider.prompts[0])
+            self.assertIn('"männlich", "weiblich"', provider.prompts[0])
             self.assertNotIn("foto ist", provider.prompts[0])
             self.assertNotIn("quelle muss", provider.prompts[0])
             self.assertNotIn("dateiname muss", provider.prompts[0])
+
+    def test_all_prompts_share_the_nachname_field_contract(self) -> None:
+        name_hint = type("NameHint", (), {"name": "Max Mustermann", "confidence": 90.0})()
+        prompts = [
+            build_extraction_prompt(
+                "OCR", filename="example.txt", name_hint=name_hint
+            ),
+            build_vision_extraction_prompt(
+                "OCR", filename="example.txt", name_hint=name_hint
+            ),
+            build_image_only_vision_extraction_prompt(filename="example.jpg"),
+        ]
+
+        for prompt in prompts:
+            prompt_fields = prompt.split("Regeln:")[0]
+            prompt_keys = prompt_fields.strip().splitlines()[-1].split(", ")
+            self.assertIn("nachname", prompt_keys)
+            self.assertNotIn("name", prompt_keys)
+            self.assertNotIn("wohnort", prompt_keys)
+            self.assertNotIn("Ort und Wohnort", prompt)
+            self.assertNotIn("direkt darunter zwei Orte", prompt)
+            self.assertIn("Veranstaltungs-", prompt)
+
+        self.assertNotIn("schwachen lokalen Lauf", prompts[1])
+
+    def test_normalize_record_maps_nachname_to_legacy_name(self) -> None:
+        row = normalize_record(
+            {"nachname": "Mustermann", "name": "Legacy"},
+            filename="example",
+        )
+
+        self.assertEqual(row["name"], "Mustermann")
+        self.assertNotIn("nachname", row)
+
+    def test_normalize_record_accepts_legacy_name_responses(self) -> None:
+        row = normalize_record({"name": "Mustermann"}, filename="example")
+
+        self.assertEqual(row["name"], "Mustermann")
 
     def test_extract_skips_low_confidence_artifact_and_logs_warning(self) -> None:
         with TemporaryDirectory() as tmp:

@@ -13,7 +13,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .llm import CSV_COLUMNS, STORED_COLUMNS, LlmProvider, VisionLlmProvider
+from .llm import (
+    CSV_COLUMNS,
+    MODEL_RESPONSE_COLUMNS,
+    LlmProvider,
+    VisionLlmProvider,
+)
 from .methods import (
     TEXT_EXTRACTION_METHOD,
     VISION_IMAGE_ONLY_METHOD,
@@ -75,7 +80,7 @@ class DbExtractionRecord:
     estimated_tokens: int | None = None
     latency_ms: int | None = None
     image_path: Path | None = None
-    prompt_version: str = "death_notice_v2"
+    prompt_version: str = "death_notice_v3"
     provider_name: str = ""
     model_name: str = ""
 
@@ -86,8 +91,22 @@ VISION_FAILED_STATUS = "vision_failed"
 CACHED_EXISTING_STATUS = "cached_existing"
 PROCESSED_STATUSES = {"processed", "rerouted_processed", VISION_PROCESSED_STATUS}
 CHECKPOINT_REUSE_STATUSES = {"processed", "rerouted_processed", "skipped_low_confidence"}
-LLM_EXCLUDED_COLUMNS = {"foto", "bemerkungen", "quelle", "dateiname"}
-LLM_PROMPT_COLUMNS = [column for column in STORED_COLUMNS if column not in LLM_EXCLUDED_COLUMNS]
+LLM_PROMPT_COLUMNS = MODEL_RESPONSE_COLUMNS
+
+MODEL_FIELD_RULES = """- geschlecht ist exakt \"männlich\", \"weiblich\" oder \"\".
+- nachname ist ausschliesslich der aktuelle Nachname der verstorbenen Person, ohne Vorname, Titel oder Geburtsname.
+- vorname enthaelt ausschliesslich den Vornamen beziehungsweise die Vornamen der verstorbenen Person.
+- geburtsdatum und sterbedatum enthalten nur explizite Daten und verwenden exakt DD.MM.YYYY, z.B. \"04.09.1937\".
+- geburtsname enthaelt nur einen ausdruecklich genannten Geburts- oder Maedchennamen der verstorbenen Person.
+- titel enthaelt nur einen akademischen, adligen oder sonstigen Titel der verstorbenen Person, keine Ueberschrift oder Familienrolle.
+- genannt enthaelt nur einen ausdruecklich genannten Rufnamen, Spitznamen oder Alias der verstorbenen Person.
+- geburtsort und sterbeort werden nur bei ausdruecklicher Kennzeichnung als solche befuellt.
+- ort ist der zuerst genannte allgemeine Ort aus einer Ortszeile zur verstorbenen Person.
+- weitere_orte enthaelt weitere allgemeine Orte derselben Art, kommasepariert.
+- Geburts-, Sterbe-, Veranstaltungs-, Kirchen-, Friedhofs- und Bestattungsorte gehoeren nicht in ort oder weitere_orte.
+- beruf enthaelt nur den Beruf der verstorbenen Person, keine Verwandtschaftsrolle.
+- zusaetzliche_hinweise enthaelt kurze Hinweise auf relevante Unklarheiten oder schwer lesbare Stellen.
+- confidence_score ist eine Zahl von 0 bis 1 als String, z.B. \"0.82\"."""
 
 
 def discover_artifacts(artifacts_dir: Path) -> list[Path]:
@@ -114,14 +133,8 @@ Gib ausschliesslich ein einzelnes valides JSON-Objekt zurueck. Verwende exakt di
 {columns}
 
 Regeln:
-- confidence_score ist eine Zahl von 0 bis 1 als String, z.B. "0.82".
+{MODEL_FIELD_RULES}
 - Fehlende oder unsichere Felder bleiben "".
-- geburtsdatum und sterbedatum muessen exakt DD.MM.YYYY verwenden, z.B. "04.09.1937".
-- Ort und Wohnort sind dasselbe Konzept. Gib nur ort zurueck.
-- Bei mehreren sonstigen Orten kommt der zuerst genannte in ort; weitere kommen in weitere_orte.
-- Orte, die als geburtsort oder sterbeort zugeordnet sind, kommen nicht zusaetzlich in ort oder weitere_orte.
-- Stehen Geburts- und Sterbedatum nebeneinander und direkt darunter zwei Orte, ordne den linken Ort dem Geburtsdatum und den rechten Ort dem Sterbedatum zu.
-- Unsicherheiten, OCR-Probleme und Interpretationshinweise kommen in zusaetzliche_hinweise.
 - Erfinde keine Daten.
 - Nutze das lokale OCR-Name-Signal als Zusatzhinweis fuer den Namen der verstorbenen Person.
 - Verwende das lokale OCR-Name-Signal nur als Hinweis; bei Widerspruch zaehlt der erkennbare OCR-Text.
@@ -152,14 +165,8 @@ Gib ausschliesslich ein einzelnes valides JSON-Objekt zurueck. Verwende exakt di
 
 Regeln:
 - Lies den Text direkt aus dem Bild. Das Bild ist die massgebliche Quelle.
-- confidence_score ist eine Zahl von 0 bis 1 als String, z.B. "0.82".
+{MODEL_FIELD_RULES}
 - Fehlende oder unsichere Felder bleiben "".
-- geburtsdatum und sterbedatum muessen exakt DD.MM.YYYY verwenden, z.B. "04.09.1937".
-- Ort und Wohnort sind dasselbe Konzept. Gib nur ort zurueck.
-- Bei mehreren sonstigen Orten kommt der zuerst genannte in ort; weitere kommen in weitere_orte.
-- Orte, die als geburtsort oder sterbeort zugeordnet sind, kommen nicht zusaetzlich in ort oder weitere_orte.
-- Stehen Geburts- und Sterbedatum nebeneinander und direkt darunter zwei Orte, ordne den linken Ort dem Geburtsdatum und den rechten Ort dem Sterbedatum zu.
-- Unsicherheiten, schwer lesbare Stellen und Interpretationshinweise kommen in zusaetzliche_hinweise.
 - Erfinde keine Daten.
 - Nutze den OCR-Text und das lokale OCR-Name-Signal nur als Zusatzhinweise.
 - Bei Widerspruch zaehlt der im Bild erkennbare Text.
@@ -167,7 +174,7 @@ Regeln:
 Lokales OCR-Name-Signal:
 {name_signal}
 
-OCR-Text aus dem schwachen lokalen Lauf:
+Lokaler OCR-Text als Zusatzhinweis:
 {ocr_hint}
 """
 
@@ -186,14 +193,8 @@ Gib ausschliesslich ein einzelnes valides JSON-Objekt zurueck. Verwende exakt di
 
 Regeln:
 - Das Bild ist die einzige Quelle.
-- confidence_score ist eine Zahl von 0 bis 1 als String, z.B. "0.82".
+{MODEL_FIELD_RULES}
 - Fehlende oder unsichere Felder bleiben "".
-- geburtsdatum und sterbedatum muessen exakt DD.MM.YYYY verwenden, z.B. "04.09.1937".
-- Ort und Wohnort sind dasselbe Konzept. Gib nur ort zurueck.
-- Bei mehreren sonstigen Orten kommt der zuerst genannte in ort; weitere kommen in weitere_orte.
-- Orte, die als geburtsort oder sterbeort zugeordnet sind, kommen nicht zusaetzlich in ort oder weitere_orte.
-- Orte direkt unter Geburts- und Sterbedatum werden anhand ihrer visuellen Position zugeordnet.
-- Unsicherheiten, schwer lesbare Stellen und Interpretationshinweise kommen in zusaetzliche_hinweise.
 - Erfinde keine Daten.
 """
 
@@ -302,8 +303,11 @@ def parse_json_object(response_text: str) -> dict[str, Any]:
 
 
 def normalize_record(data: dict[str, Any], *, filename: str, source: str = "") -> dict[str, str]:
+    model_data = dict(data)
+    if "nachname" in model_data:
+        model_data["name"] = model_data.pop("nachname")
     record = {
-        **data,
+        **model_data,
         "foto": "",
         "bemerkungen": "",
         "quelle": source,

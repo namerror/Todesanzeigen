@@ -34,6 +34,69 @@ CSV_COLUMNS = [
 
 STORED_COLUMNS = [column for column in CSV_COLUMNS if column != "wohnort"]
 
+# Model-facing extraction contract. ``nachname`` is intentionally translated to
+# the legacy ``name`` field at the persistence boundary in extract.py.
+MODEL_RESPONSE_COLUMNS = [
+    "geschlecht",
+    "nachname",
+    "vorname",
+    "geburtsdatum",
+    "sterbedatum",
+    "geburtsname",
+    "titel",
+    "genannt",
+    "geburtsort",
+    "sterbeort",
+    "ort",
+    "weitere_orte",
+    "beruf",
+    "zusaetzliche_hinweise",
+    "confidence_score",
+]
+
+_MODEL_FIELD_DESCRIPTIONS = {
+    "geschlecht": 'Exakt "männlich", "weiblich" oder leer.',
+    "nachname": "Aktueller Nachname der verstorbenen Person, ohne Vorname, Titel oder Geburtsname.",
+    "vorname": "Vorname beziehungsweise Vornamen der verstorbenen Person.",
+    "geburtsdatum": 'Explizites Geburtsdatum im Format DD.MM.YYYY oder leer.',
+    "sterbedatum": 'Explizites Sterbedatum im Format DD.MM.YYYY oder leer.',
+    "geburtsname": "Nur ein ausdrücklich genannter Geburts- oder Mädchenname der verstorbenen Person.",
+    "titel": "Akademischer, adliger oder sonstiger Titel der verstorbenen Person.",
+    "genannt": "Nur ein ausdrücklich genannter Rufname, Spitzname oder Alias der verstorbenen Person.",
+    "geburtsort": "Nur ein ausdrücklich als Geburtsort genannter Ort.",
+    "sterbeort": "Nur ein ausdrücklich als Sterbeort genannter Ort.",
+    "ort": "Erster allgemeiner Ort aus einer Ortszeile zur verstorbenen Person; kein Veranstaltungs-, Kirchen-, Friedhofs-, Bestattungs-, Geburts- oder Sterbeort.",
+    "weitere_orte": "Weitere allgemeine Orte derselben Art, kommasepariert; keine Veranstaltungs-, Kirchen-, Friedhofs-, Bestattungs-, Geburts- oder Sterbeorte.",
+    "beruf": "Nur der Beruf der verstorbenen Person, keine Verwandtschaftsrolle.",
+    "zusaetzliche_hinweise": "Kurzer Hinweis auf relevante Unklarheiten oder schwer lesbare Stellen.",
+    "confidence_score": 'Gesamtkonfidenz als Dezimalzahl von 0 bis 1 im Stringformat, zum Beispiel "0.82".',
+}
+
+QWEN_VISION_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "death_notice_extraction",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                field: {
+                    "type": "string",
+                    "description": _MODEL_FIELD_DESCRIPTIONS[field],
+                    **(
+                        {"enum": ["", "männlich", "weiblich"]}
+                        if field == "geschlecht"
+                        else {}
+                    ),
+                }
+                for field in MODEL_RESPONSE_COLUMNS
+            },
+            "required": MODEL_RESPONSE_COLUMNS,
+            "additionalProperties": False,
+        },
+    },
+}
+
 
 class LlmProvider(Protocol):
     provider_name: str
@@ -276,7 +339,7 @@ class QwenProvider:
 @dataclass(frozen=True)
 class QwenVisionSettings:
     api_key: str
-    model: str = "qwen-vl-ocr"
+    model: str = "qwen3.7-plus-2026-05-26"
     base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
     @classmethod
@@ -285,7 +348,7 @@ class QwenVisionSettings:
         if not api_key:
             raise ConfigError("Missing required Qwen environment variable: DASHSCOPE_API_KEY")
 
-        model = os.getenv("QWEN_VISION_MODEL", "qwen-vl-ocr").strip()
+        model = os.getenv("QWEN_VISION_MODEL", "qwen3.7-plus-2026-05-26").strip()
         base_url = os.getenv(
             "QWEN_VISION_BASE_URL",
             os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
@@ -307,8 +370,9 @@ class QwenVisionProvider:
         completion = self._client.chat.completions.create(
             model=self._model,
             messages=[_vision_chat_message(prompt, image_path, mime_type)],
-            response_format={"type": "json_object"},
+            response_format=QWEN_VISION_RESPONSE_FORMAT,
             temperature=0,
+            extra_body={"enable_thinking": False},
         )
         content = completion.choices[0].message.content
         if content:
@@ -324,8 +388,9 @@ class QwenVisionProvider:
         completion = await self._async_client.chat.completions.create(
             model=self._model,
             messages=[_vision_chat_message(prompt, image_path, mime_type)],
-            response_format={"type": "json_object"},
+            response_format=QWEN_VISION_RESPONSE_FORMAT,
             temperature=0,
+            extra_body={"enable_thinking": False},
         )
         content = completion.choices[0].message.content
         if content:
