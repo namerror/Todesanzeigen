@@ -1,0 +1,30 @@
+[defaults]
+text = "text_current"
+vlm = "vlm_current"
+
+[[variants]]
+alias = "text_current"
+label = "Text · Qwen 3.6 Flash · prompt v3"
+method = "text_extraction"
+provider = "qwen"
+model = "qwen3.6-flash"
+prompt_version = "death_notice_v3"
+review_enabled = true
+
+[[variants]]
+alias = "vlm_current"
+label = "VLM · Qwen 3.7 Plus · prompt v3"
+method = "vision_model_image_only"
+provider = "qwen"
+model = "qwen3.7-plus-2026-05-26"
+prompt_version = "death_notice_v3"
+review_enabled = true
+
+[[variants]]
+alias = "text_qwen36_prompt_v1"
+label = "Text · Qwen 3.6 Flash · prompt v1"
+method = "text_extraction"
+provider = "qwen"
+model = "qwen3.6-flash"
+prompt_version = "death_notice_v1"
+review_enabled = false

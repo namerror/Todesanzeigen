@@ -26,6 +26,7 @@ from .storage import (
     reviewed_ground_truth_items,
     save_ground_truth_label,
 )
+from .variants import DEFAULT_VARIANTS_CONFIG_PATH, ExtractionVariant, load_variant_config
 
 PAGE_SIZE = 50
 FIELD_LABELS = {
@@ -47,7 +48,8 @@ LONG_FIELDS = {"weitere_orte", "beruf", "bemerkungen", "zusaetzliche_hinweise"}
 
 
 def create_review_app(
-    *, db_path: Path = DEFAULT_DB_PATH, label_set: str = DEFAULT_LABEL_SET, reviewer: str = ""
+    *, db_path: Path = DEFAULT_DB_PATH, label_set: str = DEFAULT_LABEL_SET, reviewer: str = "",
+    variants_config: Path = DEFAULT_VARIANTS_CONFIG_PATH,
 ) -> Any:
     try:
         from fastapi import FastAPI, HTTPException
@@ -60,6 +62,7 @@ def create_review_app(
         ) from exc
 
     apply_migrations(db_path)
+    variant_config = load_variant_config(variants_config)
     app = FastAPI(title="Todesanzeigen Review")
 
     @app.get("/", response_class=HTMLResponse)
@@ -104,8 +107,9 @@ def create_review_app(
         with connect(db_path) as connection:
             detail = document_review_detail(connection, document_id=document_id, label_set=label_set)
         fields = _initial_fields(detail)
-        candidates = [_prepare_candidate(candidate) for candidate in detail["candidates"]]
-        candidates.sort(key=_candidate_sort_key)
+        candidates = _select_review_candidates(
+            detail["candidates"], variant_config.review_variants
+        )
         detail["candidates"] = candidates
         comparison_sources: list[dict[str, Any]] = []
         if detail["ground_truth"] is not None:
@@ -196,12 +200,22 @@ def create_review_app(
 def serve_review_app(
     *, db_path: Path = DEFAULT_DB_PATH, label_set: str = DEFAULT_LABEL_SET,
     reviewer: str = "", host: str = "127.0.0.1", port: int = 8000,
+    variants_config: Path = DEFAULT_VARIANTS_CONFIG_PATH,
 ) -> None:
     try:
         import uvicorn
     except ImportError as exc:
         raise RuntimeError("Review UI requires uvicorn. Install project dependencies before running it.") from exc
-    uvicorn.run(create_review_app(db_path=db_path, label_set=label_set, reviewer=reviewer), host=host, port=port)
+    uvicorn.run(
+        create_review_app(
+            db_path=db_path,
+            label_set=label_set,
+            reviewer=reviewer,
+            variants_config=variants_config,
+        ),
+        host=host,
+        port=port,
+    )
 
 
 def _initial_fields(detail: dict[str, Any]) -> dict[str, str]:
@@ -223,16 +237,57 @@ def _initial_source_label(detail: dict[str, Any]) -> str:
     return f"Current GT · {_method_label(str(source))}"
 
 
-def _prepare_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+def _prepare_candidate(
+    candidate: dict[str, Any], variant: ExtractionVariant | None = None
+) -> dict[str, Any]:
     method = str(candidate.get("extraction_method") or candidate.get("source_name") or "candidate")
-    prepared = {**candidate, "fields": _fields(candidate.get("fields", {})), "label": _method_label(method)}
+    prepared = {
+        **candidate,
+        "fields": _fields(candidate.get("fields", {})),
+        "label": variant.label if variant is not None else _method_label(method),
+        "variant_alias": variant.alias if variant is not None else "",
+    }
     prepared["meta"] = " · ".join(
         value for value in (
             str(candidate.get("method_family") or ""), str(candidate.get("extraction_provider") or ""),
-            str(candidate.get("extraction_model") or ""), str(candidate.get("route_reason") or ""),
+            str(candidate.get("extraction_model") or ""),
+            str(candidate.get("extraction_prompt_version") or ""),
+            str(candidate.get("route_reason") or ""),
         ) if value
     )
     return prepared
+
+
+def _select_review_candidates(
+    candidates: list[dict[str, Any]], variants: tuple[ExtractionVariant, ...]
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    seen_unlinked_sources: set[str] = set()
+    for candidate in candidates:
+        if candidate.get("extraction_output_id") is not None:
+            continue
+        source = str(candidate.get("source_name") or candidate.get("source_kind") or candidate["id"])
+        if source in seen_unlinked_sources:
+            continue
+        seen_unlinked_sources.add(source)
+        selected.append(_prepare_candidate(candidate))
+    for variant in variants:
+        match = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate.get("superseded_at") is None
+                and str(candidate.get("extraction_method") or "") == variant.method
+                and str(candidate.get("extraction_provider") or "") == variant.provider
+                and str(candidate.get("extraction_model") or "") == variant.model
+                and str(candidate.get("extraction_prompt_version") or "")
+                == variant.prompt_version
+            ),
+            None,
+        )
+        if match is not None:
+            selected.append(_prepare_candidate(match, variant))
+    return selected
 
 
 def _prepare_pending_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -240,16 +295,6 @@ def _prepare_pending_item(item: dict[str, Any]) -> dict[str, Any]:
     priorities = {"text_extraction": 0, "vision_model_image_only": 1, "vision_model_reroute": 2}
     methods.sort(key=lambda method: (priorities.get(method, 99), method))
     return {**item, "methods": [_method_label(method) for method in methods]}
-
-
-def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[int, str]:
-    method = str(candidate.get("extraction_method") or candidate.get("source_name") or "")
-    priority = {
-        "text_extraction": 0,
-        "vision_model_image_only": 1,
-        "vision_model_reroute": 2,
-    }
-    return priority.get(method, 99), method
 
 
 def _prepare_reviewed_item(item: dict[str, Any]) -> dict[str, Any]:

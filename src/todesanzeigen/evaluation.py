@@ -8,6 +8,7 @@ from typing import Any
 from .llm import STORED_COLUMNS
 from .storage import (
     DEFAULT_DB_PATH,
+    active_extraction_for_variant,
     apply_migrations,
     all_documents,
     connect,
@@ -15,8 +16,8 @@ from .storage import (
     ground_truth_rows,
     insert_evaluation_result,
     insert_evaluation_run,
-    latest_extraction_by_method,
 )
+from .variants import DEFAULT_VARIANTS_CONFIG_PATH, load_variant_config
 
 
 @dataclass(frozen=True)
@@ -30,12 +31,20 @@ class SplitSummary:
 @dataclass(frozen=True)
 class EvaluationSummary:
     evaluation_run_id: int
+    variant_alias: str
     documents: int
     exact_record_accuracy: float
     field_precision: float
     field_recall: float
     field_f1: float
     missing_predictions: int
+    estimated_tokens_total: int | None
+    estimated_tokens_count: int
+    latency_ms_total: int | None
+    latency_ms_mean: float | None
+    latency_ms_count: int
+    cost_usd_total: float | None
+    cost_usd_count: int
 
 
 def create_source_year_split(
@@ -82,14 +91,16 @@ def create_source_year_split(
     )
 
 
-def evaluate_method(
+def evaluate_variant(
     *,
     db_path: Path = DEFAULT_DB_PATH,
     label_set: str,
-    method: str,
+    variant_alias: str,
+    variants_config: Path = DEFAULT_VARIANTS_CONFIG_PATH,
     split_name: str = "",
     name: str | None = None,
 ) -> EvaluationSummary:
+    variant = load_variant_config(variants_config).variant(variant_alias)
     apply_migrations(db_path)
     with connect(db_path) as connection:
         labels = ground_truth_rows(connection, label_set=label_set, split_name=split_name)
@@ -101,13 +112,21 @@ def evaluate_method(
             "documents": len(labels),
             "missing_predictions": 0,
         }
+        telemetry: dict[str, list[float]] = {
+            "estimated_tokens": [],
+            "latency_ms": [],
+            "cost_usd": [],
+        }
         per_document: list[dict[str, Any]] = []
         for label in labels:
             truth = _loads(label["fields_json"])
-            prediction_row = latest_extraction_by_method(
+            prediction_row = active_extraction_for_variant(
                 connection,
                 document_id=int(label["document_id"]),
-                method=method,
+                method=variant.method,
+                provider=variant.provider,
+                model=variant.model,
+                prompt_version=variant.prompt_version,
             )
             if prediction_row is None:
                 totals["missing_predictions"] += 1
@@ -131,6 +150,10 @@ def evaluate_method(
                 totals["fn"] += len(field_results)
                 continue
 
+            for key in telemetry:
+                if prediction_row[key] is not None:
+                    telemetry[key].append(float(prediction_row[key]))
+
             prediction = _loads(prediction_row["fields_json"])
             field_results, exact = _compare_fields(truth, prediction)
             counts = _field_counts(field_results)
@@ -151,6 +174,9 @@ def evaluate_method(
         recall = _safe_div(totals["tp"], totals["tp"] + totals["fn"])
         f1 = _safe_div(2 * precision * recall, precision + recall)
         exact_accuracy = _safe_div(totals["exact"], totals["documents"])
+        estimated_tokens_total = _sum_or_none(telemetry["estimated_tokens"], integer=True)
+        latency_ms_total = _sum_or_none(telemetry["latency_ms"], integer=True)
+        cost_usd_total = _sum_or_none(telemetry["cost_usd"])
         metrics = {
             "documents": totals["documents"],
             "exact_record_accuracy": exact_accuracy,
@@ -158,14 +184,21 @@ def evaluate_method(
             "field_recall": recall,
             "field_f1": f1,
             "missing_predictions": totals["missing_predictions"],
+            "estimated_tokens_total": estimated_tokens_total,
+            "estimated_tokens_count": len(telemetry["estimated_tokens"]),
+            "latency_ms_total": latency_ms_total,
+            "latency_ms_mean": _mean_or_none(telemetry["latency_ms"]),
+            "latency_ms_count": len(telemetry["latency_ms"]),
+            "cost_usd_total": cost_usd_total,
+            "cost_usd_count": len(telemetry["cost_usd"]),
         }
         evaluation_run_id = insert_evaluation_run(
             connection,
-            name=name or f"{method}:{label_set}",
+            name=name or f"{variant_alias}:{label_set}",
             label_set=label_set,
-            method=method,
+            method=variant.method,
             split_name=split_name,
-            config={},
+            config={"variant_alias": variant_alias, "variant": variant.as_dict()},
             metrics=metrics,
         )
         for result in per_document:
@@ -179,13 +212,32 @@ def evaluate_method(
             )
     return EvaluationSummary(
         evaluation_run_id=evaluation_run_id,
+        variant_alias=variant_alias,
         documents=totals["documents"],
         exact_record_accuracy=exact_accuracy,
         field_precision=precision,
         field_recall=recall,
         field_f1=f1,
         missing_predictions=totals["missing_predictions"],
+        estimated_tokens_total=estimated_tokens_total,
+        estimated_tokens_count=len(telemetry["estimated_tokens"]),
+        latency_ms_total=latency_ms_total,
+        latency_ms_mean=_mean_or_none(telemetry["latency_ms"]),
+        latency_ms_count=len(telemetry["latency_ms"]),
+        cost_usd_total=cost_usd_total,
+        cost_usd_count=len(telemetry["cost_usd"]),
     )
+
+
+def _sum_or_none(values: list[float], *, integer: bool = False) -> int | float | None:
+    if not values:
+        return None
+    total = sum(values)
+    return int(total) if integer else total
+
+
+def _mean_or_none(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
 
 
 def _compare_fields(

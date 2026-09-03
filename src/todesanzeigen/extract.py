@@ -20,6 +20,7 @@ from .llm import (
     VisionLlmProvider,
 )
 from .methods import (
+    CURRENT_PROMPT_VERSION,
     TEXT_EXTRACTION_METHOD,
     VISION_IMAGE_ONLY_METHOD,
     VISION_REROUTE_METHOD,
@@ -80,7 +81,7 @@ class DbExtractionRecord:
     estimated_tokens: int | None = None
     latency_ms: int | None = None
     image_path: Path | None = None
-    prompt_version: str = "death_notice_v3"
+    prompt_version: str = CURRENT_PROMPT_VERSION
     provider_name: str = ""
     model_name: str = ""
 
@@ -1212,6 +1213,11 @@ async def extract_artifacts_to_db_async(
             if below_threshold and reroute_settings is not None
             else TEXT_EXTRACTION_METHOD
         )
+        request_provider = (
+            reroute_settings.provider
+            if request_method == VISION_REROUTE_METHOD and reroute_settings is not None
+            else provider
+        )
         cached_record = _cached_db_record_for_request(
             db_path,
             artifact_path=artifact_path,
@@ -1229,6 +1235,9 @@ async def extract_artifacts_to_db_async(
                 if request_method == VISION_REROUTE_METHOD or below_threshold
                 else ""
             ),
+            provider_name=_provider_name(request_provider),
+            model_name=_model_name(request_provider),
+            prompt_version=CURRENT_PROMPT_VERSION,
             force=force,
         )
         if cached_record is not None:
@@ -1237,6 +1246,14 @@ async def extract_artifacts_to_db_async(
             continue
 
         resumed_record = None if force else resumed_records.get(artifact_path.name)
+        if resumed_record is not None and not _record_matches_variant(
+            resumed_record,
+            method=request_method,
+            provider_name=_provider_name(request_provider),
+            model_name=_model_name(request_provider),
+            prompt_version=CURRENT_PROMPT_VERSION,
+        ):
+            resumed_record = None
         if resumed_record is not None:
             records_by_name[artifact_path.name] = resumed_record
             continue
@@ -1409,6 +1426,9 @@ async def reroute_candidates_to_db_async(
             name_hint=candidate.name_hint,
             threshold=candidate.threshold,
             reason=candidate.reason or _low_confidence_reason(candidate.name_hint.confidence),
+            provider_name=_provider_name(provider),
+            model_name=_model_name(provider),
+            prompt_version=CURRENT_PROMPT_VERSION,
             force=force,
         )
         if cached_record is not None:
@@ -1556,6 +1576,9 @@ async def extract_images_to_db_async(
             input_dir=input_dir,
             image_path=image_path,
             reason="image_only",
+            provider_name=_provider_name(provider),
+            model_name=_model_name(provider),
+            prompt_version=CURRENT_PROMPT_VERSION,
             force=force,
         )
         if cached_record is not None:
@@ -1571,6 +1594,14 @@ async def extract_images_to_db_async(
             continue
 
         resumed_record = None if force else resumed_records.get(image_path.name)
+        if resumed_record is not None and not _record_matches_variant(
+            resumed_record,
+            method=VISION_IMAGE_ONLY_METHOD,
+            provider_name=_provider_name(provider),
+            model_name=_model_name(provider),
+            prompt_version=CURRENT_PROMPT_VERSION,
+        ):
+            resumed_record = None
         if resumed_record is not None:
             records_by_name[image_path.name] = resumed_record
             continue
@@ -1680,13 +1711,15 @@ def _cached_db_record_for_request(
     threshold: float | None = None,
     reason: str = "",
     image_path: Path | None = None,
+    provider_name: str,
+    model_name: str,
+    prompt_version: str,
     force: bool = False,
 ) -> DbExtractionRecord | None:
     from .storage import (
+        active_extraction_for_variant,
         connect,
-        latest_active_extraction_by_slot,
         sha256_file,
-        supersede_active_extractions_by_slot,
         upsert_document,
     )
 
@@ -1696,8 +1729,6 @@ def _cached_db_record_for_request(
         if resolved_image is not None and resolved_image.exists() and resolved_image.is_file()
         else ""
     )
-    slot = result_slot(method)
-
     with connect(db_path) as connection:
         document_id: int | None = None
         if source:
@@ -1725,17 +1756,15 @@ def _cached_db_record_for_request(
             return None
 
         if force:
-            supersede_active_extractions_by_slot(
-                connection,
-                document_id=document_id,
-                result_slot_value=slot,
-            )
             return None
 
-        existing = latest_active_extraction_by_slot(
+        existing = active_extraction_for_variant(
             connection,
             document_id=document_id,
-            result_slot_value=slot,
+            method=method,
+            provider=provider_name,
+            model=model_name,
+            prompt_version=prompt_version,
         )
         if existing is None:
             return None
@@ -1756,6 +1785,7 @@ def _cached_db_record_for_request(
             image_path=resolved_image,
             provider_name=str(existing["provider"] or ""),
             model_name=str(existing["model"] or ""),
+            prompt_version=str(existing["prompt_version"] or ""),
         )
 
 
@@ -1780,6 +1810,22 @@ def _fields_from_output_row(row: Any) -> dict[str, str]:
     return {str(key): "" if value is None else str(value) for key, value in data.items()}
 
 
+def _record_matches_variant(
+    record: DbExtractionRecord,
+    *,
+    method: str,
+    provider_name: str,
+    model_name: str,
+    prompt_version: str,
+) -> bool:
+    return (
+        record.method == method
+        and record.provider_name == provider_name
+        and record.model_name == model_name
+        and record.prompt_version == prompt_version
+    )
+
+
 def _persist_db_extraction_records(
     db_path: Path,
     records: list[DbExtractionRecord],
@@ -1801,19 +1847,24 @@ def _persist_db_extraction_records(
         insert_extraction_output,
         insert_label_candidate,
         sha256_file,
+        supersede_active_extraction_for_variant,
         upsert_document,
         upsert_ocr_output,
     )
 
     apply_migrations(db_path)
     with connect(db_path) as connection:
+        persisted_run_config = {
+            **run_config,
+            "prompt_version": CURRENT_PROMPT_VERSION,
+        }
         run_id = create_run(
             connection,
             command=command,
             method=run_method,
             provider=run_provider,
             model=run_model,
-            config=run_config,
+            config=persisted_run_config,
         )
         try:
             for record in records:
@@ -1867,13 +1918,22 @@ def _persist_db_extraction_records(
 
                 config_hash = _stable_config_hash(
                     {
-                        **run_config,
+                        **persisted_run_config,
                         "method": record.method,
                         "provider": record.provider_name,
                         "model": record.model_name,
                         "prompt_version": record.prompt_version,
                     }
                 )
+                if result.status in PROCESSED_STATUSES:
+                    supersede_active_extraction_for_variant(
+                        connection,
+                        document_id=document_id,
+                        method=record.method,
+                        provider=record.provider_name,
+                        model=record.model_name,
+                        prompt_version=record.prompt_version,
+                    )
                 output_id = insert_extraction_output(
                     connection,
                     document_id=document_id,
@@ -1891,7 +1951,7 @@ def _persist_db_extraction_records(
                     latency_ms=record.latency_ms,
                     route_reason=record.reason,
                     route_decision=_route_decision(record),
-                    config=run_config,
+                    config=persisted_run_config,
                     ocr_output_id=ocr_output_id,
                     result_slot_value=result_slot(record.method),
                     input_fingerprint=_record_input_fingerprint(record, input_dir, sha256_file),
@@ -1968,6 +2028,7 @@ def _db_record_checkpoint_metadata(record: DbExtractionRecord) -> dict[str, Any]
         "method": record.method,
         "provider": record.provider_name or None,
         "model": record.model_name or None,
+        "prompt_version": record.prompt_version,
         "route_reason": record.reason,
     }
     if record.result.artifact_path.suffix == ".txt":
@@ -2035,6 +2096,7 @@ def _load_completed_checkpoint_db_records(
             image_path=Path(source_image) if isinstance(source_image, str) and source_image else None,
             provider_name=str(record.get("provider") or ""),
             model_name=str(record.get("model") or ""),
+            prompt_version=str(record.get("prompt_version") or ""),
         )
     return records
 
@@ -2077,6 +2139,7 @@ def _load_completed_image_checkpoint_db_records(
             image_path=image_path,
             provider_name=str(record.get("provider") or ""),
             model_name=str(record.get("model") or ""),
+            prompt_version=str(record.get("prompt_version") or ""),
         )
     return records
 

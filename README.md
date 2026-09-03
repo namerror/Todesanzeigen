@@ -199,12 +199,10 @@ before extraction.
 
 SQLite is the authoritative cache for extraction outputs. Before a model
 request is scheduled, the command checks whether the same document already has
-an active successful row for the requested result slot. `text_extraction` uses
-the `ocr_llm` slot. Direct VLM extraction and low-confidence VLM reroute both
-use the `vlm` slot, so those two VLM paths do not coexist for the same
-document. A cache hit returns `cached_existing`, avoids the provider call, and
-does not insert a duplicate extraction row. Pass `--force` to supersede the
-active row for that slot and run the provider again.
+an active successful row for the exact method/provider/model/prompt variant. A
+cache hit returns `cached_existing`, avoids the provider call, and does not
+insert a duplicate extraction row. Pass `--force` to run the provider again and
+supersede the prior exact variant only after the replacement succeeds.
 
 Extraction is still checkpointed by default for run-level audit and local
 resume. Every `extract` run writes completed, skipped, cached, rerouted, and
@@ -283,9 +281,9 @@ todesanzeigen reroute --force
 ```
 
 Standalone reroute records VLM outputs in SQLite and writes audit details in
-`logs/reroute-results.jsonl`. It uses the same `vlm` result slot as
-`vision-extract`, so an existing direct VLM result prevents a reroute call for
-the same document unless `--force` is passed.
+`logs/reroute-results.jsonl`. Reroute and direct image-only VLM outputs use
+different methods and therefore coexist even when their provider, model, and
+prompt version are identical.
 
 ## Image-Only Vision Extraction
 
@@ -364,6 +362,7 @@ todesanzeigen ingest results \
   --method text_extraction \
   --provider qwen \
   --model qwen3.6-flash \
+  --prompt-version death_notice_v3 \
   --candidate-kind teacher
 ```
 
@@ -382,6 +381,8 @@ Imported rows are stored as extraction outputs and as pending label candidates.
 Model-backed methods require an exact model name. Normal `extract`, `reroute`,
 and `vision-extract` runs record the provider and model automatically; imports
 must pass `--model` because legacy CSV and JSONL files may not contain it.
+CSV imports may use `--prompt-version` to preserve historical prompt lineage;
+JSONL records use their own `prompt_version` when present.
 They are not treated as ground truth automatically. This is intentional:
 VLM-generated or LLM-generated "ground truth" should be reviewed before it is
 used as a benchmark label.
@@ -403,6 +404,20 @@ vision_model_image_only   method_family=vlm, result_slot=vlm, route_reason=image
 vision_model_reroute      method_family=vlm, result_slot=vlm, route_reason=low_confidence
 ```
 
+A document may have several active successful outputs for a method. An output
+variant is identified by `(method, provider, model, prompt_version)`. Repeating
+the same variant uses the DB cache; `--force` appends a replacement and marks
+only the prior exact variant as superseded. Different models or prompt versions
+coexist and remain independently evaluable. `result_slot` is retained only as
+coarse lineage and is not used for cache or selection.
+
+Named variants and operational defaults live in
+`config/extraction_variants.toml`. The shipped defaults select
+`qwen3.6-flash/death_notice_v3` for text and
+`qwen3.7-plus-2026-05-26/death_notice_v3` for image-only VLM. Update the
+`CURRENT_PROMPT_VERSION` constant and these aliases together when changing the
+prompt implementation; extraction commands always run the prompt in code.
+
 Reviewed ground truth is stored only in `ground_truth_labels`. It is not mirrored
 as another extraction method. Extraction commands do not write the operational
 CSV directly; generate it from the DB when needed:
@@ -414,8 +429,8 @@ todesanzeigen export csv \
   --output-file output/result.csv
 ```
 
-CSV priority is: reviewed GT, image-only VLM, low-confidence VLM reroute,
-OCR+LLM text extraction, then no row. Superseded extraction rows are ignored by
+CSV priority is: reviewed GT, the configured default VLM variant, the configured
+default text variant, then no row. Superseded extraction rows are ignored by
 this export. Internally, `ort` is the single stored location field. CSV export
 copies it to both `ort` and the legacy `wohnort` column.
 
@@ -443,7 +458,23 @@ http://127.0.0.1:8000
 
 The review UI has separate **Needs review** and **Ground truth** views. On a
 record page it shows the source image, OCR text, current GT when available, and
-a field-by-field comparison of the latest result from each extraction method.
+a field-by-field comparison of the exact variants whose `review_enabled` switch
+is set in `config/extraction_variants.toml`. Missing variants are omitted rather
+than replaced with a different model or prompt. Candidate queues and counts are
+not affected by this display switch.
+
+Toggle a configured comparison source without deleting its outputs:
+
+```toml
+[[variants]]
+alias = "text_qwen36_prompt_v1"
+label = "Text · Qwen 3.6 Flash · prompt v1"
+method = "text_extraction"
+provider = "qwen"
+model = "qwen3.6-flash"
+prompt_version = "death_notice_v1"
+review_enabled = true
+```
 The GT editor starts empty for an unreviewed record: use **Fill form** on the
 text or VLM result to choose an explicit starting source, or enter a label
 manually. **Approve as GT** accepts a method result directly.
@@ -494,12 +525,12 @@ Export supervised failure-prediction rows for the first router milestone:
 ```sh
 todesanzeigen dataset export-router \
   --label-set gt-v1 \
-  --method text_extraction \
+  --variant text_current \
   --feature-set router-v2 \
   --output-file output/datasets/router-v2-text-extraction.jsonl
 ```
 
-The router export uses reviewed GT to mark whether the selected method produced
+The router export uses reviewed GT to mark whether the selected variant produced
 an exact-record match. Features include source metadata, image quality proxies,
 OCR text statistics, TSV confidence/layout statistics, and the local name-hint
 confidence. Filename, year, layout-family, image-path, suffix, and MIME metadata
@@ -521,8 +552,8 @@ record is expected to point to one document/image and have:
 
 - a feature snapshot, usually `router-v2`
 - a reviewed GT label in `ground_truth_labels`
-- an active OCR+LLM output in the `ocr_llm` result slot
-- optionally an active VLM output in the `vlm` result slot for routed quality/cost metrics
+- an active output for the configured default OCR+LLM variant
+- optionally an active output for the configured default VLM variant
 
 Build feature snapshots before training:
 
@@ -600,12 +631,12 @@ model.
 
 ### Evaluation
 
-Evaluate the latest outputs for a method against reviewed labels:
+Evaluate one named, exact variant against reviewed labels:
 
 ```sh
 todesanzeigen eval run \
   --label-set gt-v1 \
-  --method text_extraction
+  --variant text_current
 ```
 
 Evaluate on a named split:
@@ -613,12 +644,14 @@ Evaluate on a named split:
 ```sh
 todesanzeigen eval run \
   --label-set gt-v1 \
-  --method vision_model_image_only \
+  --variant vlm_current \
   --split benchmark-v1
 ```
 
-Evaluation records exact-record accuracy, field-level precision, recall, F1, and
-missing predictions. Aggregate metrics are stored in `evaluation_runs`; per
+Evaluation records exact-record accuracy, field-level precision, recall, F1,
+missing predictions, and aggregate stored token, latency, and cost telemetry.
+The alias and resolved variant tuple are stored with the run. Aggregate metrics
+are stored in `evaluation_runs`; per
 document field comparisons are stored in `evaluation_results`.
 
 ### Recommended ML Workflow
@@ -634,8 +667,8 @@ todesanzeigen vision-extract --input-dir "input/Aichacher Nachrichten" --source 
 todesanzeigen review serve --reviewer "your-name"
 todesanzeigen dataset split --name benchmark-v1 --strategy source-year
 todesanzeigen features build --feature-set router-v2
-todesanzeigen eval run --label-set gt-v1 --method text_extraction --split benchmark-v1
-todesanzeigen dataset export-router --label-set gt-v1 --method text_extraction --feature-set router-v2 --output-file output/datasets/router-v2.jsonl
+todesanzeigen eval run --label-set gt-v1 --variant text_current --split benchmark-v1
+todesanzeigen dataset export-router --label-set gt-v1 --variant text_current --feature-set router-v2 --output-file output/datasets/router-v2.jsonl
 todesanzeigen router train --label-set gt-v1 --feature-set router-v2 --split benchmark-v1 --model-dir models/router/router-v2
 todesanzeigen router manifest --label-set gt-v1 --feature-set router-v2 --model-dir models/router/router-v2 --output-file output/router-manifest.jsonl
 todesanzeigen export csv --label-set gt-v1 --output-file output/result.csv

@@ -85,7 +85,9 @@ class RouterDatasetTests(TestCase):
 
     def test_load_router_dataset_pairs_features_gt_text_and_vlm_outputs(self) -> None:
         with TemporaryDirectory() as tmp:
-            db_path = Path(tmp) / "state" / "test.sqlite3"
+            root = Path(tmp)
+            db_path = root / "state" / "test.sqlite3"
+            variants_config = _write_test_variants(root)
             apply_migrations(db_path)
             with connect(db_path) as connection:
                 document_id = _insert_router_document(
@@ -100,6 +102,7 @@ class RouterDatasetTests(TestCase):
                 label_set=DEFAULT_LABEL_SET,
                 feature_set="router-v1",
                 target_f1_threshold=0.95,
+                variants_config=variants_config,
             )
 
         self.assertEqual(len(dataset.records), 1)
@@ -117,6 +120,7 @@ class RouterTrainingTests(TestCase):
             root = Path(tmp)
             db_path = root / "state" / "test.sqlite3"
             model_dir = root / "models" / "router"
+            variants_config = _write_test_variants(root)
             apply_migrations(db_path)
             with connect(db_path) as connection:
                 for index in range(4):
@@ -134,6 +138,7 @@ class RouterTrainingTests(TestCase):
                     model_dir=model_dir,
                     validation_ratio=0.25,
                     min_train_rows=3,
+                    variants_config=variants_config,
                 )
 
     def test_training_writes_model_artifacts_and_manifest(self) -> None:
@@ -142,6 +147,7 @@ class RouterTrainingTests(TestCase):
             db_path = root / "state" / "test.sqlite3"
             model_dir = root / "models" / "router"
             manifest_file = root / "output" / "router-manifest.jsonl"
+            variants_config = _write_test_variants(root)
             apply_migrations(db_path)
             assignments: dict[int, str] = {}
             with connect(db_path) as connection:
@@ -168,6 +174,7 @@ class RouterTrainingTests(TestCase):
                 split_name="router-split",
                 validation_ratio=0.25,
                 min_train_rows=4,
+                variants_config=variants_config,
             )
             manifest_summary = write_router_manifest(
                 db_path=db_path,
@@ -175,6 +182,7 @@ class RouterTrainingTests(TestCase):
                 feature_set="router-v1",
                 output_file=manifest_file,
                 threshold=0.0,
+                variants_config=variants_config,
             )
             rows = [
                 json.loads(line)
@@ -232,6 +240,7 @@ def _insert_router_document(
         document_id=document_id,
         run_id=None,
         method="text_extraction",
+        provider="test",
         model="test-text-model",
         fields={"name": "Musterfrau" if failed else "Mustermann", "vorname": "Max"},
         status="processed",
@@ -241,8 +250,37 @@ def _insert_router_document(
         document_id=document_id,
         run_id=None,
         method="vision_model_image_only",
+        provider="test",
         model="test-vision-model",
         fields={"name": "Mustermann", "vorname": "Max"},
         status="vision_processed",
     )
     return document_id
+
+
+def _write_test_variants(root: Path) -> Path:
+    path = root / "variants.toml"
+    path.write_text(
+        """[defaults]
+text = "test_text"
+vlm = "test_vlm"
+[[variants]]
+alias = "test_text"
+label = "Test text"
+method = "text_extraction"
+provider = "test"
+model = "test-text-model"
+prompt_version = "death_notice_v3"
+review_enabled = true
+[[variants]]
+alias = "test_vlm"
+label = "Test VLM"
+method = "vision_model_image_only"
+provider = "test"
+model = "test-vision-model"
+prompt_version = "death_notice_v3"
+review_enabled = true
+""",
+        encoding="utf-8",
+    )
+    return path

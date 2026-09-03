@@ -14,14 +14,15 @@ from .llm import STORED_COLUMNS
 from .storage import (
     DEFAULT_DB_PATH,
     DEFAULT_LABEL_SET,
+    active_extraction_for_variant,
     all_documents,
     apply_migrations,
     connect,
-    latest_extraction_by_method,
     latest_feature_snapshot,
     latest_ocr_output,
     upsert_feature_snapshot,
 )
+from .variants import DEFAULT_VARIANTS_CONFIG_PATH, load_variant_config
 
 
 DEFAULT_FEATURE_SET = "router-v2"
@@ -77,9 +78,11 @@ def export_router_dataset(
     db_path: Path = DEFAULT_DB_PATH,
     output_file: Path,
     label_set: str = DEFAULT_LABEL_SET,
-    method: str,
+    variant_alias: str,
     feature_set: str = DEFAULT_FEATURE_SET,
+    variants_config: Path = DEFAULT_VARIANTS_CONFIG_PATH,
 ) -> RouterDatasetSummary:
+    variant = load_variant_config(variants_config).variant(variant_alias)
     apply_migrations(db_path)
     output_file.parent.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
@@ -112,10 +115,13 @@ def export_router_dataset(
                 missing_features += 1
                 continue
 
-            prediction_row = latest_extraction_by_method(
+            prediction_row = active_extraction_for_variant(
                 connection,
                 document_id=document_id,
-                method=method,
+                method=variant.method,
+                provider=variant.provider,
+                model=variant.model,
+                prompt_version=variant.prompt_version,
             )
             truth = _loads(label["fields_json"])
             missing_prediction = prediction_row is None
@@ -131,7 +137,9 @@ def export_router_dataset(
                     "year": label["year"],
                     "label_set": label_set,
                     "feature_set": feature_set,
-                    "method": method,
+                    "method": variant.method,
+                    "variant_alias": variant.alias,
+                    "variant": variant.as_dict(),
                     "features": _loads(feature_snapshot["features_json"]),
                     "target": {
                         "cheap_pipeline_failed": not exact_match,

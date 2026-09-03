@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .extract import PROCESSED_STATUSES
-from .methods import requires_model
+from .methods import CURRENT_PROMPT_VERSION, requires_model
 from .normalization import normalize_stored_fields
 from .ocr import image_mime_type
 from .storage import (
@@ -20,6 +20,7 @@ from .storage import (
     insert_label_candidate,
     read_csv_rows,
     sha256_file,
+    supersede_active_extraction_for_variant,
     upsert_document,
     upsert_ocr_output,
 )
@@ -125,6 +126,7 @@ def ingest_results(
     method: str = "csv_import",
     provider: str = "",
     model: str = "",
+    prompt_version: str = CURRENT_PROMPT_VERSION,
     candidate_kind: str = "teacher",
     input_dir: Path | None = None,
 ) -> ResultsIngestSummary:
@@ -165,6 +167,7 @@ def ingest_results(
                 ),
                 "candidate_kind": candidate_kind,
                 "input_dir": str(input_dir or ""),
+                "prompt_version": prompt_version,
             },
         )
         output_count = 0
@@ -184,6 +187,7 @@ def ingest_results(
                     method=method,
                     provider=resolved_provider,
                     model=resolved_model,
+                    prompt_version=prompt_version,
                     fields=row,
                     status="processed",
                 )
@@ -217,6 +221,7 @@ def ingest_results(
                     method=record_method,
                     provider=str(record.get("provider") or resolved_provider),
                     model=str(record.get("model") or resolved_model),
+                    prompt_version=str(record.get("prompt_version") or prompt_version),
                     fields=row,
                     status=str(record.get("status") or "processed"),
                     error=str(record.get("error") or ""),
@@ -329,6 +334,7 @@ def _get_or_create_extraction_output(
     method: str,
     provider: str,
     model: str,
+    prompt_version: str,
     fields: dict[str, Any],
     status: str,
     error: str = "",
@@ -342,15 +348,26 @@ def _get_or_create_extraction_output(
           AND method = ?
           AND provider = ?
           AND model = ?
+          AND prompt_version = ?
           AND fields_json = ?
           AND status = ?
+          AND superseded_at IS NULL
         ORDER BY id DESC
         LIMIT 1
         """,
-        (document_id, method, provider, model, fields_json, status),
+        (document_id, method, provider, model, prompt_version, fields_json, status),
     ).fetchone()
     if existing is not None:
         return int(existing["id"]), False
+    if status in PROCESSED_STATUSES:
+        supersede_active_extraction_for_variant(
+            connection,
+            document_id=document_id,
+            method=method,
+            provider=provider,
+            model=model,
+            prompt_version=prompt_version,
+        )
     return (
         insert_extraction_output(
             connection,
@@ -359,6 +376,7 @@ def _get_or_create_extraction_output(
             method=method,
             provider=provider,
             model=model,
+            prompt_version=prompt_version,
             fields=fields,
             status=status,
             error=error,
@@ -377,18 +395,14 @@ def _get_or_create_label_candidate(
     source_name: str,
     fields: dict[str, Any],
 ) -> int | None:
-    fields_json = _fields_json(fields)
     existing = connection.execute(
         """
         SELECT id FROM label_candidates
-        WHERE document_id = ?
-          AND source_kind = ?
-          AND source_name = ?
-          AND fields_json = ?
+        WHERE extraction_output_id = ?
         ORDER BY id DESC
         LIMIT 1
         """,
-        (document_id, source_kind, source_name, fields_json),
+        (extraction_output_id,),
     ).fetchone()
     if existing is not None:
         return None

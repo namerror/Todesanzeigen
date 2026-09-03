@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from ..storage import DEFAULT_DB_PATH, DEFAULT_LABEL_SET
+from ..variants import DEFAULT_VARIANTS_CONFIG_PATH
 from .dataset import load_router_dataset
 from .model import load_router_model, predict_failure_probabilities
 
@@ -26,6 +27,7 @@ def write_router_manifest(
     label_set: str = DEFAULT_LABEL_SET,
     feature_set: str,
     threshold: float | None = None,
+    variants_config: Path = DEFAULT_VARIANTS_CONFIG_PATH,
 ) -> RouterManifestSummary:
     bundle = load_router_model(model_dir)
     decision_threshold = bundle.threshold if threshold is None else threshold
@@ -35,6 +37,7 @@ def write_router_manifest(
         feature_set=feature_set,
         target_f1_threshold=bundle.target_f1_threshold,
         require_labels=False,
+        variants_config=variants_config,
     )
     records = list(dataset.records)
     probabilities = predict_failure_probabilities(bundle.pipeline, records)
@@ -45,6 +48,8 @@ def write_router_manifest(
             threshold=decision_threshold,
             cheap_cost=bundle.cheap_cost,
             vlm_cost=bundle.vlm_cost,
+            text_variant=dataset.text_variant,
+            vlm_variant=dataset.vlm_variant,
         )
         for record, probability in zip(records, probabilities)
     ]
@@ -70,6 +75,8 @@ def _manifest_row(
     threshold: float,
     cheap_cost: float,
     vlm_cost: float,
+    text_variant: dict[str, str],
+    vlm_variant: dict[str, str],
 ) -> dict[str, Any]:
     route = "vlm" if probability >= threshold else "ocr_llm"
     row = {
@@ -83,6 +90,8 @@ def _manifest_row(
         "expected_cost": vlm_cost if route == "vlm" else cheap_cost,
         "ocr_llm_output_id": record.cheap_output_id,
         "vlm_output_id": record.vlm_output_id,
+        "ocr_llm_variant": text_variant,
+        "vlm_variant": vlm_variant,
     }
     if record.cheap_metrics is not None:
         row["ocr_llm_target_metrics"] = record.cheap_metrics.to_dict()

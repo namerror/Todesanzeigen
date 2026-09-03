@@ -33,6 +33,8 @@ from .ocr import (
 )
 from .ocr_filtering import filter_artifact_names, name_map_artifact_path
 from .storage import DEFAULT_DB_PATH, DEFAULT_LABEL_SET
+from .methods import CURRENT_PROMPT_VERSION
+from .variants import DEFAULT_VARIANTS_CONFIG_PATH
 
 
 CANDIDATE_KINDS = ("teacher", "pipeline", "manual_seed")
@@ -285,6 +287,7 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_results.add_argument("--method", default="csv_import")
     ingest_results.add_argument("--provider", default="")
     ingest_results.add_argument("--model", default="")
+    ingest_results.add_argument("--prompt-version", default=CURRENT_PROMPT_VERSION)
     ingest_results.add_argument(
         "--candidate-kind",
         choices=["teacher", "pipeline", "manual_seed"],
@@ -313,7 +316,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dataset_export_router.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     dataset_export_router.add_argument("--label-set", default=DEFAULT_LABEL_SET)
-    dataset_export_router.add_argument("--method", required=True)
+    dataset_export_router.add_argument("--variant", required=True)
+    dataset_export_router.add_argument(
+        "--variants-config", type=Path, default=DEFAULT_VARIANTS_CONFIG_PATH
+    )
     dataset_export_router.add_argument("--feature-set", default=DEFAULT_FEATURE_SET)
     dataset_export_router.add_argument("--output-file", type=Path, required=True)
 
@@ -329,13 +335,15 @@ def build_parser() -> argparse.ArgumentParser:
     export_csv.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     export_csv.add_argument("--label-set", default=DEFAULT_LABEL_SET)
     export_csv.add_argument("--output-file", type=Path, default=Path("output/result.csv"))
+    export_csv.add_argument("--variants-config", type=Path, default=DEFAULT_VARIANTS_CONFIG_PATH)
 
     eval_parser = subparsers.add_parser("eval", help="Evaluate extraction outputs against ground truth labels.")
     eval_subparsers = eval_parser.add_subparsers(dest="eval_command", required=True)
     eval_run = eval_subparsers.add_parser("run", help="Run field-level extraction evaluation.")
     eval_run.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     eval_run.add_argument("--label-set", default=DEFAULT_LABEL_SET)
-    eval_run.add_argument("--method", required=True)
+    eval_run.add_argument("--variant", required=True)
+    eval_run.add_argument("--variants-config", type=Path, default=DEFAULT_VARIANTS_CONFIG_PATH)
     eval_run.add_argument("--split", default="")
     eval_run.add_argument("--name")
 
@@ -357,6 +365,7 @@ def build_parser() -> argparse.ArgumentParser:
     router_train.add_argument("--vlm-cost", type=float, default=10.0)
     router_train.add_argument("--lambda-cost", type=float, default=0.01)
     router_train.add_argument("--min-train-rows", type=int, default=4)
+    router_train.add_argument("--variants-config", type=Path, default=DEFAULT_VARIANTS_CONFIG_PATH)
     router_manifest = router_subparsers.add_parser(
         "manifest",
         help="Write a document-to-route manifest from a trained router model.",
@@ -367,6 +376,7 @@ def build_parser() -> argparse.ArgumentParser:
     router_manifest.add_argument("--model-dir", type=Path, required=True)
     router_manifest.add_argument("--output-file", type=Path, required=True)
     router_manifest.add_argument("--threshold", type=float)
+    router_manifest.add_argument("--variants-config", type=Path, default=DEFAULT_VARIANTS_CONFIG_PATH)
 
     review = subparsers.add_parser("review", help="Review and approve label candidates.")
     review_subparsers = review.add_subparsers(dest="review_command", required=True)
@@ -376,6 +386,7 @@ def build_parser() -> argparse.ArgumentParser:
     review_serve.add_argument("--reviewer", default="")
     review_serve.add_argument("--host", default="127.0.0.1")
     review_serve.add_argument("--port", type=int, default=8000)
+    review_serve.add_argument("--variants-config", type=Path, default=DEFAULT_VARIANTS_CONFIG_PATH)
 
     return parser
 
@@ -709,6 +720,7 @@ def run_ingest_command(args: argparse.Namespace) -> int:
             method=args.method,
             provider=args.provider,
             model=args.model,
+            prompt_version=args.prompt_version,
             candidate_kind=args.candidate_kind,
             input_dir=args.input_dir,
         )
@@ -754,8 +766,9 @@ def run_dataset_command(args: argparse.Namespace) -> int:
             db_path=args.db,
             output_file=args.output_file,
             label_set=args.label_set,
-            method=args.method,
+            variant_alias=args.variant,
             feature_set=args.feature_set,
+            variants_config=args.variants_config,
         )
         print(
             f"Exported {summary.rows} router rows to {summary.output_file}; "
@@ -792,6 +805,7 @@ def run_export_command(args: argparse.Namespace) -> int:
                 connection,
                 output_csv=args.output_file,
                 label_set=args.label_set,
+                variants_config=args.variants_config,
             )
         method_parts = ", ".join(
             f"{method}={count}" for method, count in summary.method_rows.items()
@@ -807,12 +821,13 @@ def run_export_command(args: argparse.Namespace) -> int:
 
 def run_eval_command(args: argparse.Namespace) -> int:
     if args.eval_command == "run":
-        from .evaluation import evaluate_method
+        from .evaluation import evaluate_variant
 
-        summary = evaluate_method(
+        summary = evaluate_variant(
             db_path=args.db,
             label_set=args.label_set,
-            method=args.method,
+            variant_alias=args.variant,
+            variants_config=args.variants_config,
             split_name=args.split,
             name=args.name,
         )
@@ -821,7 +836,12 @@ def run_eval_command(args: argparse.Namespace) -> int:
             f"exact={summary.exact_record_accuracy:.3f}; "
             f"field_f1={summary.field_f1:.3f}; "
             f"precision={summary.field_precision:.3f}; recall={summary.field_recall:.3f}; "
-            f"missing_predictions={summary.missing_predictions}."
+            f"missing_predictions={summary.missing_predictions}; "
+            f"estimated_tokens={summary.estimated_tokens_total} "
+            f"({summary.estimated_tokens_count} rows); "
+            f"mean_latency_ms={summary.latency_ms_mean} "
+            f"({summary.latency_ms_count} rows); "
+            f"cost_usd={summary.cost_usd_total} ({summary.cost_usd_count} rows)."
         )
         return 0
     raise ValueError(f"Unsupported eval command: {args.eval_command}")
@@ -844,6 +864,7 @@ def run_router_command(args: argparse.Namespace) -> int:
             vlm_cost=args.vlm_cost,
             lambda_cost=args.lambda_cost,
             min_train_rows=args.min_train_rows,
+            variants_config=args.variants_config,
         )
         print(
             f"Router trained in {summary.model_dir}: "
@@ -863,6 +884,7 @@ def run_router_command(args: argparse.Namespace) -> int:
             label_set=args.label_set,
             feature_set=args.feature_set,
             threshold=args.threshold,
+            variants_config=args.variants_config,
         )
         print(
             f"Router manifest written to {summary.output_file}: "
@@ -883,6 +905,7 @@ def run_review_command(args: argparse.Namespace) -> int:
             reviewer=args.reviewer,
             host=args.host,
             port=args.port,
+            variants_config=args.variants_config,
         )
         return 0
     raise ValueError(f"Unsupported review command: {args.review_command}")

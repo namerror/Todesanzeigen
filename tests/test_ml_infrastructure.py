@@ -6,7 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import IsolatedAsyncioTestCase, TestCase
 
-from src.todesanzeigen.evaluation import evaluate_method
+from src.todesanzeigen.evaluation import evaluate_variant
 from src.todesanzeigen.extract import (
     CACHED_EXISTING_STATUS,
     AsyncExtractionSettings,
@@ -38,6 +38,34 @@ from src.todesanzeigen.storage import (
 )
 
 
+def _write_test_variants(root: Path) -> Path:
+    path = root / "variants.toml"
+    path.write_text(
+        """[defaults]
+text = "test_text"
+vlm = "test_vlm"
+[[variants]]
+alias = "test_text"
+label = "Test text"
+method = "text_extraction"
+provider = "test"
+model = "test-text-model"
+prompt_version = "death_notice_v3"
+review_enabled = true
+[[variants]]
+alias = "test_vlm"
+label = "Test VLM"
+method = "vision_model_image_only"
+provider = "test"
+model = "test-vision-model"
+prompt_version = "death_notice_v3"
+review_enabled = true
+""",
+        encoding="utf-8",
+    )
+    return path
+
+
 class MlInfrastructureTests(TestCase):
     def test_migrations_are_idempotent(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -54,6 +82,7 @@ class MlInfrastructureTests(TestCase):
                     "003_result_slot_cache",
                     "004_require_generation_model",
                     "005_remove_artifacts",
+                    "006_extraction_variants",
                 ],
             )
             self.assertEqual(second, [])
@@ -174,7 +203,10 @@ class MlInfrastructureTests(TestCase):
                     """
                 )
 
-            self.assertEqual(apply_migrations(db_path), ["005_remove_artifacts"])
+            self.assertEqual(
+                apply_migrations(db_path),
+                ["005_remove_artifacts", "006_extraction_variants"],
+            )
 
             with connect(db_path) as connection:
                 tables = {
@@ -1075,9 +1107,10 @@ class MlInfrastructureTests(TestCase):
         self.assertEqual(fields["name"], "Edited")
         self.assertEqual(fields["vorname"], "Erika")
 
-    def test_evaluate_method_records_field_metrics(self) -> None:
+    def test_evaluate_variant_records_field_metrics_and_telemetry(self) -> None:
         with TemporaryDirectory() as tmp:
-            db_path = Path(tmp) / "state" / "test.sqlite3"
+            root = Path(tmp)
+            db_path = root / "state" / "test.sqlite3"
             apply_migrations(db_path)
             with connect(db_path) as connection:
                 from src.todesanzeigen.storage import upsert_document
@@ -1098,25 +1131,35 @@ class MlInfrastructureTests(TestCase):
                     document_id=document_id,
                     run_id=None,
                     method="text_extraction",
+                    provider="test",
                     model="test-text-model",
                     fields={"name": "Mustermann", "vorname": "Erika"},
                     status="processed",
+                    estimated_tokens=125,
+                    latency_ms=80,
+                    cost_usd=0.0125,
                 )
 
-            summary = evaluate_method(
+            variants_config = _write_test_variants(root)
+            summary = evaluate_variant(
                 db_path=db_path,
                 label_set=DEFAULT_LABEL_SET,
-                method="text_extraction",
+                variant_alias="test_text",
+                variants_config=variants_config,
             )
 
             self.assertEqual(summary.documents, 1)
             self.assertEqual(summary.exact_record_accuracy, 0)
             self.assertGreater(summary.field_precision, 0)
             self.assertGreater(summary.field_recall, 0)
+            self.assertEqual(summary.estimated_tokens_total, 125)
+            self.assertEqual(summary.latency_ms_mean, 80)
+            self.assertEqual(summary.cost_usd_total, 0.0125)
             with connect(db_path) as connection:
                 eval_run = connection.execute("SELECT * FROM evaluation_runs").fetchone()
                 eval_result = connection.execute("SELECT * FROM evaluation_results").fetchone()
             self.assertEqual(eval_run["method"], "text_extraction")
+            self.assertEqual(json.loads(eval_run["config_json"])["variant_alias"], "test_text")
             self.assertEqual(eval_result["exact_match"], 0)
 
     def test_export_priority_csv_prefers_ground_truth_then_vlm_then_text(self) -> None:
@@ -1124,6 +1167,7 @@ class MlInfrastructureTests(TestCase):
             root = Path(tmp)
             db_path = root / "state" / "test.sqlite3"
             output_csv = root / "output" / "result.csv"
+            variants_config = _write_test_variants(root)
             apply_migrations(db_path)
             with connect(db_path) as connection:
                 gt_document_id = upsert_document(
@@ -1157,6 +1201,7 @@ class MlInfrastructureTests(TestCase):
                     document_id=gt_document_id,
                     run_id=None,
                     method="vision_model_image_only",
+                    provider="test",
                     model="test-vision-model",
                     fields={"name": "Ignored Vision"},
                     status="vision_processed",
@@ -1166,6 +1211,7 @@ class MlInfrastructureTests(TestCase):
                     document_id=vlm_document_id,
                     run_id=None,
                     method="vision_model_image_only",
+                    provider="test",
                     model="test-vision-model",
                     fields={"name": "Vision"},
                     status="vision_processed",
@@ -1175,20 +1221,25 @@ class MlInfrastructureTests(TestCase):
                     document_id=text_document_id,
                     run_id=None,
                     method="text_extraction",
+                    provider="test",
                     model="test-text-model",
                     fields={"name": "Text"},
                     status="processed",
                 )
 
-                summary = export_priority_csv(connection, output_csv=output_csv)
+                summary = export_priority_csv(
+                    connection,
+                    output_csv=output_csv,
+                    variants_config=variants_config,
+                )
 
             with output_csv.open(encoding="utf-8", newline="") as handle:
                 rows = list(csv.DictReader(handle))
 
         self.assertEqual(summary.rows, 3)
         self.assertEqual(summary.ground_truth_rows, 1)
-        self.assertEqual(summary.method_rows["vision_model_image_only"], 1)
-        self.assertEqual(summary.method_rows["text_extraction"], 1)
+        self.assertEqual(summary.method_rows["test_vlm"], 1)
+        self.assertEqual(summary.method_rows["test_text"], 1)
         self.assertEqual(summary.missing_documents, 1)
         self.assertEqual([row["name"] for row in rows], ["Ground Truth", "Text", "Vision"])
 
@@ -1198,6 +1249,7 @@ class MlInfrastructureTests(TestCase):
             db_path = root / "state" / "test.sqlite3"
             output_file = root / "output" / "router.jsonl"
             tsv_path = root / "artifacts" / "example.tsv"
+            variants_config = _write_test_variants(root)
             tsv_path.parent.mkdir()
             tsv_path.write_text(
                 "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\t"
@@ -1242,6 +1294,7 @@ class MlInfrastructureTests(TestCase):
                     document_id=document_id,
                     run_id=None,
                     method="text_extraction",
+                    provider="test",
                     model="test-text-model",
                     fields={"name": "Mustermann", "vorname": "Max"},
                     status="processed",
@@ -1252,8 +1305,9 @@ class MlInfrastructureTests(TestCase):
                 db_path=db_path,
                 output_file=output_file,
                 label_set=DEFAULT_LABEL_SET,
-                method="text_extraction",
+                variant_alias="test_text",
                 feature_set="router-v2",
+                variants_config=variants_config,
             )
             row = json.loads(output_file.read_text(encoding="utf-8").splitlines()[0])
 
@@ -1436,6 +1490,7 @@ class DbFirstExtractionTests(IsolatedAsyncioTestCase):
                     document_id=document_id,
                     run_id=None,
                     method="text_extraction",
+                    provider="fake",
                     model="fake-model",
                     fields={"name": "Cached Text"},
                     status="processed",
@@ -1457,7 +1512,7 @@ class DbFirstExtractionTests(IsolatedAsyncioTestCase):
         self.assertEqual(results[0].row["name"], "Cached Text")
         self.assertEqual(output_count, 1)
 
-    async def test_image_only_vlm_uses_reroute_cache_slot(self) -> None:
+    async def test_image_only_vlm_does_not_use_reroute_variant_cache(self) -> None:
         class FailingVisionProvider:
             provider_name = "fake-vision"
             model_name = "fake-vision-model"
@@ -1485,6 +1540,7 @@ class DbFirstExtractionTests(IsolatedAsyncioTestCase):
                     document_id=document_id,
                     run_id=None,
                     method="vision_model_reroute",
+                    provider="fake-vision",
                     model="fake-vision-model",
                     fields={"name": "Cached VLM"},
                     status="rerouted_processed",
@@ -1501,11 +1557,10 @@ class DbFirstExtractionTests(IsolatedAsyncioTestCase):
             with connect(db_path) as connection:
                 output_count = connection.execute("SELECT COUNT(*) AS count FROM extraction_outputs").fetchone()["count"]
 
-        self.assertEqual(results[0].status, CACHED_EXISTING_STATUS)
-        self.assertEqual(results[0].row["name"], "Cached VLM")
-        self.assertEqual(output_count, 1)
+        self.assertEqual(results[0].status, "vision_failed")
+        self.assertEqual(output_count, 2)
 
-    async def test_reroute_uses_image_only_vlm_cache_slot(self) -> None:
+    async def test_reroute_does_not_use_image_only_variant_cache(self) -> None:
         class FailingVisionProvider:
             provider_name = "fake-vision"
             model_name = "fake-vision-model"
@@ -1537,6 +1592,7 @@ class DbFirstExtractionTests(IsolatedAsyncioTestCase):
                     document_id=document_id,
                     run_id=None,
                     method="vision_model_image_only",
+                    provider="fake-vision",
                     model="fake-vision-model",
                     fields={"name": "Cached Direct VLM"},
                     status="vision_processed",
@@ -1554,11 +1610,10 @@ class DbFirstExtractionTests(IsolatedAsyncioTestCase):
             with connect(db_path) as connection:
                 output_count = connection.execute("SELECT COUNT(*) AS count FROM extraction_outputs").fetchone()["count"]
 
-        self.assertEqual(results[0].status, CACHED_EXISTING_STATUS)
-        self.assertEqual(results[0].row["name"], "Cached Direct VLM")
-        self.assertEqual(output_count, 1)
+        self.assertEqual(results[0].status, "rerouted_failed")
+        self.assertEqual(output_count, 2)
 
-    async def test_force_text_extraction_supersedes_existing_slot(self) -> None:
+    async def test_force_text_extraction_supersedes_existing_variant(self) -> None:
         class Provider:
             provider_name = "fake"
             model_name = "fake-model"
@@ -1598,7 +1653,8 @@ class DbFirstExtractionTests(IsolatedAsyncioTestCase):
                     document_id=document_id,
                     run_id=None,
                     method="text_extraction",
-                    model="old-model",
+                    provider="fake",
+                    model="fake-model",
                     fields={"name": "Old Text"},
                     status="processed",
                 )
@@ -1625,3 +1681,68 @@ class DbFirstExtractionTests(IsolatedAsyncioTestCase):
         self.assertIsNotNone(rows[0]["superseded_at"])
         self.assertIsNone(rows[1]["superseded_at"])
         self.assertEqual(json.loads(rows[1]["fields_json"])["name"], "Fresh Text")
+
+    async def test_failed_forced_extraction_keeps_previous_variant_active(self) -> None:
+        class FailingProvider:
+            provider_name = "fake"
+            model_name = "fake-model"
+
+            async def async_complete(self, prompt: str) -> str:
+                raise RuntimeError("provider unavailable")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "state" / "test.sqlite3"
+            artifacts_dir = root / "artifacts"
+            input_dir = root / "input"
+            artifacts_dir.mkdir()
+            input_dir.mkdir()
+            artifact_path = artifacts_dir / "example.txt"
+            image_path = input_dir / "example.jpg"
+            artifact_path.write_text("Max Mustermann", encoding="utf-8")
+            image_path.write_bytes(b"image")
+            (artifacts_dir / "name_map.json").write_text(
+                json.dumps({"example.txt": {"name": "Max Mustermann", "confidence": 93}}),
+                encoding="utf-8",
+            )
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="example",
+                    image_path=image_path,
+                )
+                old_id = insert_extraction_output(
+                    connection,
+                    document_id=document_id,
+                    run_id=None,
+                    method="text_extraction",
+                    provider="fake",
+                    model="fake-model",
+                    fields={"name": "Old Text"},
+                    status="processed",
+                )
+
+            results = await extract_artifacts_to_db_async(
+                artifacts_dir,
+                db_path,
+                FailingProvider(),
+                input_dir=input_dir,
+                source="Aichacher Nachrichten",
+                settings=AsyncExtractionSettings(max_retries=0),
+                force=True,
+            )
+
+            with connect(db_path) as connection:
+                old = connection.execute(
+                    "SELECT superseded_at FROM extraction_outputs WHERE id = ?", (old_id,)
+                ).fetchone()
+                statuses = [
+                    row["status"]
+                    for row in connection.execute("SELECT status FROM extraction_outputs ORDER BY id")
+                ]
+
+        self.assertEqual(results[0].status, "failed")
+        self.assertIsNone(old["superseded_at"])
+        self.assertEqual(statuses, ["processed", "failed"])

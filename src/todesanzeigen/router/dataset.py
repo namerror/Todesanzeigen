@@ -5,16 +5,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..methods import OCR_LLM_SLOT, VLM_SLOT
 from ..storage import (
     DEFAULT_DB_PATH,
     DEFAULT_LABEL_SET,
+    active_extraction_for_variant,
     all_documents,
     apply_migrations,
     connect,
-    latest_active_extraction_by_slot,
     latest_feature_snapshot,
 )
+from ..variants import DEFAULT_VARIANTS_CONFIG_PATH, load_variant_config
 from .labels import TargetFieldMetrics, score_target_fields
 
 
@@ -47,6 +47,10 @@ class RouterDataset:
     no_evaluated_fields: int
     missing_cheap_predictions: int
     missing_vlm_predictions: int
+    text_variant_alias: str
+    vlm_variant_alias: str
+    text_variant: dict[str, str]
+    vlm_variant: dict[str, str]
 
 
 def load_router_dataset(
@@ -57,7 +61,11 @@ def load_router_dataset(
     target_f1_threshold: float,
     split_name: str = "",
     require_labels: bool = True,
+    variants_config: Path = DEFAULT_VARIANTS_CONFIG_PATH,
 ) -> RouterDataset:
+    variant_config = load_variant_config(variants_config)
+    text_variant = variant_config.variant(variant_config.text_default)
+    vlm_variant = variant_config.variant(variant_config.vlm_default)
     apply_migrations(db_path)
     records: list[RouterRecord] = []
     missing_features = 0
@@ -84,15 +92,21 @@ def load_router_dataset(
                 missing_features += 1
                 continue
 
-            cheap_output = latest_active_extraction_by_slot(
+            cheap_output = active_extraction_for_variant(
                 connection,
                 document_id=document_id,
-                result_slot_value=OCR_LLM_SLOT,
+                method=text_variant.method,
+                provider=text_variant.provider,
+                model=text_variant.model,
+                prompt_version=text_variant.prompt_version,
             )
-            vlm_output = latest_active_extraction_by_slot(
+            vlm_output = active_extraction_for_variant(
                 connection,
                 document_id=document_id,
-                result_slot_value=VLM_SLOT,
+                method=vlm_variant.method,
+                provider=vlm_variant.provider,
+                model=vlm_variant.model,
+                prompt_version=vlm_variant.prompt_version,
             )
             cheap_fields = _loads(cheap_output["fields_json"]) if cheap_output else None
             vlm_fields = _loads(vlm_output["fields_json"]) if vlm_output else None
@@ -140,6 +154,10 @@ def load_router_dataset(
         no_evaluated_fields=no_evaluated_fields,
         missing_cheap_predictions=missing_cheap_predictions,
         missing_vlm_predictions=missing_vlm_predictions,
+        text_variant_alias=text_variant.alias,
+        vlm_variant_alias=vlm_variant.alias,
+        text_variant=text_variant.as_dict(),
+        vlm_variant=vlm_variant.as_dict(),
     )
 
 

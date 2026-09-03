@@ -58,17 +58,20 @@ class CliOcrTests(TestCase):
 
         feature_args = parser.parse_args(["features", "build"])
         export_args = parser.parse_args(
-            ["dataset", "export-router", "--method", "text", "--output-file", "rows.jsonl"]
+            ["dataset", "export-router", "--variant", "text", "--output-file", "rows.jsonl"]
         )
         train_args = parser.parse_args(["router", "train", "--model-dir", "model"])
         manifest_args = parser.parse_args(
             ["router", "manifest", "--model-dir", "model", "--output-file", "routes.jsonl"]
         )
+        eval_args = parser.parse_args(["eval", "run", "--variant", "text_current"])
 
         self.assertEqual(feature_args.feature_set, "router-v2")
         self.assertEqual(export_args.feature_set, "router-v2")
         self.assertEqual(train_args.feature_set, "router-v2")
         self.assertEqual(manifest_args.feature_set, "router-v2")
+        self.assertEqual(eval_args.variant, "text_current")
+        self.assertEqual(eval_args.variants_config, Path("config/extraction_variants.toml"))
 
     def test_documentai_requires_explicit_gcp_unlock(self) -> None:
         args = cli.build_parser().parse_args(["ocr", "--engine", "documentai"])
@@ -220,6 +223,7 @@ class CliOcrTests(TestCase):
             method="text_extraction",
             provider="qwen",
             model="qwen3.6-flash",
+            prompt_version="death_notice_v3",
             candidate_kind="pipeline",
             input_dir=Path("input/Aichacher Nachrichten"),
         )

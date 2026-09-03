@@ -12,7 +12,7 @@ from typing import Any, Iterable
 
 from .llm import CSV_COLUMNS
 from .methods import (
-    DEFAULT_EXPORT_METHOD_PRIORITY,
+    CURRENT_PROMPT_VERSION,
     GT_EXPORT_SOURCE,
     default_route_reason,
     method_family,
@@ -26,7 +26,7 @@ from .ocr import image_mime_type
 
 DEFAULT_DB_PATH = Path("state/todesanzeigen.sqlite3")
 DEFAULT_LABEL_SET = "gt-v1"
-SCHEMA_VERSION = "005_remove_artifacts"
+SCHEMA_VERSION = "006_extraction_variants"
 SUCCESSFUL_EXTRACTION_STATUSES = ("processed", "rerouted_processed", "vision_processed")
 
 
@@ -322,7 +322,7 @@ def insert_extraction_output(
     status: str,
     provider: str = "",
     model: str = "",
-    prompt_version: str = "death_notice_v3",
+    prompt_version: str = CURRENT_PROMPT_VERSION,
     raw_response: str = "",
     error: str = "",
     attempts: int = 0,
@@ -716,6 +716,7 @@ def document_review_detail(
                 extraction_outputs.method AS extraction_method,
                 extraction_outputs.provider AS extraction_provider,
                 extraction_outputs.model AS extraction_model,
+                extraction_outputs.prompt_version AS extraction_prompt_version,
                 extraction_outputs.method_family,
                 extraction_outputs.route_reason,
                 extraction_outputs.result_slot,
@@ -729,16 +730,7 @@ def document_review_detail(
             (document_id,),
         )
     )
-    candidates: list[dict[str, Any]] = []
-    seen_methods: set[str] = set()
-    for row in candidate_rows:
-        method_key = str(
-            row["extraction_method"] or row["source_name"] or row["source_kind"] or row["id"]
-        )
-        if method_key in seen_methods:
-            continue
-        seen_methods.add(method_key)
-        candidates.append({**dict(row), "fields": _loads(row["fields_json"])})
+    candidates = [{**dict(row), "fields": _loads(row["fields_json"])} for row in candidate_rows]
     ground_truth = connection.execute(
         """
         SELECT
@@ -748,6 +740,7 @@ def document_review_detail(
             extraction_outputs.method AS extraction_method,
             extraction_outputs.provider AS extraction_provider,
             extraction_outputs.model AS extraction_model,
+            extraction_outputs.prompt_version AS extraction_prompt_version,
             extraction_outputs.method_family AS method_family,
             extraction_outputs.route_reason AS route_reason
         FROM ground_truth_labels
@@ -781,62 +774,54 @@ def document_review_detail(
     }
 
 
-def latest_extraction_by_method(
+def active_extraction_for_variant(
     connection: sqlite3.Connection,
     *,
     document_id: int,
     method: str,
-) -> sqlite3.Row | None:
-    return connection.execute(
-        """
-        SELECT * FROM extraction_outputs
-        WHERE document_id = ? AND method = ? AND status IN (
-            'processed', 'rerouted_processed', 'vision_processed'
-        )
-          AND superseded_at IS NULL
-        ORDER BY created_at DESC, id DESC
-        LIMIT 1
-        """,
-        (document_id, method),
-    ).fetchone()
-
-
-def latest_active_extraction_by_slot(
-    connection: sqlite3.Connection,
-    *,
-    document_id: int,
-    result_slot_value: str,
+    provider: str,
+    model: str,
+    prompt_version: str,
 ) -> sqlite3.Row | None:
     return connection.execute(
         """
         SELECT * FROM extraction_outputs
         WHERE document_id = ?
-          AND result_slot = ?
+          AND method = ?
+          AND provider = ?
+          AND model = ?
+          AND prompt_version = ?
           AND superseded_at IS NULL
           AND status IN ('processed', 'rerouted_processed', 'vision_processed')
         ORDER BY created_at DESC, id DESC
         LIMIT 1
         """,
-        (document_id, result_slot_value),
+        (document_id, method, provider, model, prompt_version),
     ).fetchone()
 
 
-def supersede_active_extractions_by_slot(
+def supersede_active_extraction_for_variant(
     connection: sqlite3.Connection,
     *,
     document_id: int,
-    result_slot_value: str,
+    method: str,
+    provider: str,
+    model: str,
+    prompt_version: str,
 ) -> int:
     cursor = connection.execute(
         """
         UPDATE extraction_outputs
         SET superseded_at = CURRENT_TIMESTAMP
         WHERE document_id = ?
-          AND result_slot = ?
+          AND method = ?
+          AND provider = ?
+          AND model = ?
+          AND prompt_version = ?
           AND superseded_at IS NULL
           AND status IN ('processed', 'rerouted_processed', 'vision_processed')
         """,
-        (document_id, result_slot_value),
+        (document_id, method, provider, model, prompt_version),
     )
     return int(cursor.rowcount)
 
@@ -1043,10 +1028,14 @@ def export_priority_csv(
     *,
     output_csv: Path,
     label_set: str = DEFAULT_LABEL_SET,
-    method_priority: tuple[str, ...] = DEFAULT_EXPORT_METHOD_PRIORITY,
+    variants_config: Path | None = None,
 ) -> CsvExportSummary:
+    from .variants import DEFAULT_VARIANTS_CONFIG_PATH, load_variant_config
+
+    config = load_variant_config(variants_config or DEFAULT_VARIANTS_CONFIG_PATH)
+    operational_variants = config.operational_variants
     output_csv.parent.mkdir(parents=True, exist_ok=True)
-    method_rows = {method: 0 for method in method_priority}
+    method_rows = {variant.alias: 0 for variant in operational_variants}
     ground_truth_count = 0
     missing_count = 0
     rows: list[dict[str, str]] = []
@@ -1055,7 +1044,7 @@ def export_priority_csv(
             connection,
             document_id=int(document["id"]),
             label_set=label_set,
-            method_priority=method_priority,
+            variants=operational_variants,
         )
         if fields is None:
             missing_count += 1
@@ -1112,7 +1101,7 @@ def _selected_export_fields(
     *,
     document_id: int,
     label_set: str,
-    method_priority: tuple[str, ...],
+    variants: tuple[Any, ...],
 ) -> tuple[str, dict[str, Any] | None]:
     ground_truth = connection.execute(
         """
@@ -1124,14 +1113,17 @@ def _selected_export_fields(
     if ground_truth is not None:
         return GT_EXPORT_SOURCE, _loads(ground_truth["fields_json"])
 
-    for method in method_priority:
-        prediction = latest_extraction_by_method(
+    for variant in variants:
+        prediction = active_extraction_for_variant(
             connection,
             document_id=document_id,
-            method=method,
+            method=variant.method,
+            provider=variant.provider,
+            model=variant.model,
+            prompt_version=variant.prompt_version,
         )
         if prediction is not None:
-            return method, _loads(prediction["fields_json"])
+            return variant.alias, _loads(prediction["fields_json"])
 
     return "", None
 

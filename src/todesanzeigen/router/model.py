@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ..storage import DEFAULT_DB_PATH, DEFAULT_LABEL_SET
+from ..variants import DEFAULT_VARIANTS_CONFIG_PATH
 from .dataset import RouterDataset, RouterRecord, load_router_dataset
 from .metrics import binary_metrics, routing_metrics
 
@@ -72,6 +73,7 @@ def train_router_from_db(
     vlm_cost: float = DEFAULT_VLM_COST,
     lambda_cost: float = DEFAULT_LAMBDA_COST,
     min_train_rows: int = 4,
+    variants_config: Path = DEFAULT_VARIANTS_CONFIG_PATH,
 ) -> RouterTrainingSummary:
     dataset = load_router_dataset(
         db_path=db_path,
@@ -80,6 +82,7 @@ def train_router_from_db(
         target_f1_threshold=target_f1_threshold,
         split_name=split_name,
         require_labels=True,
+        variants_config=variants_config,
     )
     train_records, validation_records, split_strategy = _split_records(
         list(dataset.records),
@@ -135,6 +138,10 @@ def train_router_from_db(
         "feature_set": dataset.feature_set,
         "split_name": dataset.split_name,
         "split_strategy": split_strategy,
+        "variants": {
+            "text": dataset.text_variant,
+            "vlm": dataset.vlm_variant,
+        },
         "target_f1_threshold": target_f1_threshold,
         "rows": {
             "loaded": len(dataset.records),
