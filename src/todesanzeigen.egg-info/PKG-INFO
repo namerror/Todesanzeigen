@@ -514,8 +514,9 @@ todesanzeigen eval run \
 ```
 
 Evaluation records exact-record accuracy, field-level precision, recall, F1, and
-missing predictions. Aggregate metrics are stored in `evaluation_runs`; per
-document field comparisons are stored in `evaluation_results`.
+missing predictions. The command compares stored extraction outputs with the
+current ground-truth labels and prints the metrics directly in the terminal.
+Evaluation does not invoke an extraction model or persist evaluation history.
 
 ### Recommended ML Workflow
 

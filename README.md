@@ -650,9 +650,9 @@ todesanzeigen eval run \
 
 Evaluation records exact-record accuracy, field-level precision, recall, F1,
 missing predictions, and aggregate stored token, latency, and cost telemetry.
-The alias and resolved variant tuple are stored with the run. Aggregate metrics
-are stored in `evaluation_runs`; per
-document field comparisons are stored in `evaluation_results`.
+The command compares the selected stored extraction outputs with the current
+ground-truth labels and prints the metrics directly in the terminal. Evaluation
+does not invoke an extraction model or persist evaluation history.
 
 ### Recommended ML Workflow
 

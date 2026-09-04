@@ -83,6 +83,7 @@ class MlInfrastructureTests(TestCase):
                     "004_require_generation_model",
                     "005_remove_artifacts",
                     "006_extraction_variants",
+                    "007_remove_evaluation_history",
                 ],
             )
             self.assertEqual(second, [])
@@ -95,10 +96,60 @@ class MlInfrastructureTests(TestCase):
                 }
             self.assertIn("documents", tables)
             self.assertIn("ground_truth_labels", tables)
-            self.assertIn("evaluation_results", tables)
+            self.assertNotIn("evaluation_runs", tables)
+            self.assertNotIn("evaluation_results", tables)
             self.assertIn("extraction_methods", tables)
             self.assertIn("feature_snapshots", tables)
             self.assertNotIn("artifacts", tables)
+
+    def test_remove_evaluation_history_migration_drops_existing_records(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "state" / "test.sqlite3"
+            old_migrations = root / "old-migrations"
+            old_migrations.mkdir()
+            migrations = Path(__file__).resolve().parents[1] / "migrations"
+            for path in sorted(migrations.glob("*.sql")):
+                if path.name != "007_remove_evaluation_history.sql":
+                    shutil.copy2(path, old_migrations / path.name)
+
+            apply_migrations(db_path, old_migrations)
+            with connect(db_path) as connection:
+                connection.execute("INSERT INTO sources(id, name) VALUES (1, 'Test Source')")
+                connection.execute(
+                    """
+                    INSERT INTO documents(id, document_key, source_id, filename_stem)
+                    VALUES (10, 'test:example', 1, 'example')
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO evaluation_runs(id, name, label_set, method)
+                    VALUES (20, 'old-evaluation', 'gt-v1', 'text_extraction')
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO evaluation_results(id, evaluation_run_id, document_id)
+                    VALUES (30, 20, 10)
+                    """
+                )
+
+            self.assertEqual(apply_migrations(db_path), ["007_remove_evaluation_history"])
+            with connect(db_path) as connection:
+                tables = {
+                    row["name"]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+                document = connection.execute("SELECT id FROM documents WHERE id = 10").fetchone()
+                integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+
+            self.assertNotIn("evaluation_runs", tables)
+            self.assertNotIn("evaluation_results", tables)
+            self.assertEqual(document["id"], 10)
+            self.assertEqual(integrity, "ok")
 
     def test_remove_artifacts_migration_preserves_lineage_and_foreign_keys(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -189,23 +240,13 @@ class MlInfrastructureTests(TestCase):
                     ) VALUES (50, 10, 20, 'router-v2', '{}')
                     """
                 )
-                connection.execute(
-                    """
-                    INSERT INTO evaluation_runs(id, name, label_set, method)
-                    VALUES (60, 'test-eval', 'gt-v1', 'text_extraction')
-                    """
-                )
-                connection.execute(
-                    """
-                    INSERT INTO evaluation_results(
-                        id, evaluation_run_id, document_id, extraction_output_id
-                    ) VALUES (70, 60, 10, 30)
-                    """
-                )
-
             self.assertEqual(
                 apply_migrations(db_path),
-                ["005_remove_artifacts", "006_extraction_variants"],
+                [
+                    "005_remove_artifacts",
+                    "006_extraction_variants",
+                    "007_remove_evaluation_history",
+                ],
             )
 
             with connect(db_path) as connection:
@@ -225,9 +266,6 @@ class MlInfrastructureTests(TestCase):
                 ).fetchone()
                 feature = connection.execute(
                     "SELECT * FROM feature_snapshots WHERE id = 50"
-                ).fetchone()
-                evaluation = connection.execute(
-                    "SELECT * FROM evaluation_results WHERE id = 70"
                 ).fetchone()
                 foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
                 integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
@@ -251,7 +289,6 @@ class MlInfrastructureTests(TestCase):
             self.assertEqual(json.loads(run["config_json"])["output_csv_sha256"], "csv-hash")
             self.assertEqual(candidate["extraction_output_id"], 30)
             self.assertEqual(feature["ocr_output_id"], 20)
-            self.assertEqual(evaluation["extraction_output_id"], 30)
             self.assertEqual(foreign_key_errors, [])
             self.assertEqual(integrity, "ok")
 
@@ -1156,11 +1193,14 @@ class MlInfrastructureTests(TestCase):
             self.assertEqual(summary.latency_ms_mean, 80)
             self.assertEqual(summary.cost_usd_total, 0.0125)
             with connect(db_path) as connection:
-                eval_run = connection.execute("SELECT * FROM evaluation_runs").fetchone()
-                eval_result = connection.execute("SELECT * FROM evaluation_results").fetchone()
-            self.assertEqual(eval_run["method"], "text_extraction")
-            self.assertEqual(json.loads(eval_run["config_json"])["variant_alias"], "test_text")
-            self.assertEqual(eval_result["exact_match"], 0)
+                tables = {
+                    row["name"]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+            self.assertNotIn("evaluation_runs", tables)
+            self.assertNotIn("evaluation_results", tables)
 
     def test_export_priority_csv_prefers_ground_truth_then_vlm_then_text(self) -> None:
         with TemporaryDirectory() as tmp:

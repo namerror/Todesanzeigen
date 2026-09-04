@@ -26,7 +26,7 @@ from .ocr import image_mime_type
 
 DEFAULT_DB_PATH = Path("state/todesanzeigen.sqlite3")
 DEFAULT_LABEL_SET = "gt-v1"
-SCHEMA_VERSION = "006_extraction_variants"
+SCHEMA_VERSION = "007_remove_evaluation_history"
 SUCCESSFUL_EXTRACTION_STATUSES = ("processed", "rerouted_processed", "vision_processed")
 
 
@@ -972,54 +972,6 @@ def all_documents(connection: sqlite3.Connection) -> list[sqlite3.Row]:
             ORDER BY sources.name, documents.filename_stem, documents.id
             """
         )
-    )
-
-
-def insert_evaluation_run(
-    connection: sqlite3.Connection,
-    *,
-    name: str,
-    label_set: str,
-    method: str,
-    split_name: str,
-    config: dict[str, Any],
-    metrics: dict[str, Any],
-) -> int:
-    cursor = connection.execute(
-        """
-        INSERT INTO evaluation_runs(
-            name, label_set, method, split_name, config_json, metrics_json
-        )
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (name, label_set, method, split_name, _json(config), _json(metrics)),
-    )
-    return int(cursor.lastrowid)
-
-
-def insert_evaluation_result(
-    connection: sqlite3.Connection,
-    *,
-    evaluation_run_id: int,
-    document_id: int,
-    extraction_output_id: int | None,
-    exact_match: bool,
-    field_results: dict[str, Any],
-) -> None:
-    connection.execute(
-        """
-        INSERT INTO evaluation_results(
-            evaluation_run_id, document_id, extraction_output_id, exact_match, field_results_json
-        )
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            evaluation_run_id,
-            document_id,
-            extraction_output_id,
-            1 if exact_match else 0,
-            _json(field_results),
-        ),
     )
 
 

@@ -345,7 +345,6 @@ def build_parser() -> argparse.ArgumentParser:
     eval_run.add_argument("--variant", required=True)
     eval_run.add_argument("--variants-config", type=Path, default=DEFAULT_VARIANTS_CONFIG_PATH)
     eval_run.add_argument("--split", default="")
-    eval_run.add_argument("--name")
 
     router = subparsers.add_parser("router", help="Train and apply learned model-routing policies.")
     router_subparsers = router.add_subparsers(dest="router_command", required=True)
@@ -829,10 +828,9 @@ def run_eval_command(args: argparse.Namespace) -> int:
             variant_alias=args.variant,
             variants_config=args.variants_config,
             split_name=args.split,
-            name=args.name,
         )
         print(
-            f"Evaluation {summary.evaluation_run_id}: {summary.documents} documents; "
+            f"Evaluation: {summary.documents} documents; "
             f"exact={summary.exact_record_accuracy:.3f}; "
             f"field_f1={summary.field_f1:.3f}; "
             f"precision={summary.field_precision:.3f}; recall={summary.field_recall:.3f}; "

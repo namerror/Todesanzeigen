@@ -72,6 +72,36 @@ class CliOcrTests(TestCase):
         self.assertEqual(manifest_args.feature_set, "router-v2")
         self.assertEqual(eval_args.variant, "text_current")
         self.assertEqual(eval_args.variants_config, Path("config/extraction_variants.toml"))
+        self.assertFalse(hasattr(eval_args, "name"))
+
+    def test_eval_prints_terminal_summary_without_run_id(self) -> None:
+        args = cli.build_parser().parse_args(
+            ["eval", "run", "--variant", "text_current"]
+        )
+        summary = SimpleNamespace(
+            documents=2,
+            exact_record_accuracy=0.5,
+            field_f1=0.75,
+            field_precision=0.8,
+            field_recall=0.7,
+            missing_predictions=1,
+            estimated_tokens_total=100,
+            estimated_tokens_count=1,
+            latency_ms_mean=25.0,
+            latency_ms_count=1,
+            cost_usd_total=0.01,
+            cost_usd_count=1,
+        )
+
+        output = StringIO()
+        with (
+            patch("src.todesanzeigen.evaluation.evaluate_variant", return_value=summary),
+            redirect_stdout(output),
+        ):
+            result = cli.run_eval_command(args)
+
+        self.assertEqual(result, 0)
+        self.assertTrue(output.getvalue().startswith("Evaluation: 2 documents;"))
 
     def test_documentai_requires_explicit_gcp_unlock(self) -> None:
         args = cli.build_parser().parse_args(["ocr", "--engine", "documentai"])

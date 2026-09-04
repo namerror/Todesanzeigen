@@ -14,8 +14,6 @@ from .storage import (
     connect,
     create_dataset_split,
     ground_truth_rows,
-    insert_evaluation_result,
-    insert_evaluation_run,
 )
 from .variants import DEFAULT_VARIANTS_CONFIG_PATH, load_variant_config
 
@@ -30,7 +28,6 @@ class SplitSummary:
 
 @dataclass(frozen=True)
 class EvaluationSummary:
-    evaluation_run_id: int
     variant_alias: str
     documents: int
     exact_record_accuracy: float
@@ -98,7 +95,6 @@ def evaluate_variant(
     variant_alias: str,
     variants_config: Path = DEFAULT_VARIANTS_CONFIG_PATH,
     split_name: str = "",
-    name: str | None = None,
 ) -> EvaluationSummary:
     variant = load_variant_config(variants_config).variant(variant_alias)
     apply_migrations(db_path)
@@ -117,7 +113,6 @@ def evaluate_variant(
             "latency_ms": [],
             "cost_usd": [],
         }
-        per_document: list[dict[str, Any]] = []
         for label in labels:
             truth = _loads(label["fields_json"])
             prediction_row = active_extraction_for_variant(
@@ -139,14 +134,6 @@ def evaluate_variant(
                     for column in STORED_COLUMNS
                     if _clean(truth.get(column, ""))
                 }
-                per_document.append(
-                    {
-                        "document_id": int(label["document_id"]),
-                        "extraction_output_id": None,
-                        "exact_match": False,
-                        "field_results": field_results,
-                    }
-                )
                 totals["fn"] += len(field_results)
                 continue
 
@@ -161,14 +148,6 @@ def evaluate_variant(
             totals["fp"] += counts["fp"]
             totals["fn"] += counts["fn"]
             totals["exact"] += 1 if exact else 0
-            per_document.append(
-                {
-                    "document_id": int(label["document_id"]),
-                    "extraction_output_id": int(prediction_row["id"]),
-                    "exact_match": exact,
-                    "field_results": field_results,
-                }
-            )
 
         precision = _safe_div(totals["tp"], totals["tp"] + totals["fp"])
         recall = _safe_div(totals["tp"], totals["tp"] + totals["fn"])
@@ -177,41 +156,7 @@ def evaluate_variant(
         estimated_tokens_total = _sum_or_none(telemetry["estimated_tokens"], integer=True)
         latency_ms_total = _sum_or_none(telemetry["latency_ms"], integer=True)
         cost_usd_total = _sum_or_none(telemetry["cost_usd"])
-        metrics = {
-            "documents": totals["documents"],
-            "exact_record_accuracy": exact_accuracy,
-            "field_precision": precision,
-            "field_recall": recall,
-            "field_f1": f1,
-            "missing_predictions": totals["missing_predictions"],
-            "estimated_tokens_total": estimated_tokens_total,
-            "estimated_tokens_count": len(telemetry["estimated_tokens"]),
-            "latency_ms_total": latency_ms_total,
-            "latency_ms_mean": _mean_or_none(telemetry["latency_ms"]),
-            "latency_ms_count": len(telemetry["latency_ms"]),
-            "cost_usd_total": cost_usd_total,
-            "cost_usd_count": len(telemetry["cost_usd"]),
-        }
-        evaluation_run_id = insert_evaluation_run(
-            connection,
-            name=name or f"{variant_alias}:{label_set}",
-            label_set=label_set,
-            method=variant.method,
-            split_name=split_name,
-            config={"variant_alias": variant_alias, "variant": variant.as_dict()},
-            metrics=metrics,
-        )
-        for result in per_document:
-            insert_evaluation_result(
-                connection,
-                evaluation_run_id=evaluation_run_id,
-                document_id=result["document_id"],
-                extraction_output_id=result["extraction_output_id"],
-                exact_match=result["exact_match"],
-                field_results=result["field_results"],
-            )
     return EvaluationSummary(
-        evaluation_run_id=evaluation_run_id,
         variant_alias=variant_alias,
         documents=totals["documents"],
         exact_record_accuracy=exact_accuracy,
