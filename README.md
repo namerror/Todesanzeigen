@@ -434,6 +434,20 @@ default text variant, then no row. Superseded extraction rows are ignored by
 this export. Internally, `ort` is the single stored location field. CSV export
 copies it to both `ort` and the legacy `wohnort` column.
 
+To export one configured extraction variant directly without promoting it to
+ground truth, pass its alias:
+
+```sh
+todesanzeigen export csv \
+  --db state/todesanzeigen.sqlite3 \
+  --variant vlm_current \
+  --output-file output/vlm_current.csv
+```
+
+Variant export uses the exact method/provider/model/prompt tuple from
+`config/extraction_variants.toml`, includes only active successful outputs for
+that alias, and does not let reviewed GT override the exported row.
+
 Normalize legacy location and date fields with a dry run first, then apply the
 transactional update with an automatic timestamped backup:
 

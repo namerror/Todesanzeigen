@@ -1,4 +1,4 @@
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -73,6 +73,38 @@ class CliOcrTests(TestCase):
         self.assertEqual(eval_args.variant, "text_current")
         self.assertEqual(eval_args.variants_config, Path("config/extraction_variants.toml"))
         self.assertFalse(hasattr(eval_args, "name"))
+
+    def test_export_csv_variant_dispatches_to_alias_export(self) -> None:
+        args = cli.build_parser().parse_args(
+            ["export", "csv", "--variant", "vlm_current", "--output-file", "vlm.csv"]
+        )
+        summary = SimpleNamespace(
+            rows=2,
+            method_rows={"vlm_current": 2},
+            missing_documents=1,
+        )
+
+        output = StringIO()
+        with (
+            patch("src.todesanzeigen.storage.apply_migrations") as apply_migrations,
+            patch("src.todesanzeigen.storage.connect", return_value=nullcontext("connection")) as connect,
+            patch("src.todesanzeigen.storage.export_priority_csv") as export_priority_csv,
+            patch("src.todesanzeigen.storage.export_variant_csv", return_value=summary) as export_variant_csv,
+            redirect_stdout(output),
+        ):
+            result = cli.run_export_command(args)
+
+        self.assertEqual(result, 0)
+        apply_migrations.assert_called_once_with(Path("state/todesanzeigen.sqlite3"))
+        connect.assert_called_once_with(Path("state/todesanzeigen.sqlite3"))
+        export_priority_csv.assert_not_called()
+        export_variant_csv.assert_called_once_with(
+            "connection",
+            output_csv=Path("vlm.csv"),
+            variant_alias="vlm_current",
+            variants_config=Path("config/extraction_variants.toml"),
+        )
+        self.assertIn("Exported 2 vlm_current rows", output.getvalue())
 
     def test_eval_prints_terminal_summary_without_run_id(self) -> None:
         args = cli.build_parser().parse_args(

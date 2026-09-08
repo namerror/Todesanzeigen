@@ -25,6 +25,7 @@ from src.todesanzeigen.storage import (
     connect,
     create_run,
     export_priority_csv,
+    export_variant_csv,
     insert_extraction_output,
     insert_label_candidate,
     load_candidate,
@@ -1282,6 +1283,105 @@ class MlInfrastructureTests(TestCase):
         self.assertEqual(summary.method_rows["test_text"], 1)
         self.assertEqual(summary.missing_documents, 1)
         self.assertEqual([row["name"] for row in rows], ["Ground Truth", "Text", "Vision"])
+
+    def test_export_variant_csv_uses_alias_without_ground_truth_override(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "state" / "test.sqlite3"
+            output_csv = root / "output" / "vlm.csv"
+            variants_config = _write_test_variants(root)
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                gt_document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="gt-doc",
+                )
+                vlm_document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="vlm-doc",
+                )
+                stale_document_id = upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="stale-doc",
+                )
+                upsert_document(
+                    connection,
+                    source_name="Aichacher Nachrichten",
+                    filename_stem="missing-doc",
+                )
+                save_ground_truth_label(
+                    connection,
+                    document_id=gt_document_id,
+                    label_set=DEFAULT_LABEL_SET,
+                    fields={"name": "Ground Truth", "dateiname": "gt-doc"},
+                )
+                insert_extraction_output(
+                    connection,
+                    document_id=gt_document_id,
+                    run_id=None,
+                    method="vision_model_image_only",
+                    provider="test",
+                    model="test-vision-model",
+                    fields={"name": "Variant Beats GT"},
+                    status="vision_processed",
+                )
+                insert_extraction_output(
+                    connection,
+                    document_id=vlm_document_id,
+                    run_id=None,
+                    method="vision_model_image_only",
+                    provider="test",
+                    model="test-vision-model",
+                    fields={"name": "Vision"},
+                    status="vision_processed",
+                )
+                insert_extraction_output(
+                    connection,
+                    document_id=stale_document_id,
+                    run_id=None,
+                    method="vision_model_image_only",
+                    provider="test",
+                    model="test-vision-model",
+                    prompt_version="death_notice_v2",
+                    fields={"name": "Stale Prompt"},
+                    status="vision_processed",
+                )
+
+                summary = export_variant_csv(
+                    connection,
+                    output_csv=output_csv,
+                    variant_alias="test_vlm",
+                    variants_config=variants_config,
+                )
+
+            with output_csv.open(encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(summary.rows, 2)
+        self.assertEqual(summary.ground_truth_rows, 0)
+        self.assertEqual(summary.method_rows["test_vlm"], 2)
+        self.assertEqual(summary.missing_documents, 2)
+        self.assertEqual([row["name"] for row in rows], ["Variant Beats GT", "Vision"])
+
+    def test_export_variant_csv_rejects_unknown_alias(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "state" / "test.sqlite3"
+            variants_config = _write_test_variants(root)
+            apply_migrations(db_path)
+            with connect(db_path) as connection:
+                with self.assertRaises(ValueError) as error:
+                    export_variant_csv(
+                        connection,
+                        output_csv=root / "output" / "missing.csv",
+                        variant_alias="missing_variant",
+                        variants_config=variants_config,
+                    )
+
+        self.assertIn("Unknown extraction variant alias 'missing_variant'", str(error.exception))
 
     def test_feature_snapshots_and_router_export(self) -> None:
         with TemporaryDirectory() as tmp:

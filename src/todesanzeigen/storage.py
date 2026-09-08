@@ -1025,6 +1025,53 @@ def export_priority_csv(
     )
 
 
+def export_variant_csv(
+    connection: sqlite3.Connection,
+    *,
+    output_csv: Path,
+    variant_alias: str,
+    variants_config: Path | None = None,
+) -> CsvExportSummary:
+    from .variants import DEFAULT_VARIANTS_CONFIG_PATH, load_variant_config
+
+    config = load_variant_config(variants_config or DEFAULT_VARIANTS_CONFIG_PATH)
+    variant = config.variant(variant_alias)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, str]] = []
+    missing_count = 0
+    for document in all_documents(connection):
+        prediction = active_extraction_for_variant(
+            connection,
+            document_id=int(document["id"]),
+            method=variant.method,
+            provider=variant.provider,
+            model=variant.model,
+            prompt_version=variant.prompt_version,
+        )
+        if prediction is None:
+            missing_count += 1
+            continue
+        rows.append(
+            _fields_for_csv(
+                _loads(prediction["fields_json"]),
+                source=str(document["source"]),
+                filename_stem=str(document["filename_stem"]),
+            )
+        )
+
+    with output_csv.open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return CsvExportSummary(
+        rows=len(rows),
+        ground_truth_rows=0,
+        method_rows={variant.alias: len(rows)},
+        missing_documents=missing_count,
+    )
+
+
 def read_csv_rows(path: Path) -> list[dict[str, str]]:
     with path.open(encoding="utf-8", newline="") as handle:
         return [normalize_stored_fields(row) for row in csv.DictReader(handle)]

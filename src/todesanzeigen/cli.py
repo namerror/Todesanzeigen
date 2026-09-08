@@ -336,6 +336,10 @@ def build_parser() -> argparse.ArgumentParser:
     export_csv.add_argument("--label-set", default=DEFAULT_LABEL_SET)
     export_csv.add_argument("--output-file", type=Path, default=Path("output/result.csv"))
     export_csv.add_argument("--variants-config", type=Path, default=DEFAULT_VARIANTS_CONFIG_PATH)
+    export_csv.add_argument(
+        "--variant",
+        help="Export active successful outputs for this extraction variant alias instead of GT-prioritized rows.",
+    )
 
     eval_parser = subparsers.add_parser("eval", help="Evaluate extraction outputs against ground truth labels.")
     eval_subparsers = eval_parser.add_subparsers(dest="eval_command", required=True)
@@ -796,24 +800,38 @@ def run_features_command(args: argparse.Namespace) -> int:
 
 def run_export_command(args: argparse.Namespace) -> int:
     if args.export_command == "csv":
-        from .storage import apply_migrations, connect, export_priority_csv
+        from .storage import apply_migrations, connect, export_priority_csv, export_variant_csv
 
         apply_migrations(args.db)
         with connect(args.db) as connection:
-            summary = export_priority_csv(
-                connection,
-                output_csv=args.output_file,
-                label_set=args.label_set,
-                variants_config=args.variants_config,
-            )
+            if args.variant:
+                summary = export_variant_csv(
+                    connection,
+                    output_csv=args.output_file,
+                    variant_alias=args.variant,
+                    variants_config=args.variants_config,
+                )
+            else:
+                summary = export_priority_csv(
+                    connection,
+                    output_csv=args.output_file,
+                    label_set=args.label_set,
+                    variants_config=args.variants_config,
+                )
         method_parts = ", ".join(
             f"{method}={count}" for method, count in summary.method_rows.items()
         )
-        print(
-            f"Exported {summary.rows} rows to {args.output_file}; "
-            f"ground_truth={summary.ground_truth_rows}; {method_parts}; "
-            f"missing_documents={summary.missing_documents}."
-        )
+        if args.variant:
+            print(
+                f"Exported {summary.rows} {args.variant} rows to {args.output_file}; "
+                f"{method_parts}; missing_documents={summary.missing_documents}."
+            )
+        else:
+            print(
+                f"Exported {summary.rows} rows to {args.output_file}; "
+                f"ground_truth={summary.ground_truth_rows}; {method_parts}; "
+                f"missing_documents={summary.missing_documents}."
+            )
         return 0
     raise ValueError(f"Unsupported export command: {args.export_command}")
 
