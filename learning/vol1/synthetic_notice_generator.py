@@ -185,7 +185,7 @@ CORRUPTION_KINDS = (
 @dataclass(frozen=True)
 class GeneratorConfig:
     seed: int = 17
-    families_per_template: int = 50
+    families_per_template: int = 50 # number of distinct families to generate per template
     train_percent: int = 80
     validation_percent: int = 10
     test_percent: int = 10
