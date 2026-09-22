@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import tempfile
 from dataclasses import asdict, dataclass
 from datetime import date, timedelta
@@ -19,9 +20,9 @@ from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
 
-GENERATOR_VERSION = "v1"
+GENERATOR_VERSION = "v2"
 SCHEMA_VERSION = 1
-SPLIT_ID = "synthetic-v1-grouped"
+SPLIT_ID = "synthetic-v2-grouped"
 BOS_TOKEN = "<BOS>"
 EOS_TOKEN = "<EOS>"
 SUBSETS = ("train", "validation", "test")
@@ -49,6 +50,10 @@ WEEKDAYS = (
     "Freitag",
     "Samstag",
     "Sonntag",
+)
+_DATE_PATTERN = re.compile(
+    rf"(?<!\d)(?:\d{{1,2}}\.\d{{1,2}}\.\d{{4}}|"
+    rf"\d{{1,2}}\. (?:{'|'.join(map(re.escape, MONTHS))}) \d{{4}})(?!\d)"
 )
 
 # These values are independently authored for this synthetic corpus. They are
@@ -179,6 +184,8 @@ CORRUPTION_KINDS = (
     "dropped-punctuation",
     "merged-spaces",
     "broken-umlaut",
+    "missing-date-digit",
+    "wrong-date-digit",
 )
 
 
@@ -454,6 +461,34 @@ def _break_umlaut(text: str) -> tuple[str, str | None]:
     return text, None
 
 
+def _date_digit_position(text: str, reverse: bool) -> int | None:
+    matches = list(_DATE_PATTERN.finditer(text))
+    if not matches:
+        return None
+    match = matches[-1] if reverse else matches[0]
+    positions = [
+        position
+        for position in range(match.start(), match.end())
+        if text[position].isdigit()
+    ]
+    return positions[-1] if reverse else positions[0]
+
+
+def _remove_date_digit(text: str, reverse: bool) -> tuple[str, str | None]:
+    position = _date_digit_position(text, reverse)
+    if position is None:
+        return text, None
+    return text[:position] + text[position + 1 :], "ocr-missing-date-digit"
+
+
+def _replace_date_digit(text: str, reverse: bool) -> tuple[str, str | None]:
+    position = _date_digit_position(text, reverse)
+    if position is None:
+        return text, None
+    replacement = str((int(text[position]) + 1) % 10)
+    return text[:position] + replacement + text[position + 1 :], "ocr-wrong-date-digit"
+
+
 def apply_ocr_corruption(text: str, kind: str, *, reverse: bool = False) -> tuple[str, str | None]:
     """Apply one deterministic corruption and return its slice label."""
 
@@ -467,6 +502,10 @@ def apply_ocr_corruption(text: str, kind: str, *, reverse: bool = False) -> tupl
         return _merge_spaces(text)
     if kind == "broken-umlaut":
         return _break_umlaut(text)
+    if kind == "missing-date-digit":
+        return _remove_date_digit(text, reverse)
+    if kind == "wrong-date-digit":
+        return _replace_date_digit(text, reverse)
     raise ValueError(f"unknown OCR corruption: {kind}")
 
 

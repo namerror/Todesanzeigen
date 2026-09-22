@@ -29,7 +29,7 @@ from synthetic_notice_generator import (  # noqa: E402
 )
 
 
-DEFAULT_V1_FINGERPRINT = "9d9333d62ad301c09f08226757d4c4e46dd67a561f691382a0950e57bd624676"
+DEFAULT_V2_FINGERPRINT = "4367f6610b5df498b5cbf3ffdcd79d91cb4fae058b483e1ee19df057e36029d2"
 
 
 class SyntheticNoticeGeneratorTests(TestCase):
@@ -49,7 +49,7 @@ class SyntheticNoticeGeneratorTests(TestCase):
         self.assertEqual(len(self.records), 1_200)
         self.assertEqual(
             self.manifest["corpus_fingerprint"]["value"],
-            DEFAULT_V1_FINGERPRINT,
+            DEFAULT_V2_FINGERPRINT,
         )
 
     def test_different_seed_changes_content_and_fingerprint(self) -> None:
@@ -89,6 +89,8 @@ class SyntheticNoticeGeneratorTests(TestCase):
 
     def test_required_semantic_and_corruption_slices_are_present(self) -> None:
         slices = set(self.manifest["slice_counts"])
+        self.assertEqual(self.manifest["configuration"]["corruptions"], list(CORRUPTION_KINDS))
+        self.assertEqual(self.manifest["split_id"], "synthetic-v2-grouped")
         self.assertTrue({"date", "relationship", "ceremony", "umlaut"} <= slices)
         self.assertTrue({"title", "maiden-name", "occupation"} <= slices)
         self.assertTrue(
@@ -100,6 +102,8 @@ class SyntheticNoticeGeneratorTests(TestCase):
                 "ocr-dropped-punctuation",
                 "ocr-merged-spaces",
                 "ocr-broken-umlaut",
+                "ocr-missing-date-digit",
+                "ocr-wrong-date-digit",
             }
             <= slices
         )
@@ -111,6 +115,8 @@ class SyntheticNoticeGeneratorTests(TestCase):
             "dropped-punctuation": "In Liebe, für immer.",
             "merged-spaces": "In stiller Trauer",
             "broken-umlaut": "Für schöne Jahre",
+            "missing-date-digit": "Geboren am 7. März 1942",
+            "wrong-date-digit": "Gestorben am 08.11.2025",
         }
         for kind in CORRUPTION_KINDS:
             with self.subTest(kind=kind):
@@ -125,6 +131,33 @@ class SyntheticNoticeGeneratorTests(TestCase):
         self.assertEqual(rn_label, "ocr-m-to-rn")
         self.assertNotEqual(reverse_ell, "leise")
         self.assertEqual(ell_label, "ocr-l-to-1")
+
+    def test_date_corruptions_target_only_recognized_date_digits(self) -> None:
+        format_cases = {
+            "7. März 1942": ". März 1942",
+            "07. März 1942": "7. März 1942",
+            "7.3.1942": ".3.1942",
+            "07.03.1942": "7.03.1942",
+        }
+        for original, expected in format_cases.items():
+            with self.subTest(date_format=original):
+                changed, label = apply_ocr_corruption(original, "missing-date-digit")
+                self.assertEqual(changed, expected)
+                self.assertEqual(label, "ocr-missing-date-digit")
+
+        text = "Geboren 7. März 1942; gestorben 08.11.2025; um 10.00 Uhr."
+
+        missing, missing_label = apply_ocr_corruption(text, "missing-date-digit")
+        self.assertEqual(missing, "Geboren . März 1942; gestorben 08.11.2025; um 10.00 Uhr.")
+        self.assertEqual(missing_label, "ocr-missing-date-digit")
+
+        wrong, wrong_label = apply_ocr_corruption(text, "wrong-date-digit", reverse=True)
+        self.assertEqual(wrong, "Geboren 7. März 1942; gestorben 08.11.2026; um 10.00 Uhr.")
+        self.assertEqual(wrong_label, "ocr-wrong-date-digit")
+
+        unchanged, label = apply_ocr_corruption("Treffen um 10.00 Uhr", "missing-date-digit")
+        self.assertEqual(unchanged, "Treffen um 10.00 Uhr")
+        self.assertIsNone(label)
 
     def test_vocabulary_is_training_only_sorted_and_covers_evaluation(self) -> None:
         symbols = self.manifest["vocabulary"]["symbols"]
@@ -188,7 +221,7 @@ class SyntheticNoticeGeneratorTests(TestCase):
 
     def test_write_corpus_is_canonical_and_refuses_implicit_overwrite(self) -> None:
         with TemporaryDirectory() as temporary_directory:
-            output_dir = Path(temporary_directory) / "synthetic-v1"
+            output_dir = Path(temporary_directory) / "synthetic-v2"
             manifest = write_corpus(output_dir, self.config)
             corpus_bytes = (output_dir / "corpus.jsonl").read_bytes()
             disk_manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))

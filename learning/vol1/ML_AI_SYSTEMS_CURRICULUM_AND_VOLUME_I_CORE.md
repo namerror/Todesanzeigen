@@ -327,7 +327,7 @@ Use a minimal run record:
   "prediction": "Validation NLL falls most on the date slice.",
   "seed": 17,
   "dataset_fingerprint": "...",
-  "split_id": "synthetic-v1-grouped",
+  "split_id": "synthetic-v2-grouped",
   "model": {"kind": "context_mlp", "context": 3, "embedding_dim": 16},
   "optimizer": {"kind": "sgd", "lr": 0.1},
   "status": "planned"
@@ -946,7 +946,7 @@ Generate invented records from controlled components:
 - invented towns;
 - short notice templates;
 - optional title, maiden name, occupation, and relationship phrases;
-- OCR corruptions such as `rn↔m`, `1↔l`, dropped punctuation, merged spaces, and broken umlauts.
+- OCR corruptions such as `rn↔m`, `1↔l`, dropped punctuation, merged spaces, broken umlauts, and missing or incorrect date digits.
 
 Each record should include metadata but the language model sees only text:
 
@@ -957,7 +957,7 @@ Each record should include metadata but the language model sees only text:
   "text": "...",
   "slices": ["date", "umlaut", "ocr-rn-to-m"],
   "privacy": "synthetic",
-  "generator_version": "v1"
+  "generator_version": "v2"
 }
 ```
 

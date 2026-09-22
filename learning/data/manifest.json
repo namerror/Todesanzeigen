@@ -1,0 +1,283 @@
+{
+  "boundary_tokens": {
+    "bos": "<BOS>",
+    "eos": "<EOS>"
+  },
+  "characters": {
+    "by_subset": {
+      "test": 38343,
+      "train": 285647,
+      "validation": 35892
+    },
+    "total": 359882
+  },
+  "configuration": {
+    "birth_date_range": [
+      "1925-01-01",
+      "1975-12-31"
+    ],
+    "corruptions": [
+      "rn-m",
+      "one-ell",
+      "dropped-punctuation",
+      "merged-spaces",
+      "broken-umlaut",
+      "missing-date-digit",
+      "wrong-date-digit"
+    ],
+    "death_date_range": [
+      "2022-01-01",
+      "2025-12-31"
+    ],
+    "families_per_template": 50,
+    "lexicon_provenance": "independently-authored-synthetic",
+    "templates": [
+      "template01",
+      "template02",
+      "template03",
+      "template04",
+      "template05",
+      "template06",
+      "template07",
+      "template08"
+    ],
+    "variants": [
+      "clean",
+      "light",
+      "heavy"
+    ]
+  },
+  "corpus_fingerprint": {
+    "algorithm": "sha256",
+    "value": "4367f6610b5df498b5cbf3ffdcd79d91cb4fae058b483e1ee19df057e36029d2"
+  },
+  "documents": {
+    "by_subset": {
+      "test": 132,
+      "train": 951,
+      "validation": 117
+    },
+    "total": 1200
+  },
+  "generator_version": "v2",
+  "privacy": "synthetic",
+  "schema_version": 1,
+  "seed": 17,
+  "slice_counts": {
+    "ceremony": {
+      "test": 132,
+      "total": 1200,
+      "train": 951,
+      "validation": 117
+    },
+    "date": {
+      "test": 132,
+      "total": 1200,
+      "train": 951,
+      "validation": 117
+    },
+    "date-numeric": {
+      "test": 81,
+      "total": 600,
+      "train": 480,
+      "validation": 39
+    },
+    "date-written": {
+      "test": 51,
+      "total": 600,
+      "train": 471,
+      "validation": 78
+    },
+    "maiden-name": {
+      "test": 30,
+      "total": 225,
+      "train": 168,
+      "validation": 27
+    },
+    "occupation": {
+      "test": 60,
+      "total": 543,
+      "train": 432,
+      "validation": 51
+    },
+    "ocr-1-to-l": {
+      "test": 16,
+      "total": 114,
+      "train": 91,
+      "validation": 7
+    },
+    "ocr-broken-umlaut": {
+      "test": 25,
+      "total": 228,
+      "train": 177,
+      "validation": 26
+    },
+    "ocr-dropped-punctuation": {
+      "test": 26,
+      "total": 229,
+      "train": 182,
+      "validation": 21
+    },
+    "ocr-l-to-1": {
+      "test": 12,
+      "total": 115,
+      "train": 95,
+      "validation": 8
+    },
+    "ocr-m-to-rn": {
+      "test": 21,
+      "total": 190,
+      "train": 153,
+      "validation": 16
+    },
+    "ocr-merged-spaces": {
+      "test": 27,
+      "total": 228,
+      "train": 182,
+      "validation": 19
+    },
+    "ocr-missing-date-digit": {
+      "test": 21,
+      "total": 228,
+      "train": 181,
+      "validation": 26
+    },
+    "ocr-rn-to-m": {
+      "test": 4,
+      "total": 40,
+      "train": 29,
+      "validation": 7
+    },
+    "ocr-wrong-date-digit": {
+      "test": 24,
+      "total": 228,
+      "train": 178,
+      "validation": 26
+    },
+    "relationship": {
+      "test": 132,
+      "total": 1200,
+      "train": 951,
+      "validation": 117
+    },
+    "title": {
+      "test": 12,
+      "total": 213,
+      "train": 177,
+      "validation": 24
+    },
+    "umlaut": {
+      "test": 132,
+      "total": 1200,
+      "train": 951,
+      "validation": 117
+    },
+    "variant-clean": {
+      "test": 44,
+      "total": 400,
+      "train": 317,
+      "validation": 39
+    },
+    "variant-heavy": {
+      "test": 44,
+      "total": 400,
+      "train": 317,
+      "validation": 39
+    },
+    "variant-light": {
+      "test": 44,
+      "total": 400,
+      "train": 317,
+      "validation": 39
+    }
+  },
+  "split_id": "synthetic-v2-grouped",
+  "split_rule": {
+    "algorithm": "sha256",
+    "bucket_count": 10000,
+    "key": "seed:group_id:split",
+    "percentages": {
+      "test": 10,
+      "train": 80,
+      "validation": 10
+    }
+  },
+  "vocabulary": {
+    "ordering": "boundary-tokens-then-unicode-code-point",
+    "size": 72,
+    "symbols": [
+      "<BOS>",
+      "<EOS>",
+      "\n",
+      " ",
+      "*",
+      ",",
+      "-",
+      ".",
+      "0",
+      "1",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "8",
+      "9",
+      ":",
+      "A",
+      "B",
+      "C",
+      "D",
+      "E",
+      "F",
+      "G",
+      "H",
+      "I",
+      "J",
+      "K",
+      "L",
+      "M",
+      "N",
+      "O",
+      "P",
+      "Q",
+      "R",
+      "S",
+      "T",
+      "U",
+      "V",
+      "W",
+      "Z",
+      "a",
+      "b",
+      "c",
+      "d",
+      "e",
+      "f",
+      "g",
+      "h",
+      "i",
+      "j",
+      "k",
+      "l",
+      "m",
+      "n",
+      "o",
+      "p",
+      "q",
+      "r",
+      "s",
+      "t",
+      "u",
+      "v",
+      "w",
+      "z",
+      "ß",
+      "ä",
+      "ö",
+      "ü",
+      "†"
+    ]
+  }
+}

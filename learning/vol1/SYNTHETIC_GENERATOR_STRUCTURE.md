@@ -31,7 +31,7 @@ flowchart TD
         IDS --> VARIANTS
         VARIANTS --> CORRUPT["_corrupt()<br/>0, 1, or 3 deterministic corruptions"]
         CORRUPT --> APPLY["apply_ocr_corruption()"]
-        APPLY --> OCR["OCR operations<br/>rn↔m · 1↔l · drop punctuation<br/>merge spaces · break umlaut"]
+        APPLY --> OCR["OCR operations<br/>rn↔m · 1↔l · drop punctuation<br/>merge spaces · break umlaut<br/>missing/wrong date digits"]
         OCR --> VARIANT_TEXT["Variant text + OCR slice labels"]
 
         SEMANTIC --> RECORD["NoticeRecord<br/>document_id · group_id · split · text<br/>slices · privacy · generator version"]
