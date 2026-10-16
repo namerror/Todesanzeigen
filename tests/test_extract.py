@@ -17,6 +17,7 @@ from src.todesanzeigen.extract import (
     extract_artifacts_to_csv_async,
     extract_image_with_vision,
     extract_images_to_csv_async,
+    find_image_for_artifact,
     load_reroute_candidates,
     load_name_map,
     normalize_record,
@@ -69,7 +70,7 @@ class AsyncFakeVisionProvider:
 
 
 class ExtractTests(TestCase):
-    def test_discover_artifacts_only_direct_txt_files(self) -> None:
+    def test_discover_artifacts_recursively_finds_txt_files(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             artifacts = root / "artifacts"
@@ -79,7 +80,51 @@ class ExtractTests(TestCase):
             (artifacts / "b.md").write_text("b", encoding="utf-8")
             (nested / "c.txt").write_text("c", encoding="utf-8")
 
-            self.assertEqual([path.name for path in discover_artifacts(artifacts)], ["a.txt"])
+            self.assertEqual(
+                [path.relative_to(artifacts).as_posix() for path in discover_artifacts(artifacts)],
+                ["a.txt", "nested/c.txt"],
+            )
+
+    def test_nested_artifacts_keep_distinct_names_and_images(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = root / "artifacts"
+            input_dir = root / "input"
+            output = root / "output.csv"
+            for folder in ("first", "second"):
+                (artifacts / folder).mkdir(parents=True)
+                (input_dir / folder).mkdir(parents=True)
+                (artifacts / folder / "same.txt").write_text(folder, encoding="utf-8")
+                (input_dir / folder / "same.jpg").write_bytes(folder.encode())
+            (artifacts / "name_map.json").write_text(
+                json.dumps({
+                    f"{folder}/same.txt": {"name": folder, "confidence": 95}
+                    for folder in ("first", "second")
+                }),
+                encoding="utf-8",
+            )
+
+            results = extract_artifacts_to_csv(
+                artifacts, output, FakeLlmProvider("{}"), name_confidence_threshold=85
+            )
+            with output.open(encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+            self.assertEqual([row["dateiname"] for row in rows], ["first/same", "second/same"])
+            self.assertEqual(
+                find_image_for_artifact(results[1].artifact_path, input_dir, artifacts),
+                input_dir / "second" / "same.jpg",
+            )
+
+    def test_select_nested_images_samples_paths_not_basenames(self) -> None:
+        input_dir = Path("input")
+        images = [input_dir / "first" / "same.jpg", input_dir / "second" / "same.jpg"]
+
+        sampled = select_image_paths(images, input_dir=input_dir, sample_ratio=0.5, sample_seed=4)
+        selected = select_image_paths(images, input_dir=input_dir, only=["second/same"])
+
+        self.assertEqual(len(sampled), 1)
+        self.assertEqual(selected, [images[1]])
 
     def test_extract_artifact_to_csv_with_missing_fields(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -356,6 +401,33 @@ class ExtractTests(TestCase):
 
 
 class AsyncExtractTests(IsolatedAsyncioTestCase):
+    async def test_nested_vision_images_have_distinct_checkpoint_keys_and_resume(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "input"
+            output = root / "results.csv"
+            checkpoint = root / "results.jsonl"
+            for folder in ("first", "second"):
+                image = input_dir / folder / "same.jpg"
+                image.parent.mkdir(parents=True)
+                image.write_bytes(folder.encode())
+            provider = AsyncFakeVisionProvider('{"name": "Test"}')
+
+            first = await extract_images_to_csv_async(
+                input_dir, output, provider, results_file=checkpoint
+            )
+            second = await extract_images_to_csv_async(
+                input_dir, output, provider, resume_from=checkpoint
+            )
+            records = [json.loads(line) for line in checkpoint.read_text(encoding="utf-8").splitlines()]
+            with output.open(encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+            self.assertEqual([row["dateiname"] for row in rows], ["first/same", "second/same"])
+            self.assertEqual([record["filename"] for record in records], ["first/same.jpg", "second/same.jpg"])
+            self.assertEqual(len(provider.calls), 2)
+            self.assertEqual([result.artifact_path for result in first], [result.artifact_path for result in second])
+
     async def test_async_extract_writes_rows_in_artifact_order(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

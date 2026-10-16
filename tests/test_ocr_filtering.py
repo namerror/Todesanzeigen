@@ -24,6 +24,20 @@ def tsv(*rows: str) -> str:
 
 
 class OcrFilteringTests(TestCase):
+    def test_nested_artifacts_get_distinct_name_map_keys(self) -> None:
+        with TemporaryDirectory() as tmp:
+            artifacts = Path(tmp) / "artifacts"
+            for folder in ("first", "second"):
+                path = artifacts / folder / "same.tsv"
+                path.parent.mkdir(parents=True)
+                path.write_text(tsv(), encoding="utf-8")
+
+            results = filter_artifact_names(artifacts)
+            name_map = json.loads(name_map_artifact_path(artifacts).read_text(encoding="utf-8"))
+
+            self.assertEqual(len(results), 2)
+            self.assertEqual(sorted(name_map), ["first/same.txt", "second/same.txt"])
+
     def test_detects_largest_name_line(self) -> None:
         tsv_text = tsv(
             "5\t1\t1\t1\t1\t1\t100\t50\t45\t9\t96\tIn",

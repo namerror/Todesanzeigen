@@ -158,7 +158,7 @@ def upsert_document(
     source_id = get_or_create_source(connection, source_name)
     image_path_text = _path_text(image_path)
     document_key = f"{source_name}:{image_path_text or filename_stem}"
-    inferred_year = year if year is not None else infer_year(filename_stem)
+    inferred_year = year if year is not None else infer_year(Path(filename_stem).name)
     if image_path_text:
         existing = connection.execute(
             "SELECT id FROM documents WHERE document_key = ?",

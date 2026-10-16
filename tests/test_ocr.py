@@ -42,7 +42,7 @@ class FakeLayoutOcrClient(FakeOcrClient):
 
 
 class OcrTests(TestCase):
-    def test_discover_images_only_direct_supported_files(self) -> None:
+    def test_discover_images_recursively_finds_supported_files(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             input_dir = root / "input"
@@ -54,9 +54,28 @@ class OcrTests(TestCase):
             (nested / "c.png").write_bytes(b"image")
 
             self.assertEqual(
-                [path.name for path in discover_images(input_dir)],
-                ["a.png", "b.JPG"],
+                [path.relative_to(input_dir).as_posix() for path in discover_images(input_dir)],
+                ["a.png", "b.JPG", "nested/c.png"],
             )
+
+    def test_ocr_mirrors_subfolders_for_repeated_filenames(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "input"
+            artifacts_dir = root / "artifacts"
+            for folder in ("first", "second"):
+                image = input_dir / folder / "same.jpg"
+                image.parent.mkdir(parents=True)
+                image.write_bytes(folder.encode())
+
+            results = run_ocr_folder(input_dir, artifacts_dir, FakeOcrClient())
+
+            self.assertEqual(
+                [result.artifact_path.relative_to(artifacts_dir).as_posix() for result in results],
+                ["first/same.txt", "second/same.txt"],
+            )
+            self.assertTrue((artifacts_dir / "first" / "same.txt").exists())
+            self.assertTrue((artifacts_dir / "second" / "same.txt").exists())
 
     def test_supported_mime_types(self) -> None:
         self.assertEqual(image_mime_type(Path("scan.jpg")), "image/jpeg")

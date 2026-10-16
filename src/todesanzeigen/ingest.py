@@ -9,7 +9,7 @@ from typing import Any
 from .extract import PROCESSED_STATUSES
 from .methods import CURRENT_PROMPT_VERSION, requires_model
 from .normalization import normalize_stored_fields
-from .ocr import image_mime_type
+from .ocr import discover_images, image_mime_type
 from .storage import (
     DEFAULT_DB_PATH,
     apply_migrations,
@@ -77,18 +77,19 @@ def ingest_source(
         ocr_count = 0
 
         for image_path in images:
+            relative_stem = image_path.relative_to(input_dir).with_suffix("").as_posix()
             document_id = upsert_document(
                 connection,
                 source_name=source,
-                filename_stem=image_path.stem,
+                filename_stem=relative_stem,
                 image_path=image_path,
                 image_sha256=sha256_file(image_path),
                 mime_type=image_mime_type(image_path) or "",
                 layout_family=layout_family,
             )
             document_count += 1
-            text_path = text_artifacts.get(image_path.stem)
-            tsv_path = tsv_artifacts.get(image_path.stem)
+            text_path = text_artifacts.get(relative_stem)
+            tsv_path = tsv_artifacts.get(relative_stem)
             text = ""
             if text_path is not None:
                 text = text_path.read_text(encoding="utf-8")
@@ -96,7 +97,7 @@ def ingest_source(
             if tsv_path is not None:
                 tsv_count += 1
             if text_path is not None or tsv_path is not None:
-                hint = name_map.get(f"{image_path.stem}.txt", {})
+                hint = name_map.get(f"{relative_stem}.txt", {})
                 upsert_ocr_output(
                     connection,
                     document_id=document_id,
@@ -301,7 +302,10 @@ def _document_for_row(
 def _source_image_index(input_dir: Path) -> dict[str, list[Path]]:
     index: dict[str, list[Path]] = {}
     for image_path in _discover_images_recursive(input_dir):
+        relative_stem = image_path.relative_to(input_dir).with_suffix("").as_posix()
         index.setdefault(_normalized_filename_stem(image_path.stem), []).append(image_path)
+        if relative_stem != image_path.stem:
+            index.setdefault(_normalized_filename_stem(relative_stem), []).append(image_path)
     return index
 
 
@@ -422,18 +426,14 @@ def _fields_json(fields: dict[str, Any]) -> str:
 
 
 def _discover_images_recursive(input_dir: Path) -> list[Path]:
-    if not input_dir.exists():
-        raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
-    if not input_dir.is_dir():
-        raise NotADirectoryError(f"Input path is not a directory: {input_dir}")
-    return sorted(path for path in input_dir.rglob("*") if path.is_file() and image_mime_type(path))
+    return discover_images(input_dir)
 
 
 def _artifact_index(artifacts_dir: Path, suffix: str) -> dict[str, Path]:
     if not artifacts_dir.exists():
         return {}
     return {
-        path.stem: path
+        path.relative_to(artifacts_dir).with_suffix("").as_posix(): path
         for path in sorted(artifacts_dir.rglob(f"*{suffix}"))
         if path.is_file() and path.suffix == suffix
     }

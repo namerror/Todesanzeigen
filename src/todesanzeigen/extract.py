@@ -116,7 +116,20 @@ def discover_artifacts(artifacts_dir: Path) -> list[Path]:
     if not artifacts_dir.is_dir():
         raise NotADirectoryError(f"Artifacts path is not a directory: {artifacts_dir}")
 
-    return sorted(path for path in artifacts_dir.iterdir() if path.is_file() and path.suffix == ".txt")
+    return sorted(path for path in artifacts_dir.rglob("*") if path.is_file() and path.suffix == ".txt")
+
+
+def _relative_name(path: Path, root: Path) -> str:
+    return path.relative_to(root).as_posix()
+
+
+def _relative_stem(path: Path, root: Path) -> str:
+    return path.relative_to(root).with_suffix("").as_posix()
+
+
+def _set_row_identity(row: dict[str, str], path: Path, root: Path) -> dict[str, str]:
+    row["dateiname"] = _relative_stem(path, root)
+    return row
 
 
 def build_extraction_prompt(
@@ -264,26 +277,41 @@ def load_name_map_if_exists(artifacts_dir: Path) -> dict[str, NameHint]:
     return load_name_map(artifacts_dir)
 
 
-def find_image_for_artifact(artifact_path: Path, input_dir: Path) -> Path:
+def find_image_for_artifact(
+    artifact_path: Path, input_dir: Path, artifacts_dir: Path | None = None
+) -> Path:
     if not input_dir.exists():
         raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
     if not input_dir.is_dir():
         raise NotADirectoryError(f"Input path is not a directory: {input_dir}")
 
-    for suffix in (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp", ".gif"):
-        candidate = input_dir / f"{artifact_path.stem}{suffix}"
-        if candidate.exists() and image_mime_type(candidate):
-            return candidate
+    if artifacts_dir is not None:
+        relative = artifact_path.relative_to(artifacts_dir).with_suffix("")
+        image_folder = input_dir / relative.parent
+        matches = (
+            sorted(
+                path for path in image_folder.iterdir()
+                if path.is_file() and path.stem == relative.name and image_mime_type(path)
+            )
+            if image_folder.is_dir()
+            else []
+        )
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(f"Ambiguous source images for {artifact_path}: {matches}")
+        raise FileNotFoundError(f"Source image for {artifact_path} was not found under {input_dir}")
 
     matches = sorted(
-        path
-        for path in input_dir.rglob(f"{artifact_path.stem}.*")
-        if path.is_file() and image_mime_type(path)
+        path for path in input_dir.rglob("*")
+        if path.is_file() and path.stem == artifact_path.stem and image_mime_type(path)
     )
     if not matches:
         raise FileNotFoundError(
             f"Source image for {artifact_path.name} was not found under {input_dir}"
         )
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous source images for {artifact_path}: {matches}")
     return matches[0]
 
 
@@ -408,16 +436,16 @@ def extract_artifacts_to_csv(
         writer.writeheader()
         for artifact_path in artifacts:
             try:
-                name_hint = name_map[artifact_path.name]
+                name_hint = name_map[_relative_name(artifact_path, artifacts_dir)]
             except KeyError as exc:
                 raise ValueError(
-                    f"Missing OCR name map entry for {artifact_path.name}. "
+                    f"Missing OCR name map entry for {_relative_name(artifact_path, artifacts_dir)}. "
                     "Run `todesanzeigen filter` for the same artifacts before extracting."
                 ) from exc
             if _is_below_confidence_threshold(name_hint, name_confidence_threshold):
                 _write_low_confidence_warning(
                     log_file,
-                    artifact_path.name,
+                    _relative_name(artifact_path, artifacts_dir),
                     name_hint.confidence,
                     name_confidence_threshold,
                 )
@@ -429,7 +457,7 @@ def extract_artifacts_to_csv(
                 source=source,
                 name_hint=name_hint,
             )
-            writer.writerow(fields_for_csv(row))
+            writer.writerow(fields_for_csv(_set_row_identity(row, artifact_path, artifacts_dir)))
             results.append(ExtractionResult(artifact_path, "processed", row))
 
     return results
@@ -535,9 +563,10 @@ async def extract_artifacts_to_csv_async(
                     limiter=limiter,
                     max_retries=settings.max_retries,
                 )
+                _set_row_identity(row, artifact_path, artifacts_dir)
                 result = ExtractionResult(artifact_path, "processed", row)
                 await append_checkpoint_records(
-                    artifact_path.name,
+                    _relative_name(artifact_path, artifacts_dir),
                     result,
                     attempts,
                     _checkpoint_metadata(
@@ -551,9 +580,9 @@ async def extract_artifacts_to_csv_async(
                 return result
             except Exception as exc:
                 result = ExtractionResult(artifact_path, "failed", error=str(exc))
-                _write_extraction_error(log_file, artifact_path.name, exc)
+                _write_extraction_error(log_file, _relative_name(artifact_path, artifacts_dir), exc)
                 await append_checkpoint_records(
-                    artifact_path.name,
+                    _relative_name(artifact_path, artifacts_dir),
                     result,
                     settings.max_retries + 1,
                     _checkpoint_metadata(
@@ -574,7 +603,7 @@ async def extract_artifacts_to_csv_async(
         async with reroute_semaphore:
             image_path: Path | None = None
             try:
-                image_path = find_image_for_artifact(artifact_path, reroute_settings.input_dir)
+                image_path = find_image_for_artifact(artifact_path, reroute_settings.input_dir, artifacts_dir)
                 row, attempts = await _extract_artifact_with_vision_async_with_retry(
                     artifact_path,
                     image_path,
@@ -584,6 +613,7 @@ async def extract_artifacts_to_csv_async(
                     limiter=limiter,
                     max_retries=settings.max_retries,
                 )
+                _set_row_identity(row, artifact_path, artifacts_dir)
                 result = ExtractionResult(artifact_path, "rerouted_processed", row)
                 metadata = _checkpoint_metadata(
                     method=VISION_REROUTE_METHOD,
@@ -594,7 +624,7 @@ async def extract_artifacts_to_csv_async(
                     source_image=image_path,
                 )
                 await append_checkpoint_records(
-                    artifact_path.name,
+                    _relative_name(artifact_path, artifacts_dir),
                     result,
                     attempts,
                     metadata,
@@ -602,7 +632,7 @@ async def extract_artifacts_to_csv_async(
                 return result
             except Exception as exc:
                 result = ExtractionResult(artifact_path, "rerouted_failed", error=str(exc))
-                _write_extraction_error(log_file, artifact_path.name, exc, method=VISION_REROUTE_METHOD)
+                _write_extraction_error(log_file, _relative_name(artifact_path, artifacts_dir), exc, method=VISION_REROUTE_METHOD)
                 metadata = _checkpoint_metadata(
                     method=VISION_REROUTE_METHOD,
                     provider=reroute_settings.provider,
@@ -613,7 +643,7 @@ async def extract_artifacts_to_csv_async(
                 )
                 attempts = 0 if image_path is None else settings.max_retries + 1
                 await append_checkpoint_records(
-                    artifact_path.name,
+                    _relative_name(artifact_path, artifacts_dir),
                     result,
                     attempts,
                     metadata,
@@ -622,22 +652,22 @@ async def extract_artifacts_to_csv_async(
 
     tasks: list[asyncio.Task[ExtractionResult]] = []
     for artifact_path in artifacts:
-        resumed_result = resumed_results.get(artifact_path.name)
+        resumed_result = resumed_results.get(_relative_name(artifact_path, artifacts_dir))
         if resumed_result is not None:
-            results_by_name[artifact_path.name] = resumed_result
+            results_by_name[_relative_name(artifact_path, artifacts_dir)] = resumed_result
             continue
 
         try:
-            name_hint = name_map[artifact_path.name]
+            name_hint = name_map[_relative_name(artifact_path, artifacts_dir)]
         except KeyError as exc:
             raise ValueError(
-                f"Missing OCR name map entry for {artifact_path.name}. "
+                f"Missing OCR name map entry for {_relative_name(artifact_path, artifacts_dir)}. "
                 "Run `todesanzeigen filter` for the same artifacts before extracting."
             ) from exc
         if _is_below_confidence_threshold(name_hint, name_confidence_threshold):
             _write_low_confidence_warning(
                 log_file,
-                artifact_path.name,
+                _relative_name(artifact_path, artifacts_dir),
                 name_hint.confidence,
                 name_confidence_threshold,
             )
@@ -646,9 +676,9 @@ async def extract_artifacts_to_csv_async(
                 continue
 
             result = ExtractionResult(artifact_path, "skipped_low_confidence")
-            results_by_name[artifact_path.name] = result
+            results_by_name[_relative_name(artifact_path, artifacts_dir)] = result
             await append_checkpoint_records(
-                artifact_path.name,
+                _relative_name(artifact_path, artifacts_dir),
                 result,
                 0,
                 _checkpoint_metadata(
@@ -664,9 +694,9 @@ async def extract_artifacts_to_csv_async(
         tasks.append(asyncio.create_task(process_artifact(artifact_path, name_hint)))
 
     for result in await asyncio.gather(*tasks):
-        results_by_name[result.artifact_path.name] = result
+        results_by_name[_relative_name(result.artifact_path, artifacts_dir)] = result
 
-    ordered_results = [results_by_name[path.name] for path in artifacts]
+    ordered_results = [results_by_name[_relative_name(path, artifacts_dir)] for path in artifacts]
     with output_csv.open("w", encoding="utf-8", newline="") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=CSV_COLUMNS)
         writer.writeheader()
@@ -732,31 +762,34 @@ def load_reroute_candidates(
 def select_reroute_candidates(
     candidates: list[RerouteCandidate],
     *,
+    artifacts_dir: Path | None = None,
     only: list[str] | None = None,
     sample_ratio: float | None = None,
     sample_seed: int = 0,
     limit: int | None = None,
 ) -> list[RerouteCandidate]:
-    selected = sorted(candidates, key=lambda candidate: candidate.artifact_path.name)
+    selected = sorted(candidates, key=lambda candidate: _relative_name(candidate.artifact_path, artifacts_dir) if artifacts_dir else str(candidate.artifact_path))
     if only:
         wanted = set(only)
         selected = [
             candidate
             for candidate in selected
             if candidate.artifact_path.name in wanted or candidate.artifact_path.stem in wanted
+            or (artifacts_dir is not None and (
+                _relative_name(candidate.artifact_path, artifacts_dir) in wanted
+                or _relative_stem(candidate.artifact_path, artifacts_dir) in wanted
+            ))
         ]
     if sample_ratio is not None:
         if sample_ratio <= 0 or sample_ratio > 1:
             raise ValueError("sample_ratio must be greater than 0 and at most 1.")
         if sample_ratio < 1 and selected:
             sample_size = max(1, math.ceil(len(selected) * sample_ratio))
-            sampled_names = {
-                candidate.artifact_path.name
+            sampled_paths = {
+                candidate.artifact_path
                 for candidate in random.Random(sample_seed).sample(selected, sample_size)
             }
-            selected = [
-                candidate for candidate in selected if candidate.artifact_path.name in sampled_names
-            ]
+            selected = [candidate for candidate in selected if candidate.artifact_path in sampled_paths]
     if limit is not None:
         selected = selected[:limit]
     return selected
@@ -765,28 +798,31 @@ def select_reroute_candidates(
 def select_image_paths(
     images: list[Path],
     *,
+    input_dir: Path | None = None,
     only: list[str] | None = None,
     sample_ratio: float | None = None,
     sample_seed: int = 0,
     limit: int | None = None,
 ) -> list[Path]:
-    selected = sorted(images, key=lambda path: path.name)
+    selected = sorted(images, key=lambda path: _relative_name(path, input_dir) if input_dir else str(path))
     if only:
         wanted = set(only)
         selected = [
             path
             for path in selected
             if path.name in wanted or path.stem in wanted or str(path) in wanted
+            or (input_dir is not None and (
+                _relative_name(path, input_dir) in wanted
+                or _relative_stem(path, input_dir) in wanted
+            ))
         ]
     if sample_ratio is not None:
         if sample_ratio <= 0 or sample_ratio > 1:
             raise ValueError("sample_ratio must be greater than 0 and at most 1.")
         if sample_ratio < 1 and selected:
             sample_size = max(1, math.ceil(len(selected) * sample_ratio))
-            sampled_names = {
-                path.name for path in random.Random(sample_seed).sample(selected, sample_size)
-            }
-            selected = [path for path in selected if path.name in sampled_names]
+            sampled_paths = set(random.Random(sample_seed).sample(selected, sample_size))
+            selected = [path for path in selected if path in sampled_paths]
     if limit is not None:
         selected = selected[:limit]
     return selected
@@ -798,6 +834,7 @@ async def reroute_candidates_to_csv_async(
     provider: VisionLlmProvider,
     *,
     input_dir: Path,
+    artifacts_dir: Path | None = None,
     source: str = "",
     log_file: Path | None = None,
     results_file: Path | None = None,
@@ -810,6 +847,7 @@ async def reroute_candidates_to_csv_async(
         raise ValueError("Vision reroute concurrency must be at least 1.")
     if settings.max_retries < 0:
         raise ValueError("LLM max retries must be at least 0.")
+    artifacts_dir = artifacts_dir or (candidates[0].artifact_path.parent if candidates else Path("."))
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     if log_file is not None:
@@ -830,7 +868,7 @@ async def reroute_candidates_to_csv_async(
         async with semaphore:
             image_path: Path | None = None
             try:
-                image_path = find_image_for_artifact(candidate.artifact_path, input_dir)
+                image_path = find_image_for_artifact(candidate.artifact_path, input_dir, artifacts_dir)
                 row, attempts = await _extract_artifact_with_vision_async_with_retry(
                     candidate.artifact_path,
                     image_path,
@@ -840,11 +878,12 @@ async def reroute_candidates_to_csv_async(
                     limiter=limiter,
                     max_retries=settings.max_retries,
                 )
+                _set_row_identity(row, candidate.artifact_path, artifacts_dir)
                 result = ExtractionResult(candidate.artifact_path, "rerouted_processed", row)
                 await _append_checkpoint_record_async(
                     results_file,
                     checkpoint_lock,
-                    candidate.artifact_path.name,
+                    _relative_name(candidate.artifact_path, artifacts_dir),
                     result,
                     attempts,
                     metadata=_checkpoint_metadata(
@@ -866,7 +905,7 @@ async def reroute_candidates_to_csv_async(
                 )
                 _write_extraction_error(
                     log_file,
-                    candidate.artifact_path.name,
+                    _relative_name(candidate.artifact_path, artifacts_dir),
                     exc,
                     method=VISION_REROUTE_METHOD,
                 )
@@ -874,7 +913,7 @@ async def reroute_candidates_to_csv_async(
                 await _append_checkpoint_record_async(
                     results_file,
                     checkpoint_lock,
-                    candidate.artifact_path.name,
+                    _relative_name(candidate.artifact_path, artifacts_dir),
                     result,
                     attempts,
                     metadata=_checkpoint_metadata(
@@ -924,6 +963,7 @@ async def extract_images_to_csv_async(
 
     images = select_image_paths(
         discover_images(input_dir),
+        input_dir=input_dir,
         only=only,
         sample_ratio=sample_ratio,
         sample_seed=sample_seed,
@@ -962,11 +1002,12 @@ async def extract_images_to_csv_async(
                     limiter=limiter,
                     max_retries=settings.max_retries,
                 )
+                _set_row_identity(row, image_path, input_dir)
                 result = ExtractionResult(image_path, VISION_PROCESSED_STATUS, row)
                 await _append_checkpoint_record_async(
                     checkpoint_path,
                     checkpoint_lock,
-                    image_path.name,
+                    _relative_name(image_path, input_dir),
                     result,
                     attempts,
                     metadata=_image_checkpoint_metadata(
@@ -978,11 +1019,11 @@ async def extract_images_to_csv_async(
                 return result
             except Exception as exc:
                 result = ExtractionResult(image_path, VISION_FAILED_STATUS, error=str(exc))
-                _write_extraction_error(log_file, image_path.name, exc, method=VISION_IMAGE_ONLY_METHOD)
+                _write_extraction_error(log_file, _relative_name(image_path, input_dir), exc, method=VISION_IMAGE_ONLY_METHOD)
                 await _append_checkpoint_record_async(
                     checkpoint_path,
                     checkpoint_lock,
-                    image_path.name,
+                    _relative_name(image_path, input_dir),
                     result,
                     settings.max_retries + 1,
                     metadata=_image_checkpoint_metadata(
@@ -995,16 +1036,16 @@ async def extract_images_to_csv_async(
 
     tasks: list[asyncio.Task[ExtractionResult]] = []
     for image_path in images:
-        resumed_result = resumed_results.get(image_path.name)
+        resumed_result = resumed_results.get(_relative_name(image_path, input_dir))
         if resumed_result is not None:
-            results_by_name[image_path.name] = resumed_result
+            results_by_name[_relative_name(image_path, input_dir)] = resumed_result
             continue
         tasks.append(asyncio.create_task(process_image(image_path)))
 
     for result in await asyncio.gather(*tasks):
-        results_by_name[result.artifact_path.name] = result
+        results_by_name[_relative_name(result.artifact_path, input_dir)] = result
 
-    ordered_results = [results_by_name[path.name] for path in images]
+    ordered_results = [results_by_name[_relative_name(path, input_dir)] for path in images]
     _write_results_csv(output_csv, ordered_results)
     return ordered_results
 
@@ -1101,6 +1142,7 @@ async def extract_artifacts_to_db_async(
                     limiter=limiter,
                     max_retries=settings.max_retries,
                 )
+                _set_row_identity(row, artifact_path, artifacts_dir)
                 result = ExtractionResult(artifact_path, "processed", row)
                 record = DbExtractionRecord(
                     result=result,
@@ -1114,11 +1156,11 @@ async def extract_artifacts_to_db_async(
                     provider_name=_provider_name(provider),
                     model_name=_model_name(provider),
                 )
-                await append_checkpoint_records(artifact_path.name, record)
+                await append_checkpoint_records(_relative_name(artifact_path, artifacts_dir), record)
                 return record
             except Exception as exc:
                 result = ExtractionResult(artifact_path, "failed", error=str(exc))
-                _write_extraction_error(log_file, artifact_path.name, exc)
+                _write_extraction_error(log_file, _relative_name(artifact_path, artifacts_dir), exc)
                 record = DbExtractionRecord(
                     result=result,
                     method=TEXT_EXTRACTION_METHOD,
@@ -1130,7 +1172,7 @@ async def extract_artifacts_to_db_async(
                     provider_name=_provider_name(provider),
                     model_name=_model_name(provider),
                 )
-                await append_checkpoint_records(artifact_path.name, record)
+                await append_checkpoint_records(_relative_name(artifact_path, artifacts_dir), record)
                 return record
 
     async def process_reroute_artifact(
@@ -1142,7 +1184,7 @@ async def extract_artifacts_to_db_async(
             started = time.perf_counter()
             image_path: Path | None = None
             try:
-                image_path = find_image_for_artifact(artifact_path, reroute_settings.input_dir)
+                image_path = find_image_for_artifact(artifact_path, reroute_settings.input_dir, artifacts_dir)
                 (
                     row,
                     raw_response,
@@ -1157,6 +1199,7 @@ async def extract_artifacts_to_db_async(
                     limiter=limiter,
                     max_retries=settings.max_retries,
                 )
+                _set_row_identity(row, artifact_path, artifacts_dir)
                 result = ExtractionResult(artifact_path, "rerouted_processed", row)
                 record = DbExtractionRecord(
                     result=result,
@@ -1172,13 +1215,13 @@ async def extract_artifacts_to_db_async(
                     provider_name=_provider_name(reroute_settings.provider),
                     model_name=_model_name(reroute_settings.provider),
                 )
-                await append_checkpoint_records(artifact_path.name, record)
+                await append_checkpoint_records(_relative_name(artifact_path, artifacts_dir), record)
                 return record
             except Exception as exc:
                 result = ExtractionResult(artifact_path, "rerouted_failed", error=str(exc))
                 _write_extraction_error(
                     log_file,
-                    artifact_path.name,
+                    _relative_name(artifact_path, artifacts_dir),
                     exc,
                     method=VISION_REROUTE_METHOD,
                 )
@@ -1195,16 +1238,16 @@ async def extract_artifacts_to_db_async(
                     provider_name=_provider_name(reroute_settings.provider),
                     model_name=_model_name(reroute_settings.provider),
                 )
-                await append_checkpoint_records(artifact_path.name, record)
+                await append_checkpoint_records(_relative_name(artifact_path, artifacts_dir), record)
                 return record
 
     tasks: list[asyncio.Task[DbExtractionRecord]] = []
     for artifact_path in artifacts:
         try:
-            name_hint = name_map[artifact_path.name]
+            name_hint = name_map[_relative_name(artifact_path, artifacts_dir)]
         except KeyError as exc:
             raise ValueError(
-                f"Missing OCR name map entry for {artifact_path.name}. "
+                f"Missing OCR name map entry for {_relative_name(artifact_path, artifacts_dir)}. "
                 "Run `todesanzeigen filter` for the same artifacts before extracting."
             ) from exc
         below_threshold = _is_below_confidence_threshold(name_hint, name_confidence_threshold)
@@ -1221,6 +1264,7 @@ async def extract_artifacts_to_db_async(
         cached_record = _cached_db_record_for_request(
             db_path,
             artifact_path=artifact_path,
+            artifacts_dir=artifacts_dir,
             method=request_method,
             source=source,
             input_dir=(
@@ -1241,11 +1285,11 @@ async def extract_artifacts_to_db_async(
             force=force,
         )
         if cached_record is not None:
-            records_by_name[artifact_path.name] = cached_record
-            await append_checkpoint_records(artifact_path.name, cached_record)
+            records_by_name[_relative_name(artifact_path, artifacts_dir)] = cached_record
+            await append_checkpoint_records(_relative_name(artifact_path, artifacts_dir), cached_record)
             continue
 
-        resumed_record = None if force else resumed_records.get(artifact_path.name)
+        resumed_record = None if force else resumed_records.get(_relative_name(artifact_path, artifacts_dir))
         if resumed_record is not None and not _record_matches_variant(
             resumed_record,
             method=request_method,
@@ -1255,13 +1299,13 @@ async def extract_artifacts_to_db_async(
         ):
             resumed_record = None
         if resumed_record is not None:
-            records_by_name[artifact_path.name] = resumed_record
+            records_by_name[_relative_name(artifact_path, artifacts_dir)] = resumed_record
             continue
 
         if below_threshold:
             _write_low_confidence_warning(
                 log_file,
-                artifact_path.name,
+                _relative_name(artifact_path, artifacts_dir),
                 name_hint.confidence,
                 name_confidence_threshold,
             )
@@ -1279,19 +1323,20 @@ async def extract_artifacts_to_db_async(
                 provider_name=_provider_name(provider),
                 model_name=_model_name(provider),
             )
-            records_by_name[artifact_path.name] = record
-            await append_checkpoint_records(artifact_path.name, record)
+            records_by_name[_relative_name(artifact_path, artifacts_dir)] = record
+            await append_checkpoint_records(_relative_name(artifact_path, artifacts_dir), record)
             continue
 
         tasks.append(asyncio.create_task(process_artifact(artifact_path, name_hint)))
 
     for record in await asyncio.gather(*tasks):
-        records_by_name[record.result.artifact_path.name] = record
+        records_by_name[_relative_name(record.result.artifact_path, artifacts_dir)] = record
 
-    ordered_records = [records_by_name[path.name] for path in artifacts]
+    ordered_records = [records_by_name[_relative_name(path, artifacts_dir)] for path in artifacts]
     _persist_db_extraction_records(
         db_path,
         ordered_records,
+        artifacts_dir=artifacts_dir,
         command="extract",
         source=source,
         input_dir=input_dir,
@@ -1314,6 +1359,7 @@ async def reroute_candidates_to_db_async(
     provider: VisionLlmProvider,
     *,
     input_dir: Path,
+    artifacts_dir: Path | None = None,
     source: str = "",
     log_file: Path | None = None,
     results_file: Path | None = None,
@@ -1327,6 +1373,7 @@ async def reroute_candidates_to_db_async(
         raise ValueError("Vision reroute concurrency must be at least 1.")
     if settings.max_retries < 0:
         raise ValueError("LLM max retries must be at least 0.")
+    artifacts_dir = artifacts_dir or (candidates[0].artifact_path.parent if candidates else Path("."))
     _require_provider_model(provider)
     _ensure_db_ready(db_path)
 
@@ -1344,7 +1391,7 @@ async def reroute_candidates_to_db_async(
             started = time.perf_counter()
             image_path: Path | None = None
             try:
-                image_path = find_image_for_artifact(candidate.artifact_path, input_dir)
+                image_path = find_image_for_artifact(candidate.artifact_path, input_dir, artifacts_dir)
                 (
                     row,
                     raw_response,
@@ -1359,6 +1406,7 @@ async def reroute_candidates_to_db_async(
                     limiter=limiter,
                     max_retries=settings.max_retries,
                 )
+                _set_row_identity(row, candidate.artifact_path, artifacts_dir)
                 result = ExtractionResult(candidate.artifact_path, "rerouted_processed", row)
                 record = DbExtractionRecord(
                     result=result,
@@ -1377,7 +1425,7 @@ async def reroute_candidates_to_db_async(
                 await _append_checkpoint_record_async(
                     results_file,
                     checkpoint_lock,
-                    candidate.artifact_path.name,
+                    _relative_name(candidate.artifact_path, artifacts_dir),
                     result,
                     attempts,
                     metadata=_db_record_checkpoint_metadata(record),
@@ -1387,7 +1435,7 @@ async def reroute_candidates_to_db_async(
                 result = ExtractionResult(candidate.artifact_path, "rerouted_failed", error=str(exc))
                 _write_extraction_error(
                     log_file,
-                    candidate.artifact_path.name,
+                    _relative_name(candidate.artifact_path, artifacts_dir),
                     exc,
                     method=VISION_REROUTE_METHOD,
                 )
@@ -1407,7 +1455,7 @@ async def reroute_candidates_to_db_async(
                 await _append_checkpoint_record_async(
                     results_file,
                     checkpoint_lock,
-                    candidate.artifact_path.name,
+                    _relative_name(candidate.artifact_path, artifacts_dir),
                     result,
                     attempts,
                     metadata=_db_record_checkpoint_metadata(record),
@@ -1420,6 +1468,7 @@ async def reroute_candidates_to_db_async(
         cached_record = _cached_db_record_for_request(
             db_path,
             artifact_path=candidate.artifact_path,
+            artifacts_dir=artifacts_dir,
             method=VISION_REROUTE_METHOD,
             source=source,
             input_dir=input_dir,
@@ -1432,11 +1481,11 @@ async def reroute_candidates_to_db_async(
             force=force,
         )
         if cached_record is not None:
-            records_by_name[candidate.artifact_path.name] = cached_record
+            records_by_name[_relative_name(candidate.artifact_path, artifacts_dir)] = cached_record
             await _append_checkpoint_record_async(
                 results_file,
                 checkpoint_lock,
-                candidate.artifact_path.name,
+                _relative_name(candidate.artifact_path, artifacts_dir),
                 cached_record.result,
                 cached_record.attempts,
                 metadata=_db_record_checkpoint_metadata(cached_record),
@@ -1445,15 +1494,16 @@ async def reroute_candidates_to_db_async(
         tasks.append(asyncio.create_task(process_candidate(candidate)))
 
     for record in await asyncio.gather(*tasks):
-        records_by_name[record.result.artifact_path.name] = record
+        records_by_name[_relative_name(record.result.artifact_path, artifacts_dir)] = record
 
-    records = [records_by_name[candidate.artifact_path.name] for candidate in candidates]
+    records = [records_by_name[_relative_name(candidate.artifact_path, artifacts_dir)] for candidate in candidates]
     _persist_db_extraction_records(
         db_path,
         records,
         command="reroute",
         source=source,
         input_dir=input_dir,
+        artifacts_dir=artifacts_dir,
         candidate_kind=candidate_kind,
         run_method=VISION_REROUTE_METHOD,
         run_provider=_provider_name(provider),
@@ -1490,6 +1540,7 @@ async def extract_images_to_db_async(
 
     images = select_image_paths(
         discover_images(input_dir),
+        input_dir=input_dir,
         only=only,
         sample_ratio=sample_ratio,
         sample_seed=sample_seed,
@@ -1521,6 +1572,7 @@ async def extract_images_to_db_async(
                     limiter=limiter,
                     max_retries=settings.max_retries,
                 )
+                _set_row_identity(row, image_path, input_dir)
                 result = ExtractionResult(image_path, VISION_PROCESSED_STATUS, row)
                 record = DbExtractionRecord(
                     result=result,
@@ -1537,7 +1589,7 @@ async def extract_images_to_db_async(
                 await _append_checkpoint_record_async(
                     checkpoint_path,
                     checkpoint_lock,
-                    image_path.name,
+                    _relative_name(image_path, input_dir),
                     result,
                     attempts,
                     metadata=_db_record_checkpoint_metadata(record),
@@ -1545,7 +1597,7 @@ async def extract_images_to_db_async(
                 return record
             except Exception as exc:
                 result = ExtractionResult(image_path, VISION_FAILED_STATUS, error=str(exc))
-                _write_extraction_error(log_file, image_path.name, exc, method=VISION_IMAGE_ONLY_METHOD)
+                _write_extraction_error(log_file, _relative_name(image_path, input_dir), exc, method=VISION_IMAGE_ONLY_METHOD)
                 record = DbExtractionRecord(
                     result=result,
                     method=VISION_IMAGE_ONLY_METHOD,
@@ -1559,7 +1611,7 @@ async def extract_images_to_db_async(
                 await _append_checkpoint_record_async(
                     checkpoint_path,
                     checkpoint_lock,
-                    image_path.name,
+                    _relative_name(image_path, input_dir),
                     result,
                     record.attempts,
                     metadata=_db_record_checkpoint_metadata(record),
@@ -1582,18 +1634,18 @@ async def extract_images_to_db_async(
             force=force,
         )
         if cached_record is not None:
-            records_by_name[image_path.name] = cached_record
+            records_by_name[_relative_name(image_path, input_dir)] = cached_record
             await _append_checkpoint_record_async(
                 checkpoint_path,
                 checkpoint_lock,
-                image_path.name,
+                _relative_name(image_path, input_dir),
                 cached_record.result,
                 cached_record.attempts,
                 metadata=_db_record_checkpoint_metadata(cached_record),
             )
             continue
 
-        resumed_record = None if force else resumed_records.get(image_path.name)
+        resumed_record = None if force else resumed_records.get(_relative_name(image_path, input_dir))
         if resumed_record is not None and not _record_matches_variant(
             resumed_record,
             method=VISION_IMAGE_ONLY_METHOD,
@@ -1603,14 +1655,14 @@ async def extract_images_to_db_async(
         ):
             resumed_record = None
         if resumed_record is not None:
-            records_by_name[image_path.name] = resumed_record
+            records_by_name[_relative_name(image_path, input_dir)] = resumed_record
             continue
         tasks.append(asyncio.create_task(process_image(image_path)))
 
     for record in await asyncio.gather(*tasks):
-        records_by_name[record.result.artifact_path.name] = record
+        records_by_name[_relative_name(record.result.artifact_path, input_dir)] = record
 
-    ordered_records = [records_by_name[path.name] for path in images]
+    ordered_records = [records_by_name[_relative_name(path, input_dir)] for path in images]
     _persist_db_extraction_records(
         db_path,
         ordered_records,
@@ -1704,6 +1756,7 @@ def _cached_db_record_for_request(
     db_path: Path,
     *,
     artifact_path: Path,
+    artifacts_dir: Path | None = None,
     method: str,
     source: str,
     input_dir: Path,
@@ -1723,7 +1776,7 @@ def _cached_db_record_for_request(
         upsert_document,
     )
 
-    resolved_image = image_path or _safe_record_image_path(artifact_path, input_dir)
+    resolved_image = image_path or _safe_record_image_path(artifact_path, input_dir, artifacts_dir)
     image_digest = (
         sha256_file(resolved_image)
         if resolved_image is not None and resolved_image.exists() and resolved_image.is_file()
@@ -1735,7 +1788,11 @@ def _cached_db_record_for_request(
             document_id = upsert_document(
                 connection,
                 source_name=source,
-                filename_stem=artifact_path.stem,
+                filename_stem=(
+                    _relative_stem(artifact_path, artifacts_dir)
+                    if artifacts_dir is not None and artifact_path.suffix == ".txt"
+                    else artifact_path.stem
+                ),
                 image_path=resolved_image or "",
                 image_sha256=image_digest,
                 mime_type=image_mime_type(resolved_image) if resolved_image is not None else "",
@@ -1789,13 +1846,15 @@ def _cached_db_record_for_request(
         )
 
 
-def _safe_record_image_path(artifact_path: Path, input_dir: Path) -> Path | None:
+def _safe_record_image_path(
+    artifact_path: Path, input_dir: Path, artifacts_dir: Path | None = None
+) -> Path | None:
     if image_mime_type(artifact_path):
         return artifact_path
     if artifact_path.suffix != ".txt":
         return None
     try:
-        return find_image_for_artifact(artifact_path, input_dir)
+        return find_image_for_artifact(artifact_path, input_dir, artifacts_dir)
     except (FileNotFoundError, NotADirectoryError):
         return None
 
@@ -1833,6 +1892,7 @@ def _persist_db_extraction_records(
     command: str,
     source: str,
     input_dir: Path,
+    artifacts_dir: Path | None = None,
     candidate_kind: str,
     run_method: str,
     run_provider: str,
@@ -1874,7 +1934,7 @@ def _persist_db_extraction_records(
                 row = result.row or {}
                 source_name = source or row.get("quelle", "") or "unknown"
                 filename_stem = row.get("dateiname", "") or result.artifact_path.stem
-                image_path = _record_image_path(record, input_dir)
+                image_path = _record_image_path(record, input_dir, artifacts_dir)
                 image_digest = (
                     sha256_file(image_path)
                     if image_path is not None and image_path.exists() and image_path.is_file()
@@ -1954,7 +2014,7 @@ def _persist_db_extraction_records(
                     config=persisted_run_config,
                     ocr_output_id=ocr_output_id,
                     result_slot_value=result_slot(record.method),
-                    input_fingerprint=_record_input_fingerprint(record, input_dir, sha256_file),
+                    input_fingerprint=_record_input_fingerprint(record, input_dir, sha256_file, artifacts_dir),
                     config_hash=config_hash,
                 )
                 if result.status in PROCESSED_STATUSES and result.row is not None:
@@ -1972,7 +2032,9 @@ def _persist_db_extraction_records(
             raise
 
 
-def _record_image_path(record: DbExtractionRecord, input_dir: Path) -> Path | None:
+def _record_image_path(
+    record: DbExtractionRecord, input_dir: Path, artifacts_dir: Path | None = None
+) -> Path | None:
     if record.image_path is not None:
         return record.image_path
     artifact_path = record.result.artifact_path
@@ -1980,7 +2042,7 @@ def _record_image_path(record: DbExtractionRecord, input_dir: Path) -> Path | No
         return artifact_path
     if artifact_path.suffix == ".txt":
         try:
-            return find_image_for_artifact(artifact_path, input_dir)
+            return find_image_for_artifact(artifact_path, input_dir, artifacts_dir)
         except FileNotFoundError:
             return None
     return None
@@ -1990,9 +2052,10 @@ def _record_input_fingerprint(
     record: DbExtractionRecord,
     input_dir: Path,
     sha256_file_func: Any,
+    artifacts_dir: Path | None = None,
 ) -> str:
     input_path = (
-        _record_image_path(record, input_dir)
+        _record_image_path(record, input_dir, artifacts_dir)
         if result_slot(record.method) == result_slot(VISION_IMAGE_ONLY_METHOD)
         else record.result.artifact_path
     )

@@ -62,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    ocr = subparsers.add_parser("ocr", help="Run local Tesseract OCR for images in input/.")
+    ocr = subparsers.add_parser("ocr", help="Run local Tesseract OCR for images recursively under --input-dir.")
     ocr.add_argument("--input-dir", type=Path, default=Path("input"))
     ocr.add_argument("--artifacts-dir", type=Path, default=Path("artifacts"))
     ocr.add_argument("--engine", choices=["tesseract", "documentai"], default="tesseract")
@@ -201,7 +201,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     vision_extract = subparsers.add_parser(
         "vision-extract",
-        help="Run image-only vision extraction for source images.",
+        help="Run image-only vision extraction for images recursively under --input-dir.",
     )
     vision_extract.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     vision_extract.add_argument("--input-dir", type=Path, default=Path("input"))
@@ -541,6 +541,7 @@ def run_reroute_command(args: argparse.Namespace) -> int:
     )
     selected_candidates = select_reroute_candidates(
         candidates,
+        artifacts_dir=args.artifacts_dir,
         only=args.only,
         sample_ratio=args.sample_ratio,
         sample_seed=args.sample_seed,
@@ -553,6 +554,7 @@ def run_reroute_command(args: argparse.Namespace) -> int:
             args.db,
             provider,
             input_dir=args.input_dir,
+            artifacts_dir=args.artifacts_dir,
             source=args.source,
             log_file=log_file,
             results_file=args.results_file,

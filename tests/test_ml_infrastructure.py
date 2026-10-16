@@ -461,6 +461,65 @@ class MlInfrastructureTests(TestCase):
             self.assertEqual(ocr["name_hint"], "Max Mustermann")
             self.assertEqual(ocr["name_confidence"], 91)
 
+    def test_ingest_source_pairs_nested_images_with_matching_artifacts(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "test.sqlite3"
+            input_dir = root / "input"
+            artifacts_dir = root / "artifacts"
+            for folder in ("first", "second"):
+                (input_dir / folder).mkdir(parents=True)
+                (artifacts_dir / folder).mkdir(parents=True)
+                (input_dir / folder / "same.jpg").write_bytes(folder.encode())
+                (artifacts_dir / folder / "same.txt").write_text(folder, encoding="utf-8")
+            (artifacts_dir / "name_map.json").write_text(
+                json.dumps({
+                    f"{folder}/same.txt": {"name": folder, "confidence": 90}
+                    for folder in ("first", "second")
+                }), encoding="utf-8",
+            )
+
+            summary = ingest_source(
+                db_path=db_path, source="Example", input_dir=input_dir, artifacts_dir=artifacts_dir
+            )
+            with connect(db_path) as connection:
+                rows = connection.execute(
+                    "SELECT documents.image_path, ocr_outputs.text, ocr_outputs.name_hint "
+                    "FROM documents JOIN ocr_outputs ON ocr_outputs.document_id = documents.id "
+                    "ORDER BY documents.image_path"
+                ).fetchall()
+
+            self.assertEqual((summary.documents, summary.ocr_outputs), (2, 2))
+            self.assertEqual([(row["text"], row["name_hint"]) for row in rows],
+                             [("first", "first"), ("second", "second")])
+
+    def test_ingest_results_resolves_relative_path_and_rejects_ambiguous_bare_name(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "input"
+            db_path = root / "test.sqlite3"
+            output_csv = root / "results.csv"
+            for folder in ("first", "second"):
+                image = input_dir / folder / "same.jpg"
+                image.parent.mkdir(parents=True)
+                image.write_bytes(folder.encode())
+
+            def write_result(filename: str) -> None:
+                with output_csv.open("w", encoding="utf-8", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
+                    writer.writeheader()
+                    writer.writerow({"dateiname": filename, "quelle": "Example", "name": "Test"})
+
+            write_result("second/same")
+            ingest_results(db_path=db_path, output_csv=output_csv, input_dir=input_dir)
+            with connect(db_path) as connection:
+                document = connection.execute("SELECT image_path FROM documents").fetchone()
+            self.assertEqual(document["image_path"], str(input_dir / "second" / "same.jpg"))
+
+            write_result("same")
+            with self.assertRaisesRegex(ValueError, "Ambiguous source images"):
+                ingest_results(db_path=db_path, output_csv=output_csv, input_dir=input_dir)
+
     def test_ingest_results_creates_candidates_for_review(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1473,6 +1532,76 @@ class MlInfrastructureTests(TestCase):
 
 
 class DbFirstExtractionTests(IsolatedAsyncioTestCase):
+    async def test_nested_ocr_artifacts_create_separate_documents(self) -> None:
+        class TextProvider:
+            provider_name = "fake"
+            model_name = "fake-model"
+
+            async def async_complete(self, prompt: str) -> str:
+                return json.dumps({"name": "Test"})
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "input"
+            artifacts_dir = root / "artifacts"
+            db_path = root / "test.sqlite3"
+            for folder in ("first", "second"):
+                (input_dir / folder).mkdir(parents=True)
+                (artifacts_dir / folder).mkdir(parents=True)
+                (input_dir / folder / "same.jpg").write_bytes(folder.encode())
+                (artifacts_dir / folder / "same.txt").write_text(folder, encoding="utf-8")
+            (artifacts_dir / "name_map.json").write_text(
+                json.dumps({
+                    f"{folder}/same.txt": {"name": folder, "confidence": 95}
+                    for folder in ("first", "second")
+                }), encoding="utf-8",
+            )
+
+            results = await extract_artifacts_to_db_async(
+                artifacts_dir, db_path, TextProvider(), input_dir=input_dir,
+                source="Example", settings=AsyncExtractionSettings(max_retries=0),
+            )
+            with connect(db_path) as connection:
+                rows = connection.execute(
+                    "SELECT filename_stem, image_path FROM documents ORDER BY image_path"
+                ).fetchall()
+
+            self.assertEqual([result.status for result in results], ["processed", "processed"])
+            self.assertEqual([row["filename_stem"] for row in rows], ["first/same", "second/same"])
+            self.assertEqual([Path(row["image_path"]).parent.name for row in rows], ["first", "second"])
+
+    async def test_nested_vision_images_create_separate_documents(self) -> None:
+        class VisionProvider:
+            provider_name = "fake-vision"
+            model_name = "fake-vision-model"
+
+            async def async_vision_complete(self, prompt: str, image_path: Path, mime_type: str) -> str:
+                return json.dumps({"name": image_path.parent.name})
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "input"
+            db_path = root / "test.sqlite3"
+            checkpoint = root / "results.jsonl"
+            for folder in ("first", "second"):
+                image = input_dir / folder / "same.jpg"
+                image.parent.mkdir(parents=True)
+                image.write_bytes(folder.encode())
+
+            results = await extract_images_to_db_async(
+                input_dir, db_path, VisionProvider(), source="Example",
+                results_file=checkpoint, settings=AsyncExtractionSettings(max_retries=0),
+            )
+            with connect(db_path) as connection:
+                rows = connection.execute(
+                    "SELECT filename_stem, image_path FROM documents ORDER BY image_path"
+                ).fetchall()
+            records = [json.loads(line) for line in checkpoint.read_text(encoding="utf-8").splitlines()]
+
+            self.assertEqual(len(results), 2)
+            self.assertEqual([row["filename_stem"] for row in rows], ["first/same", "second/same"])
+            self.assertEqual([record["filename"] for record in records], ["first/same.jpg", "second/same.jpg"])
+
     async def test_extract_artifacts_to_db_records_output_and_candidate(self) -> None:
         class Provider:
             provider_name = "fake"

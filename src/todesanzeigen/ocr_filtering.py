@@ -94,7 +94,7 @@ def discover_tsv_artifacts(artifacts_dir: Path) -> list[Path]:
         raise NotADirectoryError(f"Artifacts path is not a directory: {artifacts_dir}")
 
     return sorted(
-        path for path in artifacts_dir.iterdir() if path.is_file() and path.suffix == ".tsv"
+        path for path in artifacts_dir.rglob("*") if path.is_file() and path.suffix == ".tsv"
     )
 
 
@@ -102,9 +102,20 @@ def name_map_artifact_path(artifacts_dir: Path) -> Path:
     return artifacts_dir / NAME_MAP_FILENAME
 
 
-def build_name_map(results: list[NameFilterResult]) -> dict[str, dict[str, Any]]:
+def _text_artifact_key(artifact_path: Path, artifacts_dir: Path | None) -> str:
+    relative = (
+        artifact_path.relative_to(artifacts_dir)
+        if artifacts_dir is not None
+        else Path(artifact_path.name)
+    )
+    return relative.with_suffix(".txt").as_posix()
+
+
+def build_name_map(
+    results: list[NameFilterResult], artifacts_dir: Path | None = None
+) -> dict[str, dict[str, Any]]:
     return {
-        result.artifact_path.with_suffix(".txt").name: {
+        _text_artifact_key(result.artifact_path, artifacts_dir): {
             "name": result.name,
             "confidence": result.confidence,
         }
@@ -115,10 +126,11 @@ def build_name_map(results: list[NameFilterResult]) -> dict[str, dict[str, Any]]
 def write_name_map(
     results: list[NameFilterResult],
     output_path: Path,
+    artifacts_dir: Path | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
-        json.dumps(build_name_map(results), ensure_ascii=False, indent=2, sort_keys=True)
+        json.dumps(build_name_map(results, artifacts_dir), ensure_ascii=False, indent=2, sort_keys=True)
         + "\n",
         encoding="utf-8",
     )
@@ -135,6 +147,7 @@ def low_confidence_reason(confidence: float | None) -> str:
 def build_low_confidence_skip_records(
     results: list[NameFilterResult],
     threshold: float,
+    artifacts_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for result in results:
@@ -142,7 +155,7 @@ def build_low_confidence_skip_records(
             continue
         records.append(
             {
-                "filename": result.artifact_path.with_suffix(".txt").name,
+                "filename": _text_artifact_key(result.artifact_path, artifacts_dir),
                 "artifact": str(result.artifact_path),
                 "status": LOW_CONFIDENCE_STATUS,
                 "reason": low_confidence_reason(result.confidence),
@@ -158,11 +171,12 @@ def write_low_confidence_skip_log(
     results: list[NameFilterResult],
     output_path: Path,
     threshold: float,
+    artifacts_dir: Path | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
         json.dumps(record, ensure_ascii=False, sort_keys=True)
-        for record in build_low_confidence_skip_records(results, threshold)
+        for record in build_low_confidence_skip_records(results, threshold, artifacts_dir)
     ]
     output_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
@@ -191,11 +205,11 @@ def filter_artifact_names(
             )
         )
     if write_map:
-        write_name_map(results, map_path or name_map_artifact_path(artifacts_dir))
+        write_name_map(results, map_path or name_map_artifact_path(artifacts_dir), artifacts_dir)
     if low_confidence_log_path is not None:
         if confidence_threshold is None:
             raise ValueError("confidence_threshold is required when writing a low-confidence log.")
-        write_low_confidence_skip_log(results, low_confidence_log_path, confidence_threshold)
+        write_low_confidence_skip_log(results, low_confidence_log_path, confidence_threshold, artifacts_dir)
     return results
 
 

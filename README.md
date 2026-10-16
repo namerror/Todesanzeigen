@@ -97,7 +97,7 @@ TODESANZEIGEN_VISION_CONCURRENCY=1
 
 ## OCR Usage
 
-Run local Tesseract OCR for all supported images in `input/`:
+Run local Tesseract OCR for all supported images recursively under `input/`:
 
 ```sh
 todesanzeigen ocr
@@ -111,6 +111,13 @@ step creates:
 artifacts/example.txt
 artifacts/example.tsv
 ```
+
+Subfolders are mirrored: `input/collection/example.jpg` produces
+`artifacts/collection/example.txt` and `artifacts/collection/example.tsv`.
+The filter, extraction, and source ingestion commands use the same relative paths.
+Image-only vision extraction records the extensionless relative path in `dateiname`
+and the full relative filename in checkpoints, so equal filenames in different
+subfolders remain distinct.
 
 Common options:
 

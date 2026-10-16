@@ -183,16 +183,22 @@ def discover_images(input_dir: Path) -> list[Path]:
         raise NotADirectoryError(f"Input path is not a directory: {input_dir}")
 
     return sorted(
-        path for path in input_dir.iterdir() if path.is_file() and image_mime_type(path)
+        path for path in input_dir.rglob("*") if path.is_file() and image_mime_type(path)
     )
 
 
-def artifact_path_for_image(image_path: Path, artifacts_dir: Path) -> Path:
-    return artifacts_dir / f"{image_path.stem}.txt"
+def artifact_path_for_image(
+    image_path: Path, artifacts_dir: Path, input_dir: Path | None = None
+) -> Path:
+    relative = image_path.relative_to(input_dir) if input_dir is not None else Path(image_path.name)
+    return artifacts_dir / relative.with_suffix(".txt")
 
 
-def tsv_artifact_path_for_image(image_path: Path, artifacts_dir: Path) -> Path:
-    return artifacts_dir / f"{image_path.stem}.tsv"
+def tsv_artifact_path_for_image(
+    image_path: Path, artifacts_dir: Path, input_dir: Path | None = None
+) -> Path:
+    relative = image_path.relative_to(input_dir) if input_dir is not None else Path(image_path.name)
+    return artifacts_dir / relative.with_suffix(".tsv")
 
 
 def run_ocr_folder(
@@ -210,8 +216,8 @@ def run_ocr_folder(
 
     results: list[OcrRunResult] = []
     for image_path in images:
-        artifact_path = artifact_path_for_image(image_path, artifacts_dir)
-        tsv_artifact_path = tsv_artifact_path_for_image(image_path, artifacts_dir)
+        artifact_path = artifact_path_for_image(image_path, artifacts_dir, input_dir)
+        tsv_artifact_path = tsv_artifact_path_for_image(image_path, artifacts_dir, input_dir)
         expects_tsv = bool(getattr(client, "writes_tsv", False))
         artifact_set_exists = artifact_path.exists() and (
             not expects_tsv or tsv_artifact_path.exists()
@@ -233,6 +239,7 @@ def run_ocr_folder(
             continue
 
         output = client.process_image(image_path, mime_type)
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
         artifact_path.write_text(output.text, encoding="utf-8")
         if output.tsv is not None:
             tsv_artifact_path.write_text(output.tsv, encoding="utf-8")

@@ -517,6 +517,7 @@ class CliOcrTests(TestCase):
         )
         select_candidates.assert_called_once_with(
             ["a", "b"],
+            artifacts_dir=Path("custom-artifacts"),
             only=["a.txt"],
             sample_ratio=None,
             sample_seed=0,
@@ -525,6 +526,7 @@ class CliOcrTests(TestCase):
         self.assertEqual(reroute_async.call_args.args, (["a"], Path("state/test.sqlite3"), "vision-provider"))
         kwargs = reroute_async.call_args.kwargs
         self.assertEqual(kwargs["input_dir"], Path("custom-input"))
+        self.assertEqual(kwargs["artifacts_dir"], Path("custom-artifacts"))
         self.assertEqual(kwargs["candidate_kind"], "pipeline")
         self.assertIn("Vision reroute complete", output.getvalue())
 
