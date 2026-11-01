@@ -669,11 +669,12 @@ todesanzeigen eval run \
   --split benchmark-v1
 ```
 
-Evaluation records exact-record accuracy, field-level precision, recall, F1,
-missing predictions, and aggregate stored token, latency, and cost telemetry.
-The command compares the selected stored extraction outputs with the current
-ground-truth labels and prints the metrics directly in the terminal. Evaluation
-does not invoke an extraction model or persist evaluation history.
+Evaluation reports per-field accuracy, precision, recall, F1, support, missing
+predictions, and aggregate target-field scores. It compares stored predictions
+with current ground-truth labels and prints metrics in the terminal; optional
+JSON reports include mismatches and reference/prediction lineage. Evaluation does
+not invoke an extraction model or persist evaluation history. See the local VLM
+section below for repeated inference timing and memory benchmarks.
 
 ### Recommended ML Workflow
 
@@ -724,3 +725,150 @@ PYTHONPATH=. uv run pytest -q
 
 The project declares `pytest` in the `dev` dependency group, so `uv run` uses
 the same dependency-managed environment as the package.
+
+## Local VLM extraction and inference benchmarks
+
+Local image-only models have their own `local_vlm` family, separate from hosted
+VLMs. The initial variant, `local_qwen3vl_fp16`, uses
+`Qwen/Qwen3-VL-2B-Instruct` at the exact revision already downloaded during local
+experiments. The hosted operational defaults are unchanged.
+
+Enable the NVIDIA GPU first (`nvidia-smi` must work). Install into a separate
+environment so the pipeline does not require torch for normal commands:
+
+```sh
+uv venv temp/vlm-env --python 3.11
+uv pip install --python temp/vlm-env/bin/python --torch-backend=cu128 -e '.[local-vlm]'
+source temp/vlm-env/bin/activate
+```
+
+The backend pins PyTorch 2.11.0 and Transformers 5.22.1. The command above selects
+the CUDA 12.8 torch build used in the initial local test; it still requires a
+compatible NVIDIA driver. Models download automatically to the Hugging Face
+cache. A disabled/missing GPU or insufficient VRAM produces an error rather
+than silently switching device, precision, or image resolution.
+
+Extract images and register their predictions (existing inventory can instead
+be selected without `--input-dir`):
+
+```sh
+todesanzeigen local-vlm extract \
+  --variant local_qwen3vl_fp16 \
+  --input-dir 'input/Aichacher Nachrichten' --source 'Aichacher Nachrichten' \
+  --limit 5
+```
+
+This uses the full existing image-only prompt and field normalization, including
+`nachname` → `name`. Successful results create `pipeline` candidates, not GT.
+The local variant starts with `review_enabled=false`; enable it in the variants
+configuration to show it in the review UI. Exact configuration and image hashes
+control extraction cache reuse; `--force` reruns extraction.
+
+Benchmark an existing, reviewed image inventory:
+
+```sh
+todesanzeigen local-vlm benchmark \
+  --variant local_qwen3vl_fp16 --label-set gt-v1 \
+  --limit 25 --warmups 1 --repetitions 3 \
+  --output-file output/benchmarks/local-fp16.json
+```
+
+Benchmarks always execute inference, even when predictions already exist. They
+load the model once, warm up on the first selected image, and run repeated passes
+in fixed document order with concurrency/batch size 1. There is no benchmark
+resume. `--split benchmark-v1 --subset test` selects a specific subset; supplying
+`--split` without `--subset` defaults to `test`. `--only` accepts an exact image
+basename or stored filename stem. Without a label-set filter, all selected
+image-backed documents can be benchmarked, including unlabeled images.
+
+Raw warm-up and measured samples live in SQLite's `inference_benchmark_runs`
+and `inference_benchmark_samples`. Run IDs preserve history even after new
+extraction outputs supersede older predictions. The first successful measured
+repetition per document becomes its canonical extraction output and creates one
+candidate. Repeated generations remain samples, not duplicate candidates.
+
+Measurements include separate model/processor load time (excluding download),
+preprocessing/transfer time, generation time, first-token latency, decode
+throughput, total extraction time, actual token counts, and CUDA allocated and
+reserved memory peaks. First-token latency starts at generation; decode speed
+excludes the first token. Output counts include EOS. Memory peaks reset per
+sample and include resident weights; their allocated baseline is also reported.
+Timing includes lightweight measurement callbacks and CUDA synchronization.
+There is no isolated vision-encoder timing or cloud-provider equivalent yet.
+
+Reports show mean/median/nearest-rank p95 with sample counts. Warm-up and loading
+are excluded from steady-state summaries. JSON/schema validity, output-limit
+termination, failure counts, and completion rate are separate from speed. JSON
+parsing failures retain inference timings. Failures before generation completes
+are excluded from latency/speed summaries and remain in failure counts. OOM
+stops the run and preserves prior
+samples; document-level errors continue. A schema-invalid output is not published
+as a successful extraction. Do not interpret a small-sample p95 as a stable
+performance estimate.
+
+To compare weight/cache configurations, copy the local `[[variants]]` entry and
+its `[variants.inference]` table, choose a new alias/label, and change
+`weight_format` to `int8` or `nf4`, or set `use_cache=false`. For BF16 set both
+`weight_format="bf16"` and `compute_dtype="bfloat16"`. NF4 is a 4-bit floating
+format, not literal INT4. INT8/NF4 quantize eligible language-model linear layers;
+the visual encoder and output head retain the compute dtype. Effective quantized
+module names and installed versions are recorded in the run environment.
+Changing revision, precision, cache, attention, pixel limits, seed, or generation
+settings creates a different stored-result identity. Hardware/repetitions do not.
+Keep everything except the variable under study fixed.
+
+Local variants require a full model commit SHA. To obtain another revision:
+
+```sh
+python -c "from huggingface_hub import model_info; print(model_info('Qwen/Qwen3-VL-2B-Instruct').sha)"
+```
+
+Evaluate stored predictions against GT or another exact extraction variant:
+
+```sh
+todesanzeigen eval run --label-set gt-v1 \
+  --variant local_qwen3vl_fp16 --variant vlm_current \
+  --output-file output/benchmarks/quality.json
+
+todesanzeigen eval run --reference-variant vlm_current \
+  --variant local_qwen3vl_fp16
+
+todesanzeigen eval run --run-id RUN_ID --label-set gt-v1
+
+todesanzeigen local-vlm report --run-id RUN_ID --label-set gt-v1 \
+  --output-file output/benchmarks/historical-run.json
+```
+
+Evaluation loads no model. It reports accuracy, precision, recall, F1, support,
+and mismatches for the 13 structured target fields, plus aggregate scores and
+missing coverage. Metadata, notes, confidence, and image presence are excluded.
+Blank GT values mean **confirmed absent** for this evaluation: a populated
+prediction is a false positive. Wrong populated values count as both FP and FN;
+both sides use existing normalization and whitespace cleanup. Undefined ratios
+are null (`n/a` in the terminal), with raw denominators in JSON. Missing/invalid
+predictions remain failures, including for all-blank references. The router's
+existing policy of ignoring blank labels is unchanged.
+
+All variants are scored on the same reference cohort; missing predictions are
+not silently dropped. A reference variant produces **agreement**, not GT accuracy,
+and missing reference rows are reported separately. Historical run comparisons
+use canonical output IDs rather than current active predictions. GT scores are
+computed on demand; exports include reference row IDs/content hashes and
+prediction IDs. GT edits can change later reports, so retain exported reports
+when freezing an experiment. Quantized KV caches and adapter training/loading
+are intentionally deferred.
+
+Run the normal test suite without a GPU or model download:
+
+```sh
+.venv/bin/python -m pytest
+```
+
+An optional real-GPU smoke check uses the local checkpoint and a supplied image:
+
+```sh
+TODESANZEIGEN_GPU_SMOKE=1 TODESANZEIGEN_SMOKE_IMAGE='input/path/to/notice.jpg' \
+  python -m pytest tests/test_local_vlm.py -k gpu_smoke
+```
+
+Install pytest into the local environment before running that opt-in check.

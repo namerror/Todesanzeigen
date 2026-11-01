@@ -282,6 +282,8 @@ def _select_review_candidates(
                 and str(candidate.get("extraction_model") or "") == variant.model
                 and str(candidate.get("extraction_prompt_version") or "")
                 == variant.prompt_version
+                and str(candidate.get("extraction_inference_config_hash") or "")
+                == variant.inference_config_hash
             ),
             None,
         )

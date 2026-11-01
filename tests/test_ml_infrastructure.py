@@ -85,6 +85,7 @@ class MlInfrastructureTests(TestCase):
                     "005_remove_artifacts",
                     "006_extraction_variants",
                     "007_remove_evaluation_history",
+                    "008_local_vlm_benchmarks",
                 ],
             )
             self.assertEqual(second, [])
@@ -247,6 +248,7 @@ class MlInfrastructureTests(TestCase):
                     "005_remove_artifacts",
                     "006_extraction_variants",
                     "007_remove_evaluation_history",
+                    "008_local_vlm_benchmarks",
                 ],
             )
 
@@ -777,6 +779,7 @@ class MlInfrastructureTests(TestCase):
             self.assertEqual(
                 methods,
                 [
+                    "local_vision_model_image_only",
                     "text_extraction",
                     "vision_model_image_only",
                     "vision_model_reroute",

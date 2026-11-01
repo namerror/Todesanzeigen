@@ -4,21 +4,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Iterable
 
 
-ROUTER_TARGET_FIELDS = (
-    "geschlecht",
-    "name",
-    "vorname",
-    "geburtsdatum",
-    "sterbedatum",
-    "geburtsname",
-    "titel",
-    "genannt",
-    "geburtsort",
-    "sterbeort",
-    "ort",
-    "weitere_orte",
-    "beruf",
-)
+from ..field_evaluation import TARGET_FIELDS as ROUTER_TARGET_FIELDS
 
 
 @dataclass(frozen=True)

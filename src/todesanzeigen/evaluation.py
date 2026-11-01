@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .field_evaluation import TARGET_FIELDS
 from .llm import STORED_COLUMNS
 from .storage import (
     DEFAULT_DB_PATH,
@@ -122,6 +123,7 @@ def evaluate_variant(
                 provider=variant.provider,
                 model=variant.model,
                 prompt_version=variant.prompt_version,
+                inference_config_hash=variant.inference_config_hash,
             )
             if prediction_row is None:
                 totals["missing_predictions"] += 1
@@ -131,7 +133,7 @@ def evaluate_variant(
                         "prediction": "",
                         "correct": False,
                     }
-                    for column in STORED_COLUMNS
+                    for column in TARGET_FIELDS
                     if _clean(truth.get(column, ""))
                 }
                 totals["fn"] += len(field_results)
@@ -191,7 +193,7 @@ def _compare_fields(
 ) -> tuple[dict[str, dict[str, Any]], bool]:
     field_results: dict[str, dict[str, Any]] = {}
     exact = True
-    for column in STORED_COLUMNS:
+    for column in TARGET_FIELDS:
         truth_value = _clean(truth.get(column, ""))
         prediction_value = _clean(prediction.get(column, ""))
         correct = truth_value == prediction_value

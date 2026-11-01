@@ -8,10 +8,12 @@ VISION_REROUTE_METHOD = "vision_model_reroute"
 VISION_IMAGE_ONLY_METHOD = "vision_model_image_only"
 
 OCR_LLM_FAMILY = "ocr_llm"
+LOCAL_VISION_METHOD = "local_vision_model_image_only"
+LOCAL_VLM_FAMILY = "local_vlm"
 VLM_FAMILY = "vlm"
 OCR_LLM_SLOT = "ocr_llm"
 VLM_SLOT = "vlm"
-MODEL_BACKED_FAMILIES = frozenset({OCR_LLM_FAMILY, VLM_FAMILY})
+MODEL_BACKED_FAMILIES = frozenset({OCR_LLM_FAMILY, VLM_FAMILY, LOCAL_VLM_FAMILY})
 CURRENT_PROMPT_VERSION = "death_notice_v3"
 
 GT_EXPORT_SOURCE = "ground_truth"
@@ -32,6 +34,11 @@ class ExtractionMethodDefinition:
 
 
 METHOD_DEFINITIONS = {
+    LOCAL_VISION_METHOD: ExtractionMethodDefinition(
+        method=LOCAL_VISION_METHOD, method_family=LOCAL_VLM_FAMILY,
+        result_slot=LOCAL_VLM_FAMILY, default_route_reason="image_only",
+        description="Local image-only vision-language extraction.",
+    ),
     TEXT_EXTRACTION_METHOD: ExtractionMethodDefinition(
         method=TEXT_EXTRACTION_METHOD,
         method_family=OCR_LLM_FAMILY,

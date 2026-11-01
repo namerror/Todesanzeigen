@@ -338,21 +338,26 @@ def insert_extraction_output(
     input_fingerprint: str = "",
     config_hash: str = "",
     superseded_at: str | None = None,
+    inference_config_hash: str = "",
 ) -> int:
     family = method_family_value or method_family(method)
     _validate_required_model(method, model, family)
+    if family == "local_vlm" and not inference_config_hash:
+        raise ValueError("Local VLM outputs require inference_config_hash; use the local-vlm workflow")
     reason = route_reason or default_route_reason(method)
     slot = result_slot_value or result_slot(method)
+    inference_column = ", inference_config_hash" if inference_config_hash else ""
+    inference_placeholder = ", ?" if inference_config_hash else ""
     cursor = connection.execute(
-        """
+        f"""
         INSERT INTO extraction_outputs(
             document_id, run_id, method, provider, model, prompt_version,
             fields_json, raw_response, status, error, attempts, latency_ms,
             estimated_tokens, cost_usd, method_family,
             route_reason, route_decision_json, config_json, ocr_output_id,
-            result_slot, input_fingerprint, config_hash, superseded_at
+            result_slot, input_fingerprint, config_hash, superseded_at{inference_column}
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{inference_placeholder})
         """,
         (
             document_id,
@@ -378,6 +383,7 @@ def insert_extraction_output(
             input_fingerprint,
             config_hash,
             superseded_at,
+            *((inference_config_hash,) if inference_config_hash else ()),
         ),
     )
     return int(cursor.lastrowid)
@@ -717,6 +723,7 @@ def document_review_detail(
                 extraction_outputs.provider AS extraction_provider,
                 extraction_outputs.model AS extraction_model,
                 extraction_outputs.prompt_version AS extraction_prompt_version,
+                extraction_outputs.inference_config_hash AS extraction_inference_config_hash,
                 extraction_outputs.method_family,
                 extraction_outputs.route_reason,
                 extraction_outputs.result_slot,
@@ -782,6 +789,7 @@ def active_extraction_for_variant(
     provider: str,
     model: str,
     prompt_version: str,
+    inference_config_hash: str = "",
 ) -> sqlite3.Row | None:
     return connection.execute(
         """
@@ -791,12 +799,13 @@ def active_extraction_for_variant(
           AND provider = ?
           AND model = ?
           AND prompt_version = ?
+          AND inference_config_hash = ?
           AND superseded_at IS NULL
           AND status IN ('processed', 'rerouted_processed', 'vision_processed')
         ORDER BY created_at DESC, id DESC
         LIMIT 1
         """,
-        (document_id, method, provider, model, prompt_version),
+        (document_id, method, provider, model, prompt_version, inference_config_hash),
     ).fetchone()
 
 
@@ -808,6 +817,7 @@ def supersede_active_extraction_for_variant(
     provider: str,
     model: str,
     prompt_version: str,
+    inference_config_hash: str = "",
 ) -> int:
     cursor = connection.execute(
         """
@@ -818,10 +828,11 @@ def supersede_active_extraction_for_variant(
           AND provider = ?
           AND model = ?
           AND prompt_version = ?
+          AND inference_config_hash = ?
           AND superseded_at IS NULL
           AND status IN ('processed', 'rerouted_processed', 'vision_processed')
         """,
-        (document_id, method, provider, model, prompt_version),
+        (document_id, method, provider, model, prompt_version, inference_config_hash),
     )
     return int(cursor.rowcount)
 
@@ -1047,6 +1058,7 @@ def export_variant_csv(
             provider=variant.provider,
             model=variant.model,
             prompt_version=variant.prompt_version,
+            inference_config_hash=variant.inference_config_hash,
         )
         if prediction is None:
             missing_count += 1
@@ -1120,6 +1132,7 @@ def _selected_export_fields(
             provider=variant.provider,
             model=variant.model,
             prompt_version=variant.prompt_version,
+            inference_config_hash=variant.inference_config_hash,
         )
         if prediction is not None:
             return variant.alias, _loads(prediction["fields_json"])

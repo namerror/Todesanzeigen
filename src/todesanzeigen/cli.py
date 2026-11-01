@@ -253,6 +253,32 @@ def build_parser() -> argparse.ArgumentParser:
         default="teacher",
     )
 
+    local = subparsers.add_parser("local-vlm", help="Local extraction and measured GPU inference benchmarks.")
+    local_commands = local.add_subparsers(dest="local_command", required=True)
+    for command in ("extract", "benchmark", "report"):
+        local_parser = local_commands.add_parser(command)
+        local_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+        local_parser.add_argument("--variants-config", type=Path, default=DEFAULT_VARIANTS_CONFIG_PATH)
+        local_parser.add_argument("--output-file", type=Path)
+        reference = local_parser.add_mutually_exclusive_group()
+        reference.add_argument("--label-set")
+        reference.add_argument("--reference-variant")
+        local_parser.add_argument("--split", default="")
+        local_parser.add_argument("--subset", choices=("train", "validation", "test"))
+        if command == "report":
+            local_parser.add_argument("--run-id", required=True)
+        else:
+            local_parser.add_argument("--variant", required=True)
+            local_parser.add_argument("--only", action="append")
+            local_parser.add_argument("--limit", type=int)
+        if command == "extract":
+            local_parser.add_argument("--input-dir", type=Path)
+            local_parser.add_argument("--source", default="")
+            local_parser.add_argument("--force", action="store_true")
+        if command == "benchmark":
+            local_parser.add_argument("--warmups", type=int, default=1)
+            local_parser.add_argument("--repetitions", type=int, default=3)
+
     db = subparsers.add_parser("db", help="Manage the local SQLite project database.")
     db_subparsers = db.add_subparsers(dest="db_command", required=True)
     db_init = db_subparsers.add_parser("init", help="Create or migrate the SQLite database.")
@@ -341,12 +367,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Export active successful outputs for this extraction variant alias instead of GT-prioritized rows.",
     )
 
-    eval_parser = subparsers.add_parser("eval", help="Evaluate extraction outputs against ground truth labels.")
+    eval_parser = subparsers.add_parser("eval", help="Compare extraction fields against GT labels or an extraction variant.")
     eval_subparsers = eval_parser.add_subparsers(dest="eval_command", required=True)
     eval_run = eval_subparsers.add_parser("run", help="Run field-level extraction evaluation.")
     eval_run.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
-    eval_run.add_argument("--label-set", default=DEFAULT_LABEL_SET)
-    eval_run.add_argument("--variant", required=True)
+    eval_reference = eval_run.add_mutually_exclusive_group()
+    eval_reference.add_argument("--label-set")
+    eval_reference.add_argument("--reference-variant")
+    eval_run.add_argument("--variant", action="append", default=[])
+    eval_run.add_argument("--run-id")
+    eval_run.add_argument("--subset", choices=("train", "validation", "test"))
+    eval_run.add_argument("--output-file", type=Path)
     eval_run.add_argument("--variants-config", type=Path, default=DEFAULT_VARIANTS_CONFIG_PATH)
     eval_run.add_argument("--split", default="")
 
@@ -838,31 +869,67 @@ def run_export_command(args: argparse.Namespace) -> int:
     raise ValueError(f"Unsupported export command: {args.export_command}")
 
 
-def run_eval_command(args: argparse.Namespace) -> int:
-    if args.eval_command == "run":
-        from .evaluation import evaluate_variant
+def _print_field_report(report: dict) -> None:
+    print("Variant agreement" if report["mode"] == "variant_agreement" else "GT accuracy")
+    def number(value):
+        return "n/a" if value is None else f"{value:.3f}"
+    for alias, result in report["results"].items():
+        print(f"{alias}: {result['documents']} documents; missing={result['missing_predictions']}; "
+              f"micro_f1={number(result['micro']['f1'])}; "
+              f"exact={number(result.get('exact_record_accuracy'))}; {result['status']}")
+        print("field                 accuracy precision recall    f1        support")
+        for field, metrics in result["fields"].items():
+            print(f"{field:21} {number(metrics['accuracy']):8} {number(metrics['precision']):9} "
+                  f"{number(metrics['recall']):9} {number(metrics['f1']):9} {metrics['support']}")
+    if report["missing_references"]:
+        print(f"Missing reference predictions: {report['missing_references']}")
 
-        summary = evaluate_variant(
-            db_path=args.db,
-            label_set=args.label_set,
-            variant_alias=args.variant,
-            variants_config=args.variants_config,
-            split_name=args.split,
+
+def run_eval_command(args: argparse.Namespace) -> int:
+    from .field_evaluation import evaluate_comparison
+    from .local_vlm import write_report
+    report = evaluate_comparison(
+        db_path=args.db, variant_aliases=args.variant, run_id=args.run_id,
+        label_set=args.label_set or (None if args.reference_variant else DEFAULT_LABEL_SET),
+        reference_variant=args.reference_variant, variants_config=args.variants_config,
+        split_name=args.split, subset=args.subset,
+    )
+    _print_field_report(report)
+    if args.output_file:
+        write_report(args.output_file, report)
+    return 0
+
+
+def run_local_vlm_command(args: argparse.Namespace) -> int:
+    from .field_evaluation import evaluate_comparison
+    from .local_vlm import benchmark_report, run_local, write_report
+    from .variants import load_variant_config
+    if args.local_command == "report":
+        result = benchmark_report(args.db, args.run_id)
+        run_id = args.run_id
+    else:
+        variant = load_variant_config(args.variants_config).variant(args.variant)
+        result = run_local(
+            db_path=args.db, variant=variant, benchmark=args.local_command == "benchmark",
+            label_set=args.label_set, split_name=args.split, subset=args.subset,
+            only=args.only, limit=args.limit, input_dir=getattr(args, "input_dir", None),
+            source=getattr(args, "source", ""), force=getattr(args, "force", False),
+            warmups=getattr(args, "warmups", 1), repetitions=getattr(args, "repetitions", 3),
         )
-        print(
-            f"Evaluation: {summary.documents} documents; "
-            f"exact={summary.exact_record_accuracy:.3f}; "
-            f"field_f1={summary.field_f1:.3f}; "
-            f"precision={summary.field_precision:.3f}; recall={summary.field_recall:.3f}; "
-            f"missing_predictions={summary.missing_predictions}; "
-            f"estimated_tokens={summary.estimated_tokens_total} "
-            f"({summary.estimated_tokens_count} rows); "
-            f"mean_latency_ms={summary.latency_ms_mean} "
-            f"({summary.latency_ms_count} rows); "
-            f"cost_usd={summary.cost_usd_total} ({summary.cost_usd_count} rows)."
+        run_id = result["run_id"]
+    if args.label_set or args.reference_variant:
+        quality = evaluate_comparison(
+            db_path=args.db, run_id=run_id if args.local_command != "extract" else None,
+            variant_aliases=[args.variant] if args.local_command == "extract" else [],
+            label_set=args.label_set, reference_variant=args.reference_variant,
+            variants_config=args.variants_config, split_name=args.split, subset=args.subset,
         )
-        return 0
-    raise ValueError(f"Unsupported eval command: {args.eval_command}")
+        result["quality"] = quality
+        _print_field_report(quality)
+    print(json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False))
+    if args.output_file:
+        write_report(args.output_file, result)
+    return 1 if result.get("status") == "failed" else 0
 
 
 def run_router_command(args: argparse.Namespace) -> int:
@@ -987,6 +1054,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_reroute_command(args)
         if args.command == "vision-extract":
             return run_vision_extract_command(args)
+        if args.command == "local-vlm":
+            return run_local_vlm_command(args)
         if args.command == "db":
             return run_db_command(args)
         if args.command == "ingest":

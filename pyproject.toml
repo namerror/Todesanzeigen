@@ -21,6 +21,16 @@ dependencies = [
     "uvicorn>=0.35.0",
 ]
 
+[project.optional-dependencies]
+local-vlm = [
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "transformers==5.22.1",
+    "accelerate>=1.0",
+    "bitsandbytes>=0.48",
+    "huggingface-hub>=0.34",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=7.4.0",

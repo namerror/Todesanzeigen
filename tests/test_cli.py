@@ -70,7 +70,7 @@ class CliOcrTests(TestCase):
         self.assertEqual(export_args.feature_set, "router-v2")
         self.assertEqual(train_args.feature_set, "router-v2")
         self.assertEqual(manifest_args.feature_set, "router-v2")
-        self.assertEqual(eval_args.variant, "text_current")
+        self.assertEqual(eval_args.variant, ["text_current"])
         self.assertEqual(eval_args.variants_config, Path("config/extraction_variants.toml"))
         self.assertFalse(hasattr(eval_args, "name"))
 
@@ -110,30 +110,23 @@ class CliOcrTests(TestCase):
         args = cli.build_parser().parse_args(
             ["eval", "run", "--variant", "text_current"]
         )
-        summary = SimpleNamespace(
-            documents=2,
-            exact_record_accuracy=0.5,
-            field_f1=0.75,
-            field_precision=0.8,
-            field_recall=0.7,
-            missing_predictions=1,
-            estimated_tokens_total=100,
-            estimated_tokens_count=1,
-            latency_ms_mean=25.0,
-            latency_ms_count=1,
-            cost_usd_total=0.01,
-            cost_usd_count=1,
-        )
-
+        report = {
+            "mode": "gt_accuracy", "missing_references": 0,
+            "results": {"text_current": {"documents": 2, "missing_predictions": 1,
+                "micro": {"f1": .75}, "status": "ok", "fields": {
+                    "name": {"accuracy": .5, "precision": .8, "recall": .7, "f1": .75, "support": 2},
+                }}},
+        }
         output = StringIO()
         with (
-            patch("src.todesanzeigen.evaluation.evaluate_variant", return_value=summary),
+            patch("src.todesanzeigen.field_evaluation.evaluate_comparison", return_value=report) as evaluate,
             redirect_stdout(output),
         ):
             result = cli.run_eval_command(args)
-
         self.assertEqual(result, 0)
-        self.assertTrue(output.getvalue().startswith("Evaluation: 2 documents;"))
+        self.assertIn("GT accuracy", output.getvalue())
+        self.assertIn("name", output.getvalue())
+        self.assertEqual(evaluate.call_args.kwargs["variant_aliases"], ["text_current"])
 
     def test_documentai_requires_explicit_gcp_unlock(self) -> None:
         args = cli.build_parser().parse_args(["ocr", "--engine", "documentai"])

@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .methods import METHOD_DEFINITIONS
+from .methods import METHOD_DEFINITIONS, LOCAL_VISION_METHOD
+from .inference_config import InferenceConfig
 
 
 DEFAULT_VARIANTS_CONFIG_PATH = Path("config/extraction_variants.toml")
@@ -20,8 +21,13 @@ class ExtractionVariant:
     model: str
     prompt_version: str
     review_enabled: bool = False
+    inference: InferenceConfig | None = None
 
-    def as_dict(self) -> dict[str, str]:
+    @property
+    def inference_config_hash(self) -> str:
+        return self.inference.identity_hash if self.inference else ""
+
+    def as_dict(self) -> dict[str, Any]:
         return {
             "alias": self.alias,
             "label": self.label,
@@ -29,6 +35,7 @@ class ExtractionVariant:
             "provider": self.provider,
             "model": self.model,
             "prompt_version": self.prompt_version,
+            **({"inference": self.inference.as_dict(), "inference_config_hash": self.inference_config_hash} if self.inference else {}),
         }
 
 
@@ -73,7 +80,7 @@ def load_variant_config(
     if len(aliases) != len(set(aliases)):
         raise ValueError(f"Extraction variant aliases must be unique: {path}")
     identities = [
-        (variant.method, variant.provider, variant.model, variant.prompt_version)
+        (variant.method, variant.provider, variant.model, variant.prompt_version, variant.inference_config_hash)
         for variant in variants
     ]
     if len(identities) != len(set(identities)):
@@ -107,6 +114,15 @@ def _parse_variant(data: Any, path: Path) -> ExtractionVariant:
     review_enabled = data.get("review_enabled", False)
     if not isinstance(review_enabled, bool):
         raise ValueError(f"Extraction variant review_enabled must be true or false: {path}")
+    inference = None
+    if method == LOCAL_VISION_METHOD:
+        if data.get("provider") != "transformers":
+            raise ValueError("Local VLM provider must be transformers")
+        if not isinstance(data.get("inference"), dict):
+            raise ValueError("Local variants require an [variants.inference] table")
+        inference = InferenceConfig.from_dict(data["inference"])
+    elif "inference" in data:
+        raise ValueError("inference configuration is only supported for local VLM variants")
     return ExtractionVariant(
         alias=_required_text(data, "alias", path),
         label=_required_text(data, "label", path),
@@ -115,6 +131,7 @@ def _parse_variant(data: Any, path: Path) -> ExtractionVariant:
         model=_required_text(data, "model", path),
         prompt_version=_required_text(data, "prompt_version", path),
         review_enabled=review_enabled,
+        inference=inference,
     )
 
 
