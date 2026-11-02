@@ -21,12 +21,14 @@ from .storage import (
 from .variants import ExtractionVariant
 
 
-def select_documents(connection, *, label_set=None, split_name="", subset=None, only=None, limit=None, image_backed=False):
+def select_documents(connection, *, label_set=None, split_name="", subset=None, only=None, limit=None, image_backed=False, source=""):
     if subset and not split_name:
         raise ValueError("--subset requires --split")
     if limit is not None and limit < 1:
         raise ValueError("--limit must be positive")
     documents = [dict(row) for row in all_documents(connection)]
+    if source:
+        documents = [d for d in documents if d["source"] == source]
     if image_backed:
         documents = [d for d in documents if d["image_path"]]
     if label_set:
@@ -43,6 +45,49 @@ def select_documents(connection, *, label_set=None, split_name="", subset=None, 
     if only:
         documents = [d for d in documents if d["filename_stem"] in only or Path(d["image_path"]).name in only]
     return documents[:limit] if limit else documents
+
+
+def select_images(connection, *, input_dir=None, limit=None, reference=None, **filters):
+    """Validate registered paths before limiting; directory selection never relocates records."""
+    from .ocr import discover_images
+    if limit is not None and limit < 1:
+        raise ValueError("--limit must be positive")
+    documents = select_documents(connection, **filters)
+    directory_images = None
+    if input_dir is not None:
+        directory_images = {}
+        for path in discover_images(input_dir):
+            directory_images.setdefault(path.resolve(), []).append(path)
+    available, invalid = [], []
+    for document in documents:
+        image = Path(document["image_path"]).resolve() if document["image_path"] else None
+        matches = directory_images.get(image, []) if directory_images is not None else None
+        if matches is not None and len(matches) > 1:
+            raise ValueError(f"Ambiguous image matches for document {document['id']}: {matches}")
+        try:
+            if image is None:
+                raise ValueError("No recorded image path")
+            if matches is not None and not matches:
+                raise FileNotFoundError("Recorded image path is not in --input-dir")
+            if not image.is_file():
+                raise FileNotFoundError(str(image))
+            digest = sha256_file(image)
+            if document["image_sha256"] and digest != document["image_sha256"]:
+                raise ValueError("Stored image SHA-256 mismatch")
+        except (OSError, ValueError) as exc:
+            invalid.append({"document_id": document["id"], "image_path": document["image_path"], "reason": str(exc)})
+            continue
+        available.append((document, {"document_id": document["id"], "image_path": str(image), "image_sha256": digest}))
+    selected = available[:limit] if limit else available
+    summary = {"matching_documents": len(documents), "available_images": len(available),
+               "missing_invalid_images": len(invalid), "selected_images": len(selected), "invalid_images": invalid}
+    if reference is not None:
+        covered = sum(active_extraction_for_variant(connection, document_id=d["id"], **variant_lookup(reference)) is not None
+                      for d, _ in selected)
+        summary["reference_coverage"] = {"available": covered, "missing": len(selected) - covered, "total": len(selected)}
+    elif filters.get("label_set"):
+        summary["reference_coverage"] = {"available": len(selected), "missing": 0, "total": len(selected)}
+    return selected, summary
 
 
 def ingest_images(db_path: Path, input_dir: Path, source: str):
@@ -103,31 +148,27 @@ def _code_revision():
 def run_local(
     *, db_path: Path, variant: ExtractionVariant, benchmark=False, label_set=None,
     split_name="", subset=None, only=None, limit=None, input_dir=None, source="",
-    force=False, warmups=1, repetitions=3, backend_factory=None,
+    force=False, warmups=1, repetitions=3, backend_factory=None, reference=None,
 ) -> dict[str, Any]:
     if variant.method != LOCAL_VISION_METHOD or variant.inference is None:
         raise ValueError("Select a local VLM variant with inference configuration")
     if variant.prompt_version != CURRENT_PROMPT_VERSION:
         raise ValueError("Local inference supports only the current extraction prompt version")
-    if benchmark and input_dir is not None:
-        raise ValueError("Ingest images using local-vlm extract before benchmarking")
     if warmups < 0 or repetitions < 1:
         raise ValueError("Warm-ups must be nonnegative and repetitions positive")
     apply_migrations(db_path)
-    if input_dir is not None:
+    if input_dir is not None and not benchmark:
         ingest_images(db_path, input_dir, source or input_dir.name)
     with connect(db_path) as connection:
-        documents = select_documents(connection, label_set=label_set, split_name=split_name,
-                                     subset=subset, only=only, limit=limit, image_backed=True)
-    # Benchmarks only accept image-backed documents; missing files remain sample failures.
-    documents = [d for d in documents if d["image_path"]]
-    if not documents:
-        raise ValueError("No image-backed documents selected")
-    manifest = []
-    for document in documents:
-        image = Path(document["image_path"])
-        digest = sha256_file(image) if image.is_file() else ""
-        manifest.append({"document_id": document["id"], "image_path": str(image), "image_sha256": digest})
+        selected, summary = select_images(
+            connection, input_dir=input_dir, limit=limit, reference=reference, source=source,
+            label_set=label_set, split_name=split_name, subset=subset, only=only)
+    print("Selection summary: " + canonical_json(summary), flush=True)
+    if not selected:
+        raise ValueError("No eligible images remain after selection and image validation")
+    documents = [document for document, _ in selected]
+    manifest = [entry for _, entry in selected]
+    selection = {"selected_document_ids": [d["id"] for d in documents], "selection": summary}
     cached = 0
     pending = []
     with connect(db_path) as connection:
@@ -138,7 +179,7 @@ def run_local(
             else:
                 pending.append((document, entry))
         if not pending:
-            return {"cached": cached, "successful": 0, "failed": 0, "run_id": None}
+            return {"cached": cached, "successful": 0, "failed": 0, "run_id": None, **selection}
         run_id = create_run(connection, command="local-vlm benchmark" if benchmark else "local-vlm extract",
                             method=variant.method, provider=variant.provider, model=variant.model,
                             config=variant.as_dict(), code_version=_code_revision())
@@ -222,7 +263,7 @@ def run_local(
             if benchmark:
                 connection.execute("UPDATE inference_benchmark_runs SET status=?,error=?,warmup_ms=?,finished_at=CURRENT_TIMESTAMP WHERE id=?",
                                    (status, fatal, warmup_total, run_id))
-    result = {"run_id": run_id, "status": status, "successful": successes, "failed": failures, "cached": cached, "error": fatal}
+    result = {"run_id": run_id, "status": status, "successful": successes, "failed": failures, "cached": cached, "error": fatal, **selection}
     if benchmark:
         result["benchmark"] = benchmark_report(db_path, run_id)
     return result
