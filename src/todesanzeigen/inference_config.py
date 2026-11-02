@@ -19,8 +19,8 @@ def fingerprint(value: Any) -> str:
 @dataclass(frozen=True)
 class InferenceConfig:
     revision: str
-    weight_format: str = "fp16"
-    compute_dtype: str = "float16"
+    weight_format: str = "bf16"
+    compute_dtype: str = "bfloat16"
     use_cache: bool = True
     attention_backend: str = "sdpa"
     min_pixels: int = 256 * 32 * 32

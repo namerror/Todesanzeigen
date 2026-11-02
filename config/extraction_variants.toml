@@ -30,8 +30,8 @@ prompt_version = "death_notice_v1"
 review_enabled = false
 
 [[variants]]
-alias = "local_qwen3vl_fp16"
-label = "Local VLM · Qwen3-VL 2B · FP16"
+alias = "local_qwen3vl_bf16"
+label = "Local VLM · Qwen3-VL 2B · BF16"
 method = "local_vision_model_image_only"
 provider = "transformers"
 model = "Qwen/Qwen3-VL-2B-Instruct"
@@ -39,8 +39,8 @@ prompt_version = "death_notice_v3"
 review_enabled = false
 [variants.inference]
 revision = "89644892e4d85e24eaac8bacfd4f463576704203"
-weight_format = "fp16"
-compute_dtype = "float16"
+weight_format = "bf16"
+compute_dtype = "bfloat16"
 use_cache = true
 attention_backend = "sdpa"
 min_pixels = 262144

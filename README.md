@@ -729,9 +729,12 @@ the same dependency-managed environment as the package.
 ## Local VLM extraction and inference benchmarks
 
 Local image-only models have their own `local_vlm` family, separate from hosted
-VLMs. The initial variant, `local_qwen3vl_fp16`, uses
+VLMs. The initial variant, `local_qwen3vl_bf16`, uses
 `Qwen/Qwen3-VL-2B-Instruct` at the exact revision already downloaded during local
-experiments. The hosted operational defaults are unchanged.
+experiments, preserving the checkpoint’s native BF16 weight format. The default
+compute dtype is also BF16. Previously recorded FP16 benchmark runs retain their
+original settings and remain accessible by run ID. The hosted operational
+defaults are unchanged.
 
 Enable the NVIDIA GPU first (`nvidia-smi` must work). Install into a separate
 environment so the pipeline does not require torch for normal commands:
@@ -753,7 +756,7 @@ be selected without `--input-dir`):
 
 ```sh
 todesanzeigen local-vlm extract \
-  --variant local_qwen3vl_fp16 \
+  --variant local_qwen3vl_bf16 \
   --input-dir 'input/Aichacher Nachrichten' --source 'Aichacher Nachrichten' \
   --limit 5
 ```
@@ -768,9 +771,9 @@ Benchmark an existing, reviewed image inventory:
 
 ```sh
 todesanzeigen local-vlm benchmark \
-  --variant local_qwen3vl_fp16 --label-set gt-v1 \
+  --variant local_qwen3vl_bf16 --label-set gt-v1 \
   --limit 25 --warmups 1 --repetitions 3 \
-  --output-file output/benchmarks/local-fp16.json
+  --output-file output/benchmarks/local-bf16.json
 ```
 
 Benchmarks always execute inference, even when predictions already exist. They
@@ -808,8 +811,10 @@ performance estimate.
 
 To compare weight/cache configurations, copy the local `[[variants]]` entry and
 its `[variants.inference]` table, choose a new alias/label, and change
-`weight_format` to `int8` or `nf4`, or set `use_cache=false`. For BF16 set both
-`weight_format="bf16"` and `compute_dtype="bfloat16"`. NF4 is a 4-bit floating
+`weight_format` to `int8` or `nf4`, or set `use_cache=false`. For an FP16
+comparison set both
+`weight_format="fp16"` and `compute_dtype="float16"`. BF16 remains the baseline
+and the default compute dtype for quantized variants. NF4 is a 4-bit floating
 format, not literal INT4. INT8/NF4 quantize eligible language-model linear layers;
 the visual encoder and output head retain the compute dtype. Effective quantized
 module names and installed versions are recorded in the run environment.
@@ -827,11 +832,11 @@ Evaluate stored predictions against GT or another exact extraction variant:
 
 ```sh
 todesanzeigen eval run --label-set gt-v1 \
-  --variant local_qwen3vl_fp16 --variant vlm_current \
+  --variant local_qwen3vl_bf16 --variant vlm_current \
   --output-file output/benchmarks/quality.json
 
 todesanzeigen eval run --reference-variant vlm_current \
-  --variant local_qwen3vl_fp16
+  --variant local_qwen3vl_bf16
 
 todesanzeigen eval run --run-id RUN_ID --label-set gt-v1
 

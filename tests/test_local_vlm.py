@@ -29,7 +29,7 @@ def setup(tmp_path):
     with connect(db) as c:
         doc = upsert_document(c, source_name="paper", filename_stem="notice", image_path=image)
         save_ground_truth_label(c, document_id=doc, label_set="gt-v1", fields={"name": "Muster"})
-    variant = load_variant_config().variant("local_qwen3vl_fp16")
+    variant = load_variant_config().variant("local_qwen3vl_bf16")
     return db, image, doc, variant
 
 
@@ -61,7 +61,7 @@ def test_config_identity_and_validation():
     assert replace(config, use_cache=False).identity_hash != config.identity_hash
     assert replace(config, weight_format="nf4").identity_hash != config.identity_hash
     for data in ({"revision": "main"}, {"revision": "a" * 40, "extra": True},
-                 {"revision": "a" * 40, "weight_format": "bf16"},
+                 {"revision": "a" * 40, "weight_format": "fp16"},
                  {"revision": "a" * 40, "max_pixels": 0}):
         with pytest.raises(ValueError):
             InferenceConfig.from_dict(data)
@@ -315,7 +315,7 @@ def test_gpu_smoke_opt_in(tmp_path):
         pytest.skip("Set TODESANZEIGEN_GPU_SMOKE=1 and TODESANZEIGEN_SMOKE_IMAGE for real inference")
     image = Path(os.environ["TODESANZEIGEN_SMOKE_IMAGE"])
     from src.todesanzeigen.local_backend import TransformersBackend
-    variant = load_variant_config().variant("local_qwen3vl_fp16")
+    variant = load_variant_config().variant("local_qwen3vl_bf16")
     backend = TransformersBackend(variant.model, variant.inference)
     backend.load()
     raw, metrics = backend.infer("Lies den Namen in dieser Todesanzeige.", image)
