@@ -125,8 +125,16 @@ def parse_prediction(raw: str, document: dict) -> tuple[dict | None, dict]:
     return normalize_record(data, filename=document["filename_stem"], source=document["source"]), flags
 
 
-def _persist_prediction(connection, *, document, variant, run_id, fields, raw, metrics, image_hash):
-    supersede_active_extraction_for_variant(connection, document_id=document["id"], **variant_lookup(variant))
+def _persist_prediction(connection, *, document, variant, run_id, fields, raw, metrics, image_hash,
+                        replace_existing=True):
+    if replace_existing:
+        supersede_active_extraction_for_variant(connection, document_id=document["id"], **variant_lookup(variant))
+    else:
+        # Acquire the write lock before checking: another run may have published
+        # a prediction while inference was in progress.
+        connection.execute("BEGIN IMMEDIATE")
+        if active_extraction_for_variant(connection, document_id=document["id"], **variant_lookup(variant)) is not None:
+            return None
     output_id = insert_extraction_output(
         connection, document_id=document["id"], run_id=run_id, fields=fields,
         status="vision_processed", raw_response=raw, attempts=1,
@@ -234,17 +242,20 @@ def run_local(
                         successes += status == "success"
                         failures += status != "success"
                     with connect(db_path) as connection:
-                        if phase == "measured" and fields is not None and document["id"] not in canonical_outputs:
-                            canonical_outputs[document["id"]] = _persist_prediction(
+                        published_output_id = None
+                        if phase == "measured" and status == "success" and document["id"] not in canonical_outputs:
+                            published_output_id = _persist_prediction(
                                 connection, document=document, variant=variant, run_id=run_id,
-                                fields=fields, raw=raw, metrics=metrics, image_hash=entry["image_sha256"])
+                                fields=fields, raw=raw, metrics=metrics, image_hash=entry["image_sha256"],
+                                replace_existing=not benchmark)
+                            canonical_outputs[document["id"]] = published_output_id
                         if benchmark:
                             connection.execute(
                                 "INSERT INTO inference_benchmark_samples(run_id,document_id,repetition,phase,status,raw_response,fields_json,metrics_json,error,extraction_output_id) "
                                 "VALUES (?,?,?,?,?,?,?,?,?,?)",
                                 (run_id, document["id"], repetition, phase, status, raw,
                                  canonical_json(fields or {}), canonical_json(metrics), error,
-                                 canonical_outputs.get(document["id"]) if phase == "measured" and status == "success" else None))
+                                 published_output_id))
                         elif status != "success":
                             insert_extraction_output(connection, document_id=document["id"], run_id=run_id,
                                                      status="vision_failed", fields=None, raw_response=raw, error=error,

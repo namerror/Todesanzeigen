@@ -93,6 +93,7 @@ def test_benchmark_repetitions_cache_and_history(setup):
     assert report["completion_rate"] == 1
     assert len(report["samples"]) == 4
     assert report["run"]["load_ms"] == 17
+    assert [s["extraction_output_id"] is not None for s in report["samples"]] == [False, True, False, False]
     with connect(db) as c:
         assert c.execute("SELECT count(*) FROM label_candidates").fetchone()[0] == 1
         old_id = active_extraction_for_variant(c, document_id=doc, **variant_lookup(variant))["id"]
@@ -100,22 +101,132 @@ def test_benchmark_repetitions_cache_and_history(setup):
     assert cached["cached"] == 1 and FakeBackend.calls == 4
     run_local(db_path=db, variant=variant, benchmark=True, repetitions=1, warmups=0, backend_factory=FakeBackend)
     with connect(db) as c:
-        assert active_extraction_for_variant(c, document_id=doc, **variant_lookup(variant))["id"] != old_id
+        assert active_extraction_for_variant(c, document_id=doc, **variant_lookup(variant))["id"] == old_id
+        assert c.execute("SELECT count(*) FROM label_candidates").fetchone()[0] == 1
     quality = evaluate_comparison(db_path=db, run_id=first["run_id"], label_set="gt-v1")
     score = quality["results"]["run:" + first["run_id"]]
     assert score["fields"]["name"]["f1"] == 1
     assert score["prediction_output_ids"][str(doc)] == old_id
+    assert score["prediction_sample_ids"][str(doc)] == report["samples"][1]["id"]
     assert benchmark_report(db, first["run_id"])["samples"] == report["samples"]
     image.write_bytes(b"changed")
     result = run_local(db_path=db, variant=variant, backend_factory=FakeBackend)
     assert result["cached"] == 0
+    assert evaluate_comparison(db_path=db, run_id=first["run_id"], label_set="gt-v1") == quality
 
 
-def test_cache_settings_do_not_supersede_each_other(setup):
+@pytest.mark.parametrize("changed_image", [False, True])
+def test_benchmark_preserves_existing_prediction_and_scores_own_answer(setup, changed_image):
+    db, image, doc, variant = setup
+    run_local(db_path=db, variant=variant, backend_factory=FakeBackend)
+    with connect(db) as c:
+        original = dict(active_extraction_for_variant(c, document_id=doc, **variant_lookup(variant)))
+        candidates = [dict(row) for row in c.execute("SELECT * FROM label_candidates")]
+    if changed_image:
+        image.write_bytes(b"new-image-content")
+
+    class DifferentAnswers(FakeBackend):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.answers = iter(["Warmup", "Different", "Muster"])
+
+        def infer(self, prompt, image):
+            _, metrics = super().infer(prompt, image)
+            return json.dumps({**json.loads(self.response), "nachname": next(self.answers)}), metrics
+
+    run = run_local(db_path=db, variant=variant, benchmark=True, warmups=1, repetitions=2,
+                    backend_factory=DifferentAnswers)
+    with connect(db) as c:
+        assert dict(active_extraction_for_variant(c, document_id=doc, **variant_lookup(variant))) == original
+        assert [dict(row) for row in c.execute("SELECT * FROM label_candidates")] == candidates
+        assert c.execute("SELECT count(*) FROM extraction_outputs").fetchone()[0] == 1
+    samples = run["benchmark"]["samples"]
+    assert all(s["extraction_output_id"] is None for s in samples)
+    quality = evaluate_comparison(db_path=db, run_id=run["run_id"], label_set="gt-v1")
+    score = quality["results"]["run:" + run["run_id"]]
+    assert score["fields"]["name"]["f1"] == 0
+    assert score["prediction_output_ids"] == {}
+    assert score["prediction_sample_ids"] == {str(doc): samples[1]["id"]}
+    # Subsequent explicit extraction replacement cannot change benchmark quality.
+    run_local(db_path=db, variant=variant, force=True, backend_factory=FakeBackend)
+    assert evaluate_comparison(db_path=db, run_id=run["run_id"], label_set="gt-v1") == quality
+
+
+@pytest.mark.parametrize("history", ["failed", "superseded"])
+def test_benchmark_fills_gap_after_failed_or_superseded_history(setup, history):
+    db, _, doc, variant = setup
+    with connect(db) as c:
+        old_id = insert_extraction_output(
+            c, document_id=doc, run_id=None, fields={},
+            status="vision_failed" if history == "failed" else "vision_processed",
+            superseded_at=None if history == "failed" else "2026-01-01",
+            **variant_lookup(variant))
+        original = dict(c.execute("SELECT * FROM extraction_outputs WHERE id=?", (old_id,)).fetchone())
+
+    class InitiallyInvalid(FakeBackend):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.answers = iter([self.response, "invalid", self.response, self.response])
+
+        def infer(self, prompt, image):
+            _, metrics = super().infer(prompt, image)
+            return next(self.answers), metrics
+
+    run = run_local(db_path=db, variant=variant, benchmark=True, warmups=1, repetitions=3,
+                    backend_factory=InitiallyInvalid)
+    samples = run["benchmark"]["samples"]
+    assert [s["extraction_output_id"] is not None for s in samples] == [False, False, True, False]
+    with connect(db) as c:
+        assert dict(c.execute("SELECT * FROM extraction_outputs WHERE id=?", (old_id,)).fetchone()) == original
+        assert active_extraction_for_variant(c, document_id=doc, **variant_lookup(variant))["id"] == samples[2]["extraction_output_id"]
+        assert c.execute("SELECT count(*) FROM label_candidates").fetchone()[0] == 1
+    score = evaluate_comparison(db_path=db, run_id=run["run_id"], label_set="gt-v1")["results"]["run:" + run["run_id"]]
+    assert score["fields"]["name"]["f1"] == 1
+    assert score["prediction_sample_ids"] == {str(doc): samples[2]["id"]}
+
+
+def test_failed_benchmark_does_not_fall_back_to_existing_prediction(setup):
+    db, _, doc, variant = setup
+    run_local(db_path=db, variant=variant, backend_factory=FakeBackend)
+    backend = type("InvalidBackend", (FakeBackend,), {"response": "invalid"})
+    run = run_local(db_path=db, variant=variant, benchmark=True, warmups=0, backend_factory=backend)
+    score = evaluate_comparison(db_path=db, run_id=run["run_id"], label_set="gt-v1")["results"]["run:" + run["run_id"]]
+    assert score["missing_predictions"] == 1
+    assert score["prediction_sample_ids"] == score["prediction_output_ids"] == {}
+    with connect(db) as c:
+        assert active_extraction_for_variant(c, document_id=doc, **variant_lookup(variant)) is not None
+        assert c.execute("SELECT count(*) FROM extraction_outputs").fetchone()[0] == 1
+
+
+def test_benchmark_preserves_prediction_published_during_inference(setup):
+    db, _, doc, variant = setup
+
+    class ConcurrentPublisher(FakeBackend):
+        def infer(self, prompt, image):
+            # Simulate a separate writer publishing after selection, before persistence.
+            with connect(db) as c:
+                self.output_id = insert_extraction_output(
+                    c, document_id=doc, run_id=None, fields={"name": "Other writer"},
+                    status="vision_processed", **variant_lookup(variant))
+            return super().infer(prompt, image)
+
+    run = run_local(db_path=db, variant=variant, benchmark=True, warmups=0, repetitions=1,
+                    backend_factory=ConcurrentPublisher)
+    assert run["status"] == "completed"
+    assert run["benchmark"]["samples"][0]["extraction_output_id"] is None
+    with connect(db) as c:
+        active = active_extraction_for_variant(c, document_id=doc, **variant_lookup(variant))
+        assert json.loads(active["fields_json"])["name"] == "Other writer"
+        assert c.execute("SELECT count(*) FROM extraction_outputs").fetchone()[0] == 1
+        assert c.execute("SELECT count(*) FROM label_candidates").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("benchmark", [False, True])
+def test_cache_settings_do_not_supersede_each_other(setup, benchmark):
     db, _, doc, variant = setup
     second = replace(variant, inference=replace(variant.inference, use_cache=False))
     for v in (variant, second):
-        run_local(db_path=db, variant=v, backend_factory=FakeBackend)
+        run_local(db_path=db, variant=v, benchmark=benchmark, backend_factory=FakeBackend)
     with connect(db) as c:
         assert active_extraction_for_variant(c, document_id=doc, **variant_lookup(variant))
         assert active_extraction_for_variant(c, document_id=doc, **variant_lookup(second))
@@ -266,6 +377,36 @@ def test_benchmark_report_command_without_loading_gpu(setup, tmp_path, capsys):
     report = json.loads(output.read_text())
     assert report["quality"]["mode"] == "gt_accuracy"
     assert report["run"]["id"] == run["run_id"]
+
+
+def test_cli_benchmark_report_and_eval_score_samples_without_replacing(setup, tmp_path, monkeypatch):
+    from src.todesanzeigen import local_backend
+    db, _, doc, variant = setup
+    run_local(db_path=db, variant=variant, backend_factory=FakeBackend)
+    backend = type("DifferentBackend", (FakeBackend,), {
+        "response": json.dumps({**json.loads(FakeBackend.response), "nachname": "Different"}),
+    })
+    monkeypatch.setattr(local_backend, "TransformersBackend", backend)
+    output = tmp_path / "benchmark.json"
+    assert main(["local-vlm", "benchmark", "--db", str(db), "--variant", variant.alias,
+                 "--label-set", "gt-v1", "--warmups", "0", "--repetitions", "2",
+                 "--output-file", str(output)]) == 0
+    benchmark = json.loads(output.read_text())
+    run_id = benchmark["run_id"]
+    quality = benchmark["quality"]
+    score = quality["results"]["run:" + run_id]
+    assert score["fields"]["name"]["f1"] == 0
+    assert score["prediction_output_ids"] == {}
+    assert score["prediction_sample_ids"] == {str(doc): benchmark["benchmark"]["samples"][0]["id"]}
+    assert main(["local-vlm", "report", "--db", str(db), "--run-id", run_id,
+                 "--label-set", "gt-v1", "--output-file", str(output)]) == 0
+    assert json.loads(output.read_text())["quality"] == quality
+    assert main(["eval", "run", "--db", str(db), "--run-id", run_id,
+                 "--label-set", "gt-v1", "--output-file", str(output)]) == 0
+    assert json.loads(output.read_text()) == quality
+    with connect(db) as c:
+        active = active_extraction_for_variant(c, document_id=doc, **variant_lookup(variant))
+        assert json.loads(active["fields_json"])["name"] == "Muster"
 
 
 def test_backend_instrumentation_with_fake_gpu(tmp_path):

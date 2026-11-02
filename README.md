@@ -840,10 +840,25 @@ basename or stored filename stem. Without a label-set filter, all selected
 image-backed documents can be benchmarked, including unlabeled images.
 
 Raw warm-up and measured samples live in SQLite's `inference_benchmark_runs`
-and `inference_benchmark_samples`. Run IDs preserve history even after new
-extraction outputs supersede older predictions. The first successful measured
-repetition per document becomes its canonical extraction output and creates one
-candidate. Repeated generations remain samples, not duplicate candidates.
+and `inference_benchmark_samples`. Benchmarks never supersede existing active
+extractions. For each document, the first successful measured answer creates an
+initial extraction and one review candidate only if no successful active
+prediction exists for the exact method, provider, model, prompt version, and
+inference configuration. Failed or superseded history does not block this gap
+filling. An existing active prediction is preserved even if the image changed.
+Warm-ups and later repetitions remain samples only; answers are not combined
+or selected by majority vote. Use `local-vlm extract --force` to explicitly
+replace an active prediction.
+
+Benchmark quality evaluation scores the first successful measured sample per
+document from that run, independently of active extraction records. A document
+with no successful measured answer counts as a missing prediction even if an
+older extraction exists. This applies to automatic benchmark evaluation,
+`eval run --run-id`, and `local-vlm report`. Quality JSON includes
+`prediction_sample_ids` for answer provenance; `prediction_output_ids` includes
+only extraction links on the selected samples and may be empty. Historical runs
+remain evaluable after subsequent extraction replacements. This behavior does
+not undo supersessions performed by older benchmark runs.
 
 Measurements include separate model/processor load time (excluding download),
 preprocessing/transfer time, generation time, first-token latency, decode
@@ -912,7 +927,7 @@ existing policy of ignoring blank labels is unchanged.
 All variants are scored on the same reference cohort; missing predictions are
 not silently dropped. A reference variant produces **agreement**, not GT accuracy,
 and missing reference rows are reported separately. Historical run comparisons
-use canonical output IDs rather than current active predictions. GT scores are
+use the run's first successful measured samples rather than current active predictions. GT scores are
 computed on demand; exports include reference row IDs/content hashes and
 prediction IDs. GT edits can change later reports, so retain exported reports
 when freezing an experiment. Quantized KV caches and adapter training/loading

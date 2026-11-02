@@ -8,3 +8,11 @@ python-dotenv>=1.0.0
 python-multipart>=0.0.32
 scikit-learn>=1.5.0
 uvicorn>=0.35.0
+
+[local-vlm]
+torch==2.11.0
+torchvision==0.26.0
+transformers==5.22.1
+accelerate>=1.0
+bitsandbytes>=0.48
+huggingface-hub>=0.34

@@ -109,21 +109,29 @@ def evaluate_comparison(
         sources = [(v.alias, v) for v in variants] + ([("run:" + run_id, None)] if run_id else [])
         results = {}
         for name, variant in sources:
-            predictions, output_ids = {}, {}
+            predictions, output_ids, sample_ids = {}, {}, {}
             for document_id in references:
                 if variant is not None:
                     row = active_extraction_for_variant(connection, document_id=document_id, **variant_lookup(variant))
                 else:
-                    # Canonical outputs survive supersession and are selected by immutable sample links.
+                    # Score this run's answer independently of active extractions.
                     row = connection.execute(
-                        "SELECT e.* FROM extraction_outputs e JOIN inference_benchmark_samples s ON s.extraction_output_id=e.id "
-                        "WHERE s.run_id=? AND s.document_id=? AND s.phase='measured' AND s.status='success' ORDER BY s.id LIMIT 1",
+                        "SELECT * FROM inference_benchmark_samples "
+                        "WHERE run_id=? AND document_id=? AND phase='measured' AND status='success' "
+                        "ORDER BY repetition, id LIMIT 1",
                         (run_id, document_id)).fetchone()
                 if row is not None:
                     predictions[document_id] = json.loads(row["fields_json"])
-                    output_ids[str(document_id)] = row["id"]
+                    if variant is not None:
+                        output_ids[str(document_id)] = row["id"]
+                    else:
+                        sample_ids[str(document_id)] = row["id"]
+                        if row["extraction_output_id"] is not None:
+                            output_ids[str(document_id)] = row["extraction_output_id"]
             score = score_records(references, predictions)
             score["prediction_output_ids"] = output_ids
+            if variant is None:
+                score["prediction_sample_ids"] = sample_ids
             score["identity"] = variant.as_dict() if variant else json.loads(benchmark["variant_json"])
             results[name] = score
     mode = "variant_agreement" if reference else "gt_accuracy"
