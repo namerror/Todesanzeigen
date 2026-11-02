@@ -736,18 +736,36 @@ compute dtype is also BF16. Previously recorded FP16 benchmark runs retain their
 original settings and remain accessible by run ID. The hosted operational
 defaults are unchanged.
 
-Enable the NVIDIA GPU first (`nvidia-smi` must work). Install into a separate
-environment so the pipeline does not require torch for normal commands:
+Use the project's existing `.venv` for local extraction. Enable the NVIDIA GPU
+first (`nvidia-smi` must work), then install the optional local inference dependencies:
 
 ```sh
-uv venv temp/vlm-env --python 3.11
-uv pip install --python temp/vlm-env/bin/python --torch-backend=cu128 -e '.[local-vlm]'
-source temp/vlm-env/bin/activate
+uv sync --extra local-vlm
 ```
 
-The backend pins PyTorch 2.11.0 and Transformers 5.22.1. The command above selects
-the CUDA 12.8 torch build used in the initial local test; it still requires a
-compatible NVIDIA driver. Models download automatically to the Hugging Face
+The `local-vlm` extra is declared in `pyproject.toml` but is not installed by
+default. It keeps Torch optional for users who only run OCR or hosted models;
+a separate environment is not required. The commands below use
+`uv run --extra local-vlm`, which selects the project environment without shell
+activation. Keep the extra enabled when syncing or running local inference;
+a plain `uv sync` can remove these optional packages.
+
+The backend pins PyTorch 2.11.0 and Transformers 5.22.1. The current lockfile
+uses PyPI packages and does not explicitly select the CUDA 12.8 Torch build
+used in the initial local experiment. A compatible NVIDIA driver and a
+CUDA-enabled Torch installation are required. Verify GPU access before extraction:
+
+```sh
+uv run --extra local-vlm python -c \
+  "import torch; print('Torch:', torch.__version__); print('CUDA:', torch.version.cuda); print('GPU available:', torch.cuda.is_available())"
+```
+
+`GPU available` must be `True`. If it is `False`, resolve the driver or Torch
+CUDA build setup before proceeding. If you previously used `temp/vlm-env`,
+you can delete it after verifying the project environment; do not activate it
+for the commands below.
+
+Models download automatically to the Hugging Face
 cache. A disabled/missing GPU or insufficient VRAM produces an error rather
 than silently switching device, precision, or image resolution.
 
@@ -755,7 +773,7 @@ Extract images and register their predictions (existing inventory can instead
 be selected without `--input-dir`):
 
 ```sh
-todesanzeigen local-vlm extract \
+uv run --extra local-vlm todesanzeigen local-vlm extract \
   --variant local_qwen3vl_bf16 \
   --input-dir 'input/Aichacher Nachrichten' --source 'Aichacher Nachrichten' \
   --limit 5
@@ -770,7 +788,7 @@ control extraction cache reuse; `--force` reruns extraction.
 Benchmark an existing, reviewed image inventory:
 
 ```sh
-todesanzeigen local-vlm benchmark \
+uv run --extra local-vlm todesanzeigen local-vlm benchmark \
   --variant local_qwen3vl_bf16 --label-set gt-v1 \
   --limit 25 --warmups 1 --repetitions 3 \
   --output-file output/benchmarks/local-bf16.json
@@ -779,10 +797,10 @@ todesanzeigen local-vlm benchmark \
 Select registered inventory by source, or combine source and directory restrictions:
 
 ```sh
-todesanzeigen local-vlm extract \
+uv run --extra local-vlm todesanzeigen local-vlm extract \
   --variant local_qwen3vl_bf16 --source 'Aichacher Nachrichten' --limit 5
 
-todesanzeigen local-vlm benchmark \
+uv run --extra local-vlm todesanzeigen local-vlm benchmark \
   --variant local_qwen3vl_bf16 --source 'Aichacher Nachrichten' \
   --input-dir 'input/Aichacher Nachrichten' --only notice.jpg \
   --warmups 1 --repetitions 3
@@ -877,7 +895,7 @@ todesanzeigen eval run --reference-variant vlm_current \
 
 todesanzeigen eval run --run-id RUN_ID --label-set gt-v1
 
-todesanzeigen local-vlm report --run-id RUN_ID --label-set gt-v1 \
+uv run --extra local-vlm todesanzeigen local-vlm report --run-id RUN_ID --label-set gt-v1 \
   --output-file output/benchmarks/historical-run.json
 ```
 
@@ -910,7 +928,7 @@ An optional real-GPU smoke check uses the local checkpoint and a supplied image:
 
 ```sh
 TODESANZEIGEN_GPU_SMOKE=1 TODESANZEIGEN_SMOKE_IMAGE='input/path/to/notice.jpg' \
-  python -m pytest tests/test_local_vlm.py -k gpu_smoke
+  uv run --extra local-vlm python -m pytest tests/test_local_vlm.py -k gpu_smoke
 ```
 
-Install pytest into the local environment before running that opt-in check.
+The default `dev` dependency group supplies pytest in the same project environment.
