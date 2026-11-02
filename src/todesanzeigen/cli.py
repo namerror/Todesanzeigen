@@ -270,10 +270,11 @@ def build_parser() -> argparse.ArgumentParser:
         else:
             local_parser.add_argument("--variant", required=True)
             local_parser.add_argument("--only", action="append")
-            local_parser.add_argument("--limit", type=int)
+            local_parser.add_argument("--limit", type=int, help="Maximum images after availability and hash checks.")
+        if command != "report":
+            local_parser.add_argument("--input-dir", type=Path, help="Image directory: extract ingests images; benchmark requires recorded paths within it (no relocation).")
+            local_parser.add_argument("--source", default="", help="Filter by SQLite document source; also assigns the source to ingested extraction images.")
         if command == "extract":
-            local_parser.add_argument("--input-dir", type=Path)
-            local_parser.add_argument("--source", default="")
             local_parser.add_argument("--force", action="store_true")
         if command == "benchmark":
             local_parser.add_argument("--warmups", type=int, default=1)
@@ -908,9 +909,11 @@ def run_local_vlm_command(args: argparse.Namespace) -> int:
         result = benchmark_report(args.db, args.run_id)
         run_id = args.run_id
     else:
-        variant = load_variant_config(args.variants_config).variant(args.variant)
+        config = load_variant_config(args.variants_config)
+        variant = config.variant(args.variant)
         result = run_local(
             db_path=args.db, variant=variant, benchmark=args.local_command == "benchmark",
+            reference=config.variant(args.reference_variant) if args.reference_variant else None,
             label_set=args.label_set, split_name=args.split, subset=args.subset,
             only=args.only, limit=args.limit, input_dir=getattr(args, "input_dir", None),
             source=getattr(args, "source", ""), force=getattr(args, "force", False),
@@ -921,6 +924,7 @@ def run_local_vlm_command(args: argparse.Namespace) -> int:
         quality = evaluate_comparison(
             db_path=args.db, run_id=run_id if args.local_command != "extract" else None,
             variant_aliases=[args.variant] if args.local_command == "extract" else [],
+            document_ids=result["selected_document_ids"] if args.local_command == "extract" else None,
             label_set=args.label_set, reference_variant=args.reference_variant,
             variants_config=args.variants_config, split_name=args.split, subset=args.subset,
         )

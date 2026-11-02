@@ -65,7 +65,7 @@ def score_records(references: dict[int, dict], predictions: dict[int, dict]) -> 
 def evaluate_comparison(
     *, db_path: Path, variant_aliases=(), run_id: str | None = None,
     label_set: str | None = None, reference_variant: str | None = None,
-    variants_config: Path = DEFAULT_VARIANTS_CONFIG_PATH, split_name="", subset=None,
+    variants_config: Path = DEFAULT_VARIANTS_CONFIG_PATH, split_name="", subset=None, document_ids=None,
 ) -> dict:
     from .local_vlm import select_documents, variant_lookup
     if label_set and reference_variant:
@@ -80,6 +80,9 @@ def evaluate_comparison(
     with connect(db_path) as connection:
         documents = select_documents(connection, label_set=label_set if reference is None else None,
                                      split_name=split_name, subset=subset)
+        if document_ids is not None:
+            cohort = set(document_ids)
+            documents = [d for d in documents if d["id"] in cohort]
         benchmark = None
         if run_id:
             row = connection.execute("SELECT * FROM inference_benchmark_runs WHERE id=?", (run_id,)).fetchone()

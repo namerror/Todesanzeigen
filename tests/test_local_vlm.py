@@ -10,7 +10,7 @@ from src.todesanzeigen.field_evaluation import evaluate_comparison, score_record
 from src.todesanzeigen.inference_config import InferenceConfig
 from src.todesanzeigen.llm import MODEL_RESPONSE_COLUMNS
 from src.todesanzeigen.local_backend import FirstTokenObserver
-from src.todesanzeigen.local_vlm import benchmark_report, run_local, variant_lookup
+from src.todesanzeigen.local_vlm import benchmark_report, run_local, select_images, variant_lookup
 from src.todesanzeigen.methods import LOCAL_VISION_METHOD
 from src.todesanzeigen.review import _select_review_candidates
 from src.todesanzeigen.storage import (
@@ -157,13 +157,16 @@ def test_load_failure_is_durable(setup):
     assert result["benchmark"]["run"]["error"] == "GPU disabled"
 
 
-def test_missing_image_remains_failure(setup):
+def test_missing_image_fails_before_backend_load(setup, capsys):
     db, image, _, variant = setup
     image.unlink()
-    result = run_local(db_path=db, variant=variant, benchmark=True, warmups=0, backend_factory=FakeBackend)
-    assert result["benchmark"]["attempted_samples"] == 3
-    assert result["benchmark"]["aggregates"]["total_ms"]["count"] == 0
-    assert result["benchmark"]["completion_rate"] == 0
+    def unexpected_backend(*args):
+        pytest.fail("Empty selection must not construct a backend")
+    with pytest.raises(ValueError, match="No eligible images"):
+        run_local(db_path=db, variant=variant, benchmark=True, backend_factory=unexpected_backend)
+    assert '"missing_invalid_images":1' in capsys.readouterr().out
+    with connect(db) as c:
+        assert c.execute("SELECT count(*) FROM inference_benchmark_runs").fetchone()[0] == 0
 
 
 def test_scoring_absent_values_normalization_and_metadata():
@@ -384,3 +387,204 @@ def test_historical_quality_without_variant_file(setup, tmp_path):
     report = evaluate_comparison(db_path=db, run_id=run["run_id"], label_set="gt-v1",
                                  variants_config=tmp_path / "deleted.toml")
     assert report["results"]["run:" + run["run_id"]]["documents"] == 1
+
+
+def register_image(db, path, *, source="paper", stored_hash=""):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(path.name.encode())
+    with connect(db) as c:
+        return upsert_document(c, source_name=source, filename_stem=path.stem,
+                               image_path=path, image_sha256=stored_hash)
+
+
+def test_combined_selection_and_source_only(setup, tmp_path):
+    db, _, original, _ = setup
+    directory = tmp_path / "inputs"
+    chosen = register_image(db, directory / "chosen.jpg")
+    other_source = register_image(db, directory / "other.jpg", source="other")
+    excluded = register_image(db, directory / "excluded.jpg")
+    with connect(db) as c:
+        save_ground_truth_label(c, document_id=chosen, label_set="gt-v1", fields={})
+        create_dataset_split(c, name="selection", strategy="test", assignments={
+            chosen: "test", original: "test", excluded: "validation", other_source: "test"})
+        selected, summary = select_images(c, source="paper", input_dir=directory,
+                                          split_name="selection", label_set="gt-v1",
+                                          only=["chosen.jpg", "notice"], limit=1)
+        assert [d["id"] for d, _ in selected] == [chosen]
+        assert summary["matching_documents"] == 2
+        assert summary["available_images"] == 1
+        assert summary["missing_invalid_images"] == 1
+        selected, _ = select_images(c, source="other")
+        assert [d["id"] for d, _ in selected] == [other_source]
+        selected, _ = select_images(c, split_name="selection", subset="validation")
+        assert [d["id"] for d, _ in selected] == [excluded]
+
+
+@pytest.mark.parametrize("benchmark", [False, True])
+def test_missing_and_mismatched_images_do_not_consume_limit(setup, tmp_path, benchmark):
+    db, _, original, variant = setup
+    missing = register_image(db, tmp_path / "aaa-missing.jpg")
+    (tmp_path / "aaa-missing.jpg").unlink()
+    mismatch = register_image(db, tmp_path / "aab-mismatch.jpg", stored_hash="0" * 64)
+    result = run_local(db_path=db, variant=variant, benchmark=benchmark, limit=1,
+                       warmups=0, repetitions=1, backend_factory=FakeBackend)
+    assert result["selected_document_ids"] == [original]
+    assert result["selection"]["available_images"] == 1
+    assert result["selection"]["missing_invalid_images"] == 2
+    assert {i["document_id"] for i in result["selection"]["invalid_images"]} == {missing, mismatch}
+    assert any("SHA-256 mismatch" in i["reason"] for i in result["selection"]["invalid_images"])
+
+
+def test_benchmark_directory_manifest_and_no_record_updates(setup, tmp_path):
+    db, image, doc, variant = setup
+    with connect(db) as c:
+        c.execute("UPDATE documents SET image_sha256=? WHERE id=?", (sha256_file(image), doc))
+        before = dict(c.execute("SELECT * FROM documents WHERE id=?", (doc,)).fetchone())
+    result = run_local(db_path=db, variant=variant, benchmark=True, source="paper", input_dir=tmp_path,
+                       warmups=0, repetitions=1, backend_factory=FakeBackend)
+    assert result["benchmark"]["run"]["manifest"] == [{
+        "document_id": doc, "image_path": str(image.resolve()), "image_sha256": sha256_file(image)}]
+    with connect(db) as c:
+        assert dict(c.execute("SELECT * FROM documents WHERE id=?", (doc,)).fetchone()) == before
+
+
+def test_relocated_copy_is_rejected_even_with_matching_hash(setup, tmp_path):
+    db, image, doc, variant = setup
+    digest = sha256_file(image)
+    with connect(db) as c:
+        c.execute("UPDATE documents SET image_sha256=? WHERE id=?", (digest, doc))
+    directory = tmp_path / "restored"
+    directory.mkdir()
+    (directory / image.name).write_bytes(image.read_bytes())
+    # A copy must not qualify even while the recorded original remains available.
+    with pytest.raises(ValueError, match="No eligible images"):
+        run_local(db_path=db, variant=variant, benchmark=True, input_dir=directory,
+                  backend_factory=lambda *args: pytest.fail("Must not load"))
+    image.unlink()
+    with connect(db) as c:
+        selected, summary = select_images(c, input_dir=directory)
+        assert selected == [] and summary["missing_invalid_images"] == 1
+        assert c.execute("SELECT image_path FROM documents WHERE id=?", (doc,)).fetchone()[0] == str(image)
+        assert c.execute("SELECT count(*) FROM documents").fetchone()[0] == 1
+
+
+def test_directory_aliases_are_ambiguous(setup, tmp_path):
+    db, image, _, _ = setup
+    (tmp_path / "alias.jpg").symlink_to(image)
+    with connect(db) as c, pytest.raises(ValueError, match="Ambiguous image matches"):
+        select_images(c, input_dir=tmp_path)
+
+
+def test_reference_coverage_does_not_restrict_inference(setup, tmp_path, capsys):
+    db, _, doc, variant = setup
+    other = register_image(db, tmp_path / "other.jpg")
+    reference = load_variant_config().variant("vlm_current")
+    with connect(db) as c:
+        insert_extraction_output(c, document_id=doc, run_id=None, status="vision_processed",
+                                 fields={"name": "Muster"}, **variant_lookup(reference))
+    class ObservedBackend(FakeBackend):
+        def load(self):
+            assert '"reference_coverage":{"available":1,"missing":1,"total":2}' in capsys.readouterr().out
+            return super().load()
+    result = run_local(db_path=db, variant=variant, benchmark=True, reference=reference,
+                       warmups=0, repetitions=1, backend_factory=ObservedBackend)
+    assert result["successful"] == 2
+    assert set(result["selected_document_ids"]) == {doc, other}
+    quality = evaluate_comparison(db_path=db, run_id=result["run_id"], reference_variant=reference.alias)
+    assert quality["mode"] == "variant_agreement"
+    assert quality["cohort_documents"] == 2 and quality["missing_references"] == 1
+    assert quality["results"]["run:" + result["run_id"]]["documents"] == 1
+
+
+@pytest.mark.parametrize("all_cached", [False, True])
+def test_cli_extraction_evaluates_only_selected_including_cache(setup, tmp_path, monkeypatch, all_cached):
+    from src.todesanzeigen import local_backend
+    db, _, doc, variant = setup
+    second = register_image(db, tmp_path / "second.jpg")
+    unrelated = register_image(db, tmp_path / "unrelated.jpg", source="elsewhere")
+    with connect(db) as c:
+        for document_id in (second, unrelated):
+            save_ground_truth_label(c, document_id=document_id, label_set="gt-v1", fields={"name": "Muster"})
+    run_local(db_path=db, variant=variant, only=["notice"] if not all_cached else None, backend_factory=FakeBackend)
+    monkeypatch.setattr(local_backend, "TransformersBackend", FakeBackend)
+    output = tmp_path / "cohort.json"
+    assert main(["local-vlm", "extract", "--db", str(db), "--variant", variant.alias,
+                 "--source", "paper", "--limit", "2", "--label-set", "gt-v1", "--output-file", str(output)]) == 0
+    result = json.loads(output.read_text())
+    assert result["selected_document_ids"] == [doc, second]
+    assert result["cached"] == (2 if all_cached else 1)
+    assert result["quality"]["cohort_documents"] == 2
+    assert {row["document_id"] for row in result["quality"]["reference_rows"]} == {doc, second}
+    empty = evaluate_comparison(db_path=db, variant_aliases=[variant.alias], document_ids=[])
+    assert empty["cohort_documents"] == 0
+
+
+def test_extraction_ingestion_assigns_and_filters_source(setup, tmp_path):
+    db, _, _, variant = setup
+    directory = tmp_path / "new"
+    directory.mkdir()
+    (directory / "ingested.jpg").write_bytes(b"new image")
+    result = run_local(db_path=db, variant=variant, input_dir=directory, source="new-paper", backend_factory=FakeBackend)
+    assert result["selection"]["matching_documents"] == 1
+    with connect(db) as c:
+        row = c.execute("SELECT d.*, s.name AS source FROM documents d JOIN sources s ON s.id=d.source_id WHERE d.id=?",
+                        (result["selected_document_ids"][0],)).fetchone()
+        assert row["source"] == "new-paper"
+        assert row["image_sha256"] == sha256_file(directory / "ingested.jpg")
+
+
+def test_recorded_relative_paths_and_same_basename_do_not_relocate(setup, tmp_path, monkeypatch):
+    db, image, doc, _ = setup
+    directory = tmp_path / "different"
+    register_image(db, directory / image.name, source="other")
+    monkeypatch.chdir(tmp_path)
+    with connect(db) as c:
+        c.execute("UPDATE documents SET image_path=? WHERE id=?", (image.name, doc))
+        selected, _ = select_images(c, source="paper", input_dir=tmp_path)
+        assert selected[0][1]["image_path"] == str(image)
+        selected, _ = select_images(c, source="paper", input_dir=directory)
+        assert selected == []
+
+
+def test_benchmark_quality_is_isolated_to_manifest(setup, tmp_path):
+    db, _, doc, variant = setup
+    other = register_image(db, tmp_path / "other.jpg")
+    with connect(db) as c:
+        save_ground_truth_label(c, document_id=other, label_set="gt-v1", fields={})
+    run = run_local(db_path=db, variant=variant, benchmark=True, only=["notice"],
+                    warmups=0, repetitions=1, backend_factory=FakeBackend)
+    quality = evaluate_comparison(db_path=db, run_id=run["run_id"], label_set="gt-v1")
+    assert quality["cohort_documents"] == 1
+    assert [r["document_id"] for r in quality["reference_rows"]] == [doc]
+
+
+def test_cli_benchmark_wires_source_directory_and_reference(setup, tmp_path, monkeypatch):
+    from src.todesanzeigen import local_backend
+    db, _, doc, variant = setup
+    register_image(db, tmp_path / "other.jpg", source="other")
+    monkeypatch.setattr(local_backend, "TransformersBackend", FakeBackend)
+    output = tmp_path / "benchmark.json"
+    assert main(["local-vlm", "benchmark", "--db", str(db), "--variant", variant.alias,
+                 "--source", "paper", "--input-dir", str(tmp_path), "--reference-variant", "vlm_current",
+                 "--warmups", "0", "--repetitions", "1", "--output-file", str(output)]) == 0
+    report = json.loads(output.read_text())
+    assert report["selected_document_ids"] == [doc]
+    assert report["successful"] == 1
+    assert report["selection"]["reference_coverage"] == {"available": 0, "missing": 1, "total": 1}
+    assert report["quality"]["missing_references"] == 1
+    assert report["quality"]["results"]["run:" + report["run_id"]]["documents"] == 0
+
+
+def test_image_change_after_selection_remains_durable_failure(setup):
+    db, image, _, variant = setup
+    class ChangedImage(FakeBackend):
+        def load(self):
+            image.write_bytes(b"changed after selection")
+            return super().load()
+        def infer(self, *args):
+            pytest.fail("Changed image must not reach inference")
+    report = run_local(db_path=db, variant=variant, benchmark=True, warmups=0, repetitions=1,
+                       backend_factory=ChangedImage)["benchmark"]
+    assert report["attempted_samples"] == 1
+    assert report["successful_samples"] == 0
+    assert "Image changed" in report["samples"][0]["error"]

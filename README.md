@@ -776,6 +776,43 @@ todesanzeigen local-vlm benchmark \
   --output-file output/benchmarks/local-bf16.json
 ```
 
+Select registered inventory by source, or combine source and directory restrictions:
+
+```sh
+todesanzeigen local-vlm extract \
+  --variant local_qwen3vl_bf16 --source 'Aichacher Nachrichten' --limit 5
+
+todesanzeigen local-vlm benchmark \
+  --variant local_qwen3vl_bf16 --source 'Aichacher Nachrichten' \
+  --input-dir 'input/Aichacher Nachrichten' --only notice.jpg \
+  --warmups 1 --repetitions 3
+```
+
+`--source` filters the document source stored in SQLite; during extraction
+with `--input-dir`, it also assigns the source to ingested images (defaulting
+to the directory name when omitted). Benchmark `--input-dir` never registers
+images: it restricts selection to supported images recursively found in that
+directory whose absolute resolved paths match recorded document paths. Moved
+copies do not qualify, even with identical names and hashes. Relative recorded
+paths resolve from the current working directory. Without either flag, selection
+uses the DB inventory and recorded paths. Resolution does not rewrite DB paths;
+multiple directory entries resolving to the same recorded path are rejected as
+ambiguous.
+
+Stored image hashes, when present, must match. Missing, unreadable, and
+hash-mismatched images are excluded **before** `--limit` is applied. A selection
+summary reports matching documents, available images, missing/invalid images,
+and selected images before model loading; an empty selection fails immediately.
+Benchmark manifests capture selected document IDs, resolved paths, and image
+hashes, including newly computed hashes for records without stored hashes.
+
+With `--reference-variant vlm_current`, the summary also reports prediction
+coverage for the selected cohort. Missing reference predictions do not block
+inference and are reported separately; only documents with references enter
+reference-relative field scoring. Agreement with a reference variant is distinct
+from reviewed GT accuracy (`--label-set gt-v1`). Automatic evaluation is restricted
+to the selected cohort, including cached extraction predictions.
+
 Benchmarks always execute inference, even when predictions already exist. They
 load the model once, warm up on the first selected image, and run repeated passes
 in fixed document order with concurrency/batch size 1. There is no benchmark
